@@ -1,0 +1,17 @@
+id = "zerodice0.agent-labels"
+name = "Agent Labels"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Assign readable color-animal names to unnamed Herdr agents."
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "label-current"
+title = "Assign Agent Label"
+description = "Assign a color-animal name to the agent in the focused pane."
+contexts = ["pane"]
+command = ["python3", "agent_labels.py", "label"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["python3", "agent_labels.py", "event"]
