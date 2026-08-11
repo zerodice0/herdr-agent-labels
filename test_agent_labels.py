@@ -17,6 +17,7 @@ SPEC.loader.exec_module(agent_labels)
 class AgentLabelsTest(unittest.TestCase):
     def test_aliases_are_valid_and_unique(self):
         names = [alias.name for alias in agent_labels.ALIASES]
+        self.assertEqual(len(names), 256)
         self.assertEqual(len(names), len(set(names)))
         self.assertTrue(all(len(name) <= 32 and name.replace("-", "").islower() for name in names))
 

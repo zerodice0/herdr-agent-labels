@@ -50,6 +50,22 @@ ANIMALS = (
     "falcon",
     "rabbit",
     "turtle",
+    "bear",
+    "beaver",
+    "bison",
+    "camel",
+    "cobra",
+    "crane",
+    "deer",
+    "dolphin",
+    "eagle",
+    "ferret",
+    "frog",
+    "horse",
+    "lemur",
+    "lynx",
+    "moose",
+    "penguin",
 )
 ALIASES = tuple(
     Alias(name=f"{color}-{animal}", marker=marker, color=color)
