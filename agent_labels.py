@@ -188,7 +188,7 @@ def handle_event() -> int:
     return assign_label(pane_id)
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_cli_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Assign a readable label to an unnamed Herdr agent."
     )
@@ -213,12 +213,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main() -> int:
-    args = parse_args()
+    arguments = parse_cli_arguments()
 
-    if args.command == "event":
+    if arguments.command == "event":
         return handle_event()
 
-    pane_id = args.pane_id or context_pane_id()
+    pane_id = arguments.pane_id or context_pane_id()
     if not pane_id:
         return 1
 

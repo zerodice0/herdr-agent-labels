@@ -83,18 +83,18 @@ class AgentLabelsTest(unittest.TestCase):
             self.assertEqual(agent_labels.event_data()["pane_id"], "w1:p4")
 
     def test_parse_event_command(self):
-        args = agent_labels.parse_args(["event"])
-        self.assertEqual(args.command, "event")
+        arguments = agent_labels.parse_cli_arguments(["event"])
+        self.assertEqual(arguments.command, "event")
 
     def test_parse_label_command_with_pane_id(self):
-        args = agent_labels.parse_args(["label", "w1:p5"])
-        self.assertEqual(args.command, "label")
-        self.assertEqual(args.pane_id, "w1:p5")
+        arguments = agent_labels.parse_cli_arguments(["label", "w1:p5"])
+        self.assertEqual(arguments.command, "label")
+        self.assertEqual(arguments.pane_id, "w1:p5")
 
     def test_parse_label_command_without_pane_id(self):
-        args = agent_labels.parse_args(["label"])
-        self.assertEqual(args.command, "label")
-        self.assertIsNone(args.pane_id)
+        arguments = agent_labels.parse_cli_arguments(["label"])
+        self.assertEqual(arguments.command, "label")
+        self.assertIsNone(arguments.pane_id)
 
 
 if __name__ == "__main__":
