@@ -75,14 +75,21 @@ def decode_json(value: str) -> dict[str, Any]:
     return decoded if isinstance(decoded, dict) else {}
 
 
+def read_json_environment_variable(name: str) -> dict[str, Any]:
+    value = os.environ.get(name)
+    if value is None:
+        return {}
+    return decode_json(value)
+
+
 def event_data() -> dict[str, Any]:
-    payload = decode_json(os.environ.get("HERDR_PLUGIN_EVENT_JSON", "{}"))
+    payload = read_json_environment_variable("HERDR_PLUGIN_EVENT_JSON")
     data = payload.get("data")
     return data if isinstance(data, dict) else payload
 
 
 def context_pane_id() -> str:
-    context = decode_json(os.environ.get("HERDR_PLUGIN_CONTEXT_JSON", "{}"))
+    context = read_json_environment_variable("HERDR_PLUGIN_CONTEXT_JSON")
     return str(
         context.get("focused_pane_id")
         or context.get("pane_id")
@@ -91,7 +98,7 @@ def context_pane_id() -> str:
     )
 
 
-def agent_info(pane_id: str) -> dict[str, Any]:
+def fetch_agent_info(pane_id: str) -> dict[str, Any]:
     result = run_herdr("agent", "get", pane_id)
     if result.returncode != 0:
         return {}
@@ -103,7 +110,7 @@ def agent_info(pane_id: str) -> dict[str, Any]:
     return agent_data if isinstance(agent_data, dict) else {}
 
 
-def clear_display(pane_id: str) -> None:
+def clear_agent_label_metadata(pane_id: str) -> None:
     run_herdr(
         "pane",
         "report-metadata",
@@ -118,7 +125,13 @@ def clear_display(pane_id: str) -> None:
     )
 
 
-def report_display(pane_id: str, agent: str, alias: str, marker: str, color: str) -> None:
+def report_agent_label_metadata(
+    pane_id: str,
+    agent: str,
+    alias: str,
+    marker: str,
+    color: str,
+) -> None:
     run_herdr(
         "pane",
         "report-metadata",
@@ -145,7 +158,7 @@ def candidates(seed: str) -> Iterator[Alias]:
 
 
 def assign_label(pane_id: str) -> int:
-    info = agent_info(pane_id)
+    info = fetch_agent_info(pane_id)
     if not info:
         return 0
     if info.get("name") or info.get("agent_name"):
@@ -163,7 +176,7 @@ def assign_label(pane_id: str) -> int:
     for candidate in candidates(seed):
         renamed = run_herdr("agent", "rename", pane_id, candidate.name)
         if renamed.returncode == 0:
-            report_display(
+            report_agent_label_metadata(
                 pane_id,
                 agent,
                 candidate.name,
@@ -183,7 +196,7 @@ def handle_event() -> int:
     if not pane_id:
         return 0
     if data.get("released") or not data.get("agent"):
-        clear_display(pane_id)
+        clear_agent_label_metadata(pane_id)
         return 0
     return assign_label(pane_id)
 

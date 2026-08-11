@@ -62,7 +62,7 @@ class AgentLabelsTest(unittest.TestCase):
     def test_invalid_agent_response_shape_is_ignored(self):
         result = mock.Mock(returncode=0, stdout='{"result":null}', stderr="")
         with mock.patch.object(agent_labels, "run_herdr", return_value=result):
-            self.assertEqual(agent_labels.agent_info("w1:p3"), {})
+            self.assertEqual(agent_labels.fetch_agent_info("w1:p3"), {})
 
     def test_invalid_agent_session_shape_is_ignored(self):
         info = {
@@ -72,7 +72,7 @@ class AgentLabelsTest(unittest.TestCase):
         }
         renamed = mock.Mock(returncode=0, stdout="", stderr="")
         with (
-            mock.patch.object(agent_labels, "agent_info", return_value=info),
+            mock.patch.object(agent_labels, "fetch_agent_info", return_value=info),
             mock.patch.object(agent_labels, "run_herdr", return_value=renamed),
         ):
             self.assertEqual(agent_labels.assign_label("w1:p3"), 0)
