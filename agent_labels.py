@@ -11,7 +11,7 @@ import sys
 from typing import Any
 
 
-SOURCE = "zerodice0.agent-labels"
+SOURCE = "herdr.agent-labels"
 COLORS = (
     ("white", "⬜"),
     ("blue", "🟦"),
