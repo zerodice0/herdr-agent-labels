@@ -3,15 +3,26 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
 import subprocess
-import sys
-from typing import Any
+from typing import Any, Iterator, NamedTuple
 
 
 SOURCE = "herdr.agent-labels"
+SEED_HASH_BYTES = 4
+# Coprime with 128 aliases, so every alias is visited exactly once.
+CANDIDATE_STRIDE = 37
+
+
+class Alias(NamedTuple):
+    name: str
+    marker: str
+    color: str
+
+
 COLORS = (
     ("white", "⬜"),
     ("blue", "🟦"),
@@ -41,7 +52,7 @@ ANIMALS = (
     "turtle",
 )
 ALIASES = tuple(
-    (f"{color}-{animal}", marker, color)
+    Alias(name=f"{color}-{animal}", marker=marker, color=color)
     for color, marker in COLORS
     for animal in ANIMALS
 )
@@ -85,8 +96,11 @@ def agent_info(pane_id: str) -> dict[str, Any]:
     if result.returncode != 0:
         return {}
     payload = decode_json(result.stdout)
-    agent = payload.get("result", {}).get("agent", {})
-    return agent if isinstance(agent, dict) else {}
+    result_data = payload.get("result")
+    if not isinstance(result_data, dict):
+        return {}
+    agent_data = result_data.get("agent")
+    return agent_data if isinstance(agent_data, dict) else {}
 
 
 def clear_display(pane_id: str) -> None:
@@ -122,10 +136,12 @@ def report_display(pane_id: str, agent: str, alias: str, marker: str, color: str
     )
 
 
-def candidates(seed: str):
-    start = int.from_bytes(hashlib.sha256(seed.encode()).digest()[:4], "big") % len(ALIASES)
+def candidates(seed: str) -> Iterator[Alias]:
+    digest = hashlib.sha256(seed.encode()).digest()
+    start = int.from_bytes(digest[:SEED_HASH_BYTES], "big") % len(ALIASES)
     for offset in range(len(ALIASES)):
-        yield ALIASES[(start + offset * 37) % len(ALIASES)]
+        index = (start + offset * CANDIDATE_STRIDE) % len(ALIASES)
+        yield ALIASES[index]
 
 
 def assign_label(pane_id: str) -> int:
@@ -138,14 +154,23 @@ def assign_label(pane_id: str) -> int:
     agent = str(info.get("agent") or "")
     if not agent:
         return 0
-    session = info.get("agent_session") or {}
-    seed = f"{info.get('terminal_id', pane_id)}:{session.get('value', '')}"
+    session_data = info.get("agent_session")
+    session = session_data if isinstance(session_data, dict) else {}
+    terminal_id = str(info.get("terminal_id") or pane_id)
+    session_id = str(session.get("value") or "")
+    seed = f"{terminal_id}:{session_id}"
 
-    for alias, marker, color in candidates(seed):
-        renamed = run_herdr("agent", "rename", pane_id, alias)
+    for candidate in candidates(seed):
+        renamed = run_herdr("agent", "rename", pane_id, candidate.name)
         if renamed.returncode == 0:
-            report_display(pane_id, agent, alias, marker, color)
-            print(alias)
+            report_display(
+                pane_id,
+                agent,
+                candidate.name,
+                candidate.marker,
+                candidate.color,
+            )
+            print(candidate.name)
             return 0
         if "agent_name_taken" not in renamed.stderr:
             return 0
@@ -163,14 +188,41 @@ def handle_event() -> int:
     return assign_label(pane_id)
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Assign a readable label to an unnamed Herdr agent."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser(
+        "event",
+        help="Handle an agent detection event from Herdr.",
+    )
+
+    label_parser = subparsers.add_parser(
+        "label",
+        help="Assign a label to an agent pane.",
+    )
+    label_parser.add_argument(
+        "pane_id",
+        nargs="?",
+        help="Pane ID to label; defaults to the focused pane.",
+    )
+
+    return parser.parse_args(argv)
+
+
 def main() -> int:
-    command = sys.argv[1] if len(sys.argv) > 1 else ""
-    if command == "event":
+    args = parse_args()
+
+    if args.command == "event":
         return handle_event()
-    if command == "label":
-        pane_id = sys.argv[2] if len(sys.argv) > 2 else context_pane_id()
-        return assign_label(pane_id) if pane_id else 1
-    return 2
+
+    pane_id = args.pane_id or context_pane_id()
+    if not pane_id:
+        return 1
+
+    return assign_label(pane_id)
 
 
 if __name__ == "__main__":

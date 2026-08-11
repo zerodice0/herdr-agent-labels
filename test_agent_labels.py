@@ -16,9 +16,14 @@ SPEC.loader.exec_module(agent_labels)
 
 class AgentLabelsTest(unittest.TestCase):
     def test_aliases_are_valid_and_unique(self):
-        names = [alias for alias, _marker, _color in agent_labels.ALIASES]
+        names = [alias.name for alias in agent_labels.ALIASES]
         self.assertEqual(len(names), len(set(names)))
         self.assertTrue(all(len(name) <= 32 and name.replace("-", "").islower() for name in names))
+
+    def test_candidates_visit_every_alias(self):
+        candidates = list(agent_labels.candidates("term-1:session-1"))
+        self.assertEqual(len(candidates), len(agent_labels.ALIASES))
+        self.assertEqual(set(candidates), set(agent_labels.ALIASES))
 
     def test_conflict_retries_without_listing_agents(self):
         calls = []
@@ -54,10 +59,42 @@ class AgentLabelsTest(unittest.TestCase):
             self.assertEqual(agent_labels.assign_label("w1:p3"), 0)
         self.assertEqual(run.call_count, 1)
 
+    def test_invalid_agent_response_shape_is_ignored(self):
+        result = mock.Mock(returncode=0, stdout='{"result":null}', stderr="")
+        with mock.patch.object(agent_labels, "run_herdr", return_value=result):
+            self.assertEqual(agent_labels.agent_info("w1:p3"), {})
+
+    def test_invalid_agent_session_shape_is_ignored(self):
+        info = {
+            "agent": "codex",
+            "terminal_id": "term-1",
+            "agent_session": "invalid",
+        }
+        renamed = mock.Mock(returncode=0, stdout="", stderr="")
+        with (
+            mock.patch.object(agent_labels, "agent_info", return_value=info),
+            mock.patch.object(agent_labels, "run_herdr", return_value=renamed),
+        ):
+            self.assertEqual(agent_labels.assign_label("w1:p3"), 0)
+
     def test_event_envelope_is_supported(self):
         value = '{"event":"pane.agent_detected","data":{"pane_id":"w1:p4","agent":"codex"}}'
         with mock.patch.dict(os.environ, {"HERDR_PLUGIN_EVENT_JSON": value}):
             self.assertEqual(agent_labels.event_data()["pane_id"], "w1:p4")
+
+    def test_parse_event_command(self):
+        args = agent_labels.parse_args(["event"])
+        self.assertEqual(args.command, "event")
+
+    def test_parse_label_command_with_pane_id(self):
+        args = agent_labels.parse_args(["label", "w1:p5"])
+        self.assertEqual(args.command, "label")
+        self.assertEqual(args.pane_id, "w1:p5")
+
+    def test_parse_label_command_without_pane_id(self):
+        args = agent_labels.parse_args(["label"])
+        self.assertEqual(args.command, "label")
+        self.assertIsNone(args.pane_id)
 
 
 if __name__ == "__main__":
