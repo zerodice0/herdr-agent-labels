@@ -320,6 +320,16 @@ def character_index_at_display_column(value: str, column: int) -> int:
     return len(value)
 
 
+def wrap_display_text(value: str, width: int) -> list[str]:
+    wrapped, _cursor_row, _cursor_column = wrap_message_lines(
+        [value],
+        width=max(1, width),
+        cursor_row=0,
+        cursor_column=len(value),
+    )
+    return [line.text for line in wrapped]
+
+
 @contextmanager
 def terminal_flow_control_disabled(stream: TextIO) -> Iterator[None]:
     """Let curses receive Ctrl+S instead of treating it as terminal XOFF."""
@@ -567,6 +577,24 @@ class MessengerApp:
         self.pending_hosts.clear()
         self.status = self.text["discovery_cancelled"]
 
+    def _use_local_only(self) -> None:
+        if self.discovery:
+            self.discovery.cancel()
+            self.discovery = None
+        remote_selected = {
+            agent.identity
+            for agent in self.agents
+            if not agent.local and agent.identity in self.selected
+        }
+        self.selected.difference_update(remote_selected)
+        self.agents = [agent for agent in self.agents if agent.local]
+        self.pending_hosts.clear()
+        self.host_status.clear()
+        self.skipped_hosts = 0
+        self.remote_enabled = False
+        self.status = ""
+        self._clamp_cursor()
+
     def _clamp_cursor(self) -> None:
         records = self.filtered_agents()
         self.cursor = max(0, min(self.cursor, max(0, len(records) - 1)))
@@ -619,6 +647,8 @@ class MessengerApp:
                 self.text["direct_privacy"],
             ),
         )
+        _height, width = self.screen.getmaxyx()
+        option_row = row + 2
         for index, (label, description) in enumerate(options):
             marker = "›" if index == self.mode_option else " "
             attribute = self._style(
@@ -627,10 +657,22 @@ class MessengerApp:
                 if index == self.mode_option
                 else curses.A_BOLD,
             )
-            option_row = row + 2 + index * 3
-            self._safe_add(option_row, 2, f"{marker} {label}", attribute)
-            self._safe_add(option_row + 1, 6, description, curses.A_DIM)
-        return row + 8
+            label_lines = wrap_display_text(label, width - 6)
+            for line_index, line in enumerate(label_lines):
+                prefix = f"{marker} " if line_index == 0 else "  "
+                self._safe_add(
+                    option_row + line_index,
+                    2,
+                    f"{prefix}{line}",
+                    attribute,
+                )
+            option_row += len(label_lines)
+            description_lines = wrap_display_text(description, width - 7)
+            for line in description_lines:
+                self._safe_add(option_row, 6, line, curses.A_DIM)
+                option_row += 1
+            option_row += 1
+        return option_row
 
     def _render_mode_summary(self, row: int) -> int:
         if self.delivery_mode == DELIVERY_DIRECT:
@@ -641,14 +683,15 @@ class MessengerApp:
             label = self.text["delegate_option"]
             description = self.text["delegate_privacy"]
             pair = PAIR_SUCCESS
-        self._safe_add(
-            row,
-            0,
-            f'{self.text["delivery_mode"]}: {label}',
-            self._style(pair, curses.A_BOLD),
-        )
-        self._safe_add(row + 1, 2, description, curses.A_DIM)
-        return row + 2
+        _height, width = self.screen.getmaxyx()
+        heading = f'{self.text["delivery_mode"]}: {label}'
+        for line in wrap_display_text(heading, width - 1):
+            self._safe_add(row, 0, line, self._style(pair, curses.A_BOLD))
+            row += 1
+        for line in wrap_display_text(description, width - 3):
+            self._safe_add(row, 2, line, curses.A_DIM)
+            row += 1
+        return row
 
     def _render_recipients(self, row: int, available_rows: int) -> int:
         records = self.filtered_agents()
@@ -959,11 +1002,11 @@ class MessengerApp:
             for agent in self.agents
             if agent.identity in self.selected and not agent.stale
         ]
-        message = "\n".join(self.message_lines).strip()
+        original_message = "\n".join(self.message_lines)
         if not recipients:
             self.status = self.text["no_recipients"]
             return
-        if not message:
+        if not original_message.strip():
             self.status = self.text["empty_message"]
             return
         self.status = (
@@ -975,7 +1018,7 @@ class MessengerApp:
         self.send_cancel.clear()
         threading.Thread(
             target=self._dispatch_send_job,
-            args=(tuple(recipients), message),
+            args=(tuple(recipients), original_message),
             daemon=True,
         ).start()
 
@@ -990,14 +1033,14 @@ class MessengerApp:
                 self.environment,
                 cancel_event=self.send_cancel,
             )
-            if not _same_occupant(self.sender, current_sender):
-                self.send_results.put(SendJobResult(False, ()))
-                return
             if self.send_cancel.is_set():
                 self.send_results.put(SendJobResult(True, (), cancelled=True))
                 return
+            if not _same_occupant(self.sender, current_sender):
+                self.send_results.put(SendJobResult(False, ()))
+                return
             dispatch_recipients = recipients
-            dispatch_message = message
+            dispatch_message = message.strip()
             if self.delivery_mode == DELIVERY_DELEGATE:
                 dispatch_recipients = (self.sender,)
                 dispatch_message = build_orchestration_request(recipients, message)
@@ -1080,7 +1123,7 @@ class MessengerApp:
                 if self.discovery_option == 0:
                     self._start_remote_discovery(force=False)
                 else:
-                    self.status = ""
+                    self._use_local_only()
             elif isinstance(key, str) and key.lower() == "d":
                 self.discovery_choice = True
                 self.discovery_option = 0
@@ -1088,7 +1131,7 @@ class MessengerApp:
             elif isinstance(key, str) and key.lower() == "l":
                 self.discovery_choice = True
                 self.discovery_option = 1
-                self.status = ""
+                self._use_local_only()
             elif key == "\x1b":
                 self.running = False
             return

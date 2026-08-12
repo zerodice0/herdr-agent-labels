@@ -263,6 +263,116 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertFalse(app.discovery_choice)
         self.assertTrue(app.running)
 
+    def test_local_only_cancels_discovery_and_removes_remote_agents(self):
+        sender = agent()
+        local_recipient = agent(
+            name="red-fox",
+            pane_id="w1:p2",
+            session_id="session-2",
+        )
+        remote_recipient = agent_directory.replace(
+            local_recipient,
+            host="macbook",
+            name="white-owl",
+            pane_id="w2:p1",
+            session_id="remote-session",
+            local=False,
+        )
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender, local_recipient],
+                ),
+                mock.patch.object(
+                    agent_messenger,
+                    "ssh_hosts",
+                    return_value=["macbook"],
+                ),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        discovery = mock.Mock()
+        app.discovery_choice = True
+        app.mode_choice = False
+        app.discovery = discovery
+        app.remote_enabled = True
+        app.pending_hosts = {"macbook"}
+        app.host_status = {"macbook": app.text["refreshing"]}
+        app.agents.append(remote_recipient)
+        app.selected = {local_recipient.identity, remote_recipient.identity}
+
+        app.handle_key("\x1b")
+        app.handle_key("l")
+
+        discovery.cancel.assert_called_once_with()
+        self.assertIsNone(app.discovery)
+        self.assertFalse(app.remote_enabled)
+        self.assertFalse(app.pending_hosts)
+        self.assertFalse(app.host_status)
+        self.assertEqual(app.agents, [local_recipient])
+        self.assertEqual(app.selected, {local_recipient.identity})
+
+    def test_mode_privacy_copy_wraps_on_narrow_screens_in_every_language(self):
+        sender = agent()
+        for language in messenger_i18n.SUPPORTED_LANGUAGES:
+            environment = {"LANG": f"{language}_TEST.UTF-8"}
+            screen = mock.Mock()
+            screen.getmaxyx.return_value = (22, 44)
+            with tempfile.TemporaryDirectory() as state_directory:
+                environment["HERDR_PLUGIN_STATE_DIR"] = state_directory
+                with (
+                    mock.patch.object(
+                        agent_messenger,
+                        "query_local_agents",
+                        return_value=[sender],
+                    ),
+                    mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+                ):
+                    app = agent_messenger.MessengerApp(screen, sender, environment)
+
+            rendered: list[tuple[int, int, str]] = []
+
+            def record(row, column, value, _attribute=0):
+                rendered.append((row, column, value))
+
+            with mock.patch.object(app, "_safe_add", side_effect=record):
+                app._render_mode_choice(3)
+
+            descriptions = "".join(
+                value for _row, column, value in rendered if column == 6
+            )
+            self.assertEqual(
+                descriptions,
+                app.text["delegate_privacy"] + app.text["direct_privacy"],
+                language,
+            )
+            self.assertTrue(
+                all(
+                    agent_messenger.display_width(value) <= 37
+                    for _row, column, value in rendered
+                    if column == 6
+                ),
+                language,
+            )
+            for mode, privacy_key in (
+                (agent_messenger.DELIVERY_DELEGATE, "delegate_privacy"),
+                (agent_messenger.DELIVERY_DIRECT, "direct_privacy"),
+            ):
+                rendered.clear()
+                app.delivery_mode = mode
+                with mock.patch.object(app, "_safe_add", side_effect=record):
+                    app._render_mode_summary(3)
+                summary = "".join(
+                    value for _row, column, value in rendered if column == 2
+                )
+                self.assertEqual(summary, app.text[privacy_key], language)
+
     def test_color_pairs_use_terminal_palette(self):
         sender = agent()
         with tempfile.TemporaryDirectory() as state_directory:
@@ -517,7 +627,8 @@ class AgentMessengerTest(unittest.TestCase):
                 app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
 
         app.selected = {first.identity, second.identity}
-        app.message_lines = ["Please review this change."]
+        original_request = "\n  Please review this change.  \n"
+        app.message_lines = original_request.split("\n")
         results = [agent_directory.SendResult(sender, True)]
         with (
             mock.patch.object(agent_messenger, "fetch_local_agent", return_value=sender),
@@ -540,7 +651,12 @@ class AgentMessengerTest(unittest.TestCase):
         orchestration_request = dispatch.call_args.args[2]
         self.assertIn(first.qualified_name, orchestration_request)
         self.assertIn(second.qualified_name, orchestration_request)
-        self.assertIn("Please review this change.", orchestration_request)
+        self.assertIn(
+            "--- BEGIN ORIGINAL REQUEST ---\n"
+            f"{original_request}\n"
+            "--- END ORIGINAL REQUEST ---",
+            orchestration_request,
+        )
         self.assertIn("tailored", orchestration_request)
         self.assertIn("Use Herdr", orchestration_request)
         self.assertIn("Wait for the workers", orchestration_request)
@@ -568,7 +684,7 @@ class AgentMessengerTest(unittest.TestCase):
 
         app.selected = {first.identity, second.identity}
         app.delivery_mode = agent_messenger.DELIVERY_DIRECT
-        app.message_lines = ["Please review this change."]
+        app.message_lines = ["  Please review this change.  "]
         results = [
             agent_directory.SendResult(first, True),
             agent_directory.SendResult(second, True),
@@ -638,6 +754,40 @@ class AgentMessengerTest(unittest.TestCase):
             deadline = time.monotonic() + 1
             while app.send_results.empty() and time.monotonic() < deadline:
                 time.sleep(0.001)
+            app._poll_send()
+
+        self.assertFalse(app.sending)
+        self.assertEqual(app.status, app.text["send_cancelled"])
+
+    def test_cancelled_sender_revalidation_reports_send_cancelled(self):
+        sender = agent()
+        recipient = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender, recipient],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        def cancelled_fetch(*_args, cancel_event, **_kwargs):
+            cancel_event.set()
+            return None
+
+        with mock.patch.object(
+            agent_messenger,
+            "fetch_local_agent",
+            side_effect=cancelled_fetch,
+        ):
+            app.sending = True
+            app._dispatch_send_job((recipient,), "Review")
             app._poll_send()
 
         self.assertFalse(app.sending)
