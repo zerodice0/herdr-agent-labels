@@ -1,8 +1,8 @@
 id = "herdr.agent-labels"
 name = "Agent Labels"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.8.0"
-description = "Assign readable color-animal names to unnamed Herdr agents."
+description = "Label Herdr agents and route prompts to local or SSH-hosted peers."
 platforms = ["macos", "linux"]
 
 [[actions]]
@@ -12,6 +12,19 @@ description = "Assign a color-animal name to the agent in the focused pane."
 contexts = ["pane"]
 command = ["python3", "agent_labels.py", "label"]
 
+[[actions]]
+id = "message-agents"
+title = "Send Prompt to Agents"
+description = "Select one or more local or SSH-hosted agents and send them a prompt."
+contexts = ["pane"]
+command = ["python3", "agent_messenger.py", "launch"]
+
 [[events]]
 on = "pane.agent_detected"
 command = ["python3", "agent_labels.py", "event"]
+
+[[panes]]
+id = "messenger"
+title = "Agent Messenger"
+placement = "popup"
+command = ["python3", "agent_messenger.py", "popup"]

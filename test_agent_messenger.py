@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+
+import tempfile
+import threading
+import time
+import unittest
+from unittest import mock
+
+import agent_directory
+import agent_messenger
+import messenger_i18n
+
+
+def agent(
+    *,
+    name: str = "blue-raven",
+    pane_id: str = "w1:p1",
+    session_id: str = "session-1",
+) -> agent_directory.AgentRecord:
+    return agent_directory.AgentRecord(
+        host="local",
+        name=name,
+        pane_id=pane_id,
+        workspace_id="w1",
+        workspace_label="project",
+        status="idle",
+        session_id=session_id,
+        cwd="/work/project",
+        local=True,
+        revision=1,
+        agent_kind="codex",
+        terminal_id=f"terminal-{pane_id}",
+    )
+
+
+class ImmediateThread:
+    def __init__(self, *, target, args=(), **_kwargs):
+        self.target = target
+        self.args = args
+
+    def start(self):
+        self.target(*self.args)
+
+
+class AgentMessengerTest(unittest.TestCase):
+    def test_focused_pane_id_prefers_plugin_context(self):
+        environment = {
+            "HERDR_PLUGIN_CONTEXT_JSON": '{"focused_pane_id":"w2:p3"}',
+            "HERDR_ACTIVE_PANE_ID": "w1:p1",
+        }
+        self.assertEqual(agent_messenger.focused_pane_id(environment), "w2:p3")
+
+    def test_launch_notifies_when_focused_pane_has_no_agent(self):
+        environment = {"HERDR_PANE_ID": "w1:p1", "LANG": "en_US.UTF-8"}
+        with (
+            mock.patch.object(agent_messenger, "fetch_local_agent", return_value=None),
+            mock.patch.object(agent_messenger, "show_notification", return_value=True) as notify,
+            mock.patch.object(agent_messenger, "launch_popup") as popup,
+        ):
+            self.assertEqual(agent_messenger.launch(environment), 0)
+        self.assertIn("No agent is running", notify.call_args.args[0])
+        popup.assert_not_called()
+
+    def test_launch_opens_popup_for_focused_agent(self):
+        environment = {"HERDR_PANE_ID": "w1:p1", "LANG": "en_US.UTF-8"}
+        with (
+            mock.patch.object(agent_messenger, "fetch_local_agent", return_value=agent()),
+            mock.patch.object(agent_messenger, "launch_popup", return_value=True) as popup,
+        ):
+            self.assertEqual(agent_messenger.launch(environment), 0)
+        popup.assert_called_once_with("w1:p1", environment)
+
+    def test_launch_popup_uses_compact_dimensions(self):
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(agent_messenger, "run_herdr", return_value=completed) as run:
+            self.assertTrue(agent_messenger.launch_popup("w1:p1", {}))
+        arguments = run.call_args.args[0]
+        self.assertEqual(arguments[arguments.index("--width") + 1], "110")
+        self.assertEqual(arguments[arguments.index("--height") + 1], "34")
+
+    def test_language_detection_supports_three_locales(self):
+        self.assertEqual(messenger_i18n.detect_language({"LANG": "en_US.UTF-8"}), "en")
+        self.assertEqual(messenger_i18n.detect_language({"LANG": "ja_JP.UTF-8"}), "ja")
+        self.assertEqual(messenger_i18n.detect_language({"LANG": "ko_KR.UTF-8"}), "ko")
+
+    def test_unknown_language_falls_back_to_english(self):
+        with mock.patch.object(messenger_i18n, "_macos_language", return_value=None):
+            self.assertEqual(messenger_i18n.detect_language({"LANG": "fr_FR.UTF-8"}), "en")
+
+    def test_locale_precedence_stops_at_first_configured_value(self):
+        self.assertEqual(
+            messenger_i18n.detect_language(
+                {"LC_ALL": "fr_FR.UTF-8", "LANG": "ko_KR.UTF-8"}
+            ),
+            "en",
+        )
+        self.assertEqual(
+            messenger_i18n.detect_language(
+                {"LC_ALL": "", "LC_MESSAGES": "ja_JP.UTF-8", "LANG": "ko_KR.UTF-8"}
+            ),
+            "ja",
+        )
+
+    def test_display_width_accounts_for_wide_characters(self):
+        self.assertEqual(agent_messenger.display_width("Agent 한글"), 10)
+
+    def test_message_soft_wrap_preserves_text_and_maps_cursor(self):
+        message = "현재 프로젝트 내용을 분석하고 리뷰한 내용을 종합해서 보고해줘."
+        wrapped, cursor_row, cursor_column = agent_messenger.wrap_message_lines(
+            [message],
+            width=16,
+            cursor_row=0,
+            cursor_column=len(message),
+        )
+
+        self.assertEqual("".join(line.text for line in wrapped), message)
+        self.assertTrue(
+            all(agent_messenger.display_width(line.text) <= 16 for line in wrapped)
+        )
+        self.assertEqual(cursor_row, len(wrapped) - 1)
+        self.assertEqual(
+            cursor_column,
+            agent_messenger.display_width(wrapped[-1].text),
+        )
+
+    def test_cursor_at_soft_wrap_boundary_moves_to_next_visual_line(self):
+        wrapped, cursor_row, cursor_column = agent_messenger.wrap_message_lines(
+            ["abcdef"],
+            width=3,
+            cursor_row=0,
+            cursor_column=3,
+        )
+
+        self.assertEqual([line.text for line in wrapped], ["abc", "def"])
+        self.assertEqual((cursor_row, cursor_column), (1, 0))
+
+    def test_display_column_maps_to_cjk_character_boundary(self):
+        self.assertEqual(
+            agent_messenger.character_index_at_display_column("가나다", 3),
+            1,
+        )
+
+    def test_discovery_choice_supports_arrows_and_enter(self):
+        sender = agent()
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(
+                    agent_messenger,
+                    "ssh_hosts",
+                    return_value=["macbook"],
+                ),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        self.assertFalse(app.discovery_choice)
+        app.handle_key(agent_messenger.curses.KEY_DOWN)
+        self.assertEqual(app.discovery_option, 1)
+        with mock.patch.object(app, "_start_remote_discovery") as discover:
+            app.handle_key("\n")
+        self.assertTrue(app.discovery_choice)
+        self.assertFalse(app.remote_enabled)
+        discover.assert_not_called()
+
+    def test_color_pairs_use_terminal_palette(self):
+        sender = agent()
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        with (
+            mock.patch.object(agent_messenger.curses, "has_colors", return_value=True),
+            mock.patch.object(agent_messenger.curses, "start_color"),
+            mock.patch.object(agent_messenger.curses, "use_default_colors"),
+            mock.patch.object(agent_messenger.curses, "init_pair") as init_pair,
+        ):
+            app._initialize_colors()
+
+        self.assertTrue(app.colors_enabled)
+        self.assertEqual(init_pair.call_count, 5)
+        self.assertTrue(all(call.args[2] == -1 for call in init_pair.call_args_list))
+
+    def test_message_cursor_is_placed_after_footer_rendering(self):
+        sender = agent()
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (34, 110)
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(screen, sender, environment)
+
+        app.section = "message"
+        app.message_lines = ["hello"]
+        app.message_column = 5
+        with mock.patch.object(app, "_set_cursor_visibility"):
+            app.render()
+
+        self.assertEqual(screen.move.call_args.args, app.message_cursor)
+        self.assertEqual(app.message_cursor[1], 7)
+
+    def test_long_message_cursor_remains_inside_editor(self):
+        sender = agent()
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (22, 44)
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "ko_KR.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(screen, sender, environment)
+
+        app.section = "message"
+        app.message_lines = ["긴 메시지를 입력해도 화면에서 잘리지 않아야 합니다. " * 4]
+        app.message_column = len(app.message_lines[0])
+        with mock.patch.object(app, "_set_cursor_visibility"):
+            app.render()
+
+        cursor_row, cursor_column = screen.move.call_args.args
+        self.assertLess(cursor_row, 20)
+        self.assertLess(cursor_column, 43)
+        self.assertEqual(screen.move.call_args.args, app.message_cursor)
+
+    def test_arrow_keys_move_between_soft_wrapped_message_rows(self):
+        sender = agent()
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (22, 12)
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(screen, sender, environment)
+
+        app.section = "message"
+        app.message_lines = ["abcdefghijklmnopqrst"]
+        app.message_column = 20
+        app.handle_key(agent_messenger.curses.KEY_UP)
+        self.assertEqual((app.message_row, app.message_column), (0, 12))
+        app.handle_key(agent_messenger.curses.KEY_UP)
+        self.assertEqual((app.message_row, app.message_column), (0, 4))
+
+    def test_ctrl_s_invokes_send_from_message_editor(self):
+        sender = agent()
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        app.section = "message"
+        with mock.patch.object(app, "_send") as send:
+            app.handle_key("\x13")
+        send.assert_called_once_with()
+
+    def test_local_refresh_removes_disappeared_agent_selection(self):
+        sender = agent()
+        recipient = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender, recipient],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        app.selected.add(recipient.identity)
+        with mock.patch.object(
+            agent_messenger,
+            "query_local_agents",
+            return_value=[sender],
+        ):
+            app.handle_key("\x12")
+        self.assertNotIn(recipient.identity, app.selected)
+
+    def test_remote_scope_does_not_replace_local_agents_with_same_host(self):
+        sender = agent()
+        local_recipient = agent(
+            name="red-fox",
+            pane_id="w1:p2",
+            session_id="session-2",
+        )
+        remote_recipient = agent_directory.replace(
+            local_recipient,
+            local=False,
+            name="white-owl",
+            pane_id="w2:p1",
+            session_id="remote-session",
+        )
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender, local_recipient],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        app._replace_agent_scope(
+            local=False,
+            host=local_recipient.host,
+            records=[remote_recipient],
+        )
+        self.assertIn(local_recipient, app.agents)
+        self.assertIn(remote_recipient, app.agents)
+
+    @unittest.skipIf(agent_messenger.termios is None, "termios unavailable")
+    def test_terminal_flow_control_is_disabled_and_restored(self):
+        stream = mock.Mock()
+        stream.fileno.return_value = 7
+        original = [
+            agent_messenger.termios.IXON | agent_messenger.termios.IXOFF | 1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            [],
+        ]
+        with (
+            mock.patch.object(
+                agent_messenger.termios,
+                "tcgetattr",
+                return_value=original,
+            ),
+            mock.patch.object(agent_messenger.termios, "tcsetattr") as set_attributes,
+        ):
+            with agent_messenger.terminal_flow_control_disabled(stream):
+                pass
+
+        disabled = set_attributes.call_args_list[0].args[2]
+        self.assertFalse(disabled[0] & agent_messenger.termios.IXON)
+        self.assertFalse(disabled[0] & agent_messenger.termios.IXOFF)
+        self.assertEqual(set_attributes.call_args_list[1].args[2], original)
+
+    def test_send_dispatches_to_multiple_selected_recipients(self):
+        sender = agent()
+        first = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
+        second = agent(name="white-owl", pane_id="w1:p3", session_id="session-3")
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender, first, second],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        app.selected = {first.identity, second.identity}
+        app.message_lines = ["Please review this change."]
+        results = [
+            agent_directory.SendResult(first, True),
+            agent_directory.SendResult(second, True),
+        ]
+        with (
+            mock.patch.object(agent_messenger, "fetch_local_agent", return_value=sender),
+            mock.patch.object(
+                agent_messenger,
+                "dispatch_prompts",
+                return_value=results,
+            ) as dispatch,
+            mock.patch.object(agent_messenger, "show_notification"),
+            mock.patch.object(agent_messenger.threading, "Thread", ImmediateThread),
+        ):
+            app._send()
+            app._poll_send()
+
+        self.assertFalse(app.running)
+        self.assertCountEqual(dispatch.call_args.args[1], [first, second])
+        self.assertEqual(dispatch.call_args.args[2], "Please review this change.")
+
+    def test_send_runs_in_background_and_escape_cancels_pending_work(self):
+        sender = agent()
+        recipient = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
+        started = threading.Event()
+        stopped = threading.Event()
+
+        def cancellable_dispatch(*_args, cancel_event, **_kwargs):
+            started.set()
+            cancel_event.wait(1)
+            stopped.set()
+            return []
+
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender, recipient],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        app.selected = {recipient.identity}
+        app.message_lines = ["Review"]
+        with (
+            mock.patch.object(agent_messenger, "fetch_local_agent", return_value=sender),
+            mock.patch.object(
+                agent_messenger,
+                "dispatch_prompts",
+                side_effect=cancellable_dispatch,
+            ),
+        ):
+            before = time.monotonic()
+            app._send()
+            self.assertLess(time.monotonic() - before, 0.1)
+            self.assertTrue(started.wait(1))
+            app.handle_key("\x1b")
+            self.assertTrue(stopped.wait(1))
+            deadline = time.monotonic() + 1
+            while app.send_results.empty() and time.monotonic() < deadline:
+                time.sleep(0.001)
+            app._poll_send()
+
+        self.assertFalse(app.sending)
+        self.assertEqual(app.status, app.text["send_cancelled"])
+
+    def test_partial_send_failure_keeps_only_failed_recipients_selected(self):
+        sender = agent()
+        succeeded = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
+        failed = agent(name="white-owl", pane_id="w1:p3", session_id="session-3")
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender, succeeded, failed],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        app.sending = True
+        app.selected = {succeeded.identity, failed.identity}
+        app.send_results.put(
+            agent_messenger.SendJobResult(
+                True,
+                (
+                    agent_directory.SendResult(succeeded, True),
+                    agent_directory.SendResult(failed, False, "unavailable"),
+                ),
+            )
+        )
+        app._poll_send()
+
+        self.assertEqual(app.selected, {failed.identity})
+        self.assertIn("failed for 1", app.status)
+
+
+if __name__ == "__main__":
+    unittest.main()

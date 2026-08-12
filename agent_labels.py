@@ -13,7 +13,7 @@ from typing import Any, Iterator, NamedTuple
 
 SOURCE = "herdr.agent-labels"
 SEED_HASH_BYTES = 4
-# Coprime with 128 aliases, so every alias is visited exactly once.
+# Coprime with the current alias count, so every alias is visited exactly once.
 CANDIDATE_STRIDE = 37
 
 
