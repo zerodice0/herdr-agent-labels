@@ -52,6 +52,60 @@ class AgentDirectoryTest(unittest.TestCase):
                 ["included-host", "root-host"],
             )
 
+    def test_ssh_descriptors_map_alias_to_tailscale_device_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config"
+            config.write_text(
+                "Host macbook-pro\n  HostName 100.122.240.112\n",
+                encoding="utf-8",
+            )
+            status = subprocess.CompletedProcess(
+                ["tailscale"],
+                0,
+                json.dumps(
+                    {
+                        "Peer": {
+                            "node": {
+                                "HostName": "MacBook Pro",
+                                "DNSName": "macbook-pro.example.ts.net.",
+                                "TailscaleIPs": ["100.122.240.112"],
+                            }
+                        }
+                    }
+                ),
+                "",
+            )
+            with mock.patch.object(
+                agent_directory,
+                "_run_command",
+                return_value=status,
+            ):
+                descriptors = agent_directory.ssh_host_descriptors(
+                    ["macbook-pro"],
+                    config_path=config,
+                )
+
+        descriptor = descriptors["macbook-pro"]
+        self.assertEqual(descriptor.destination, "100.122.240.112")
+        self.assertEqual(descriptor.device_name, "MacBook Pro")
+        self.assertEqual(descriptor.dns_name, "macbook-pro.example.ts.net")
+        self.assertEqual(descriptor.display_name, "macbook-pro → MacBook Pro")
+
+    def test_parse_tailscale_devices_accepts_magicdns_short_name(self):
+        devices = agent_directory.parse_tailscale_devices(
+            {
+                "Self": {
+                    "HostName": "작업용 미니 PC",
+                    "DNSName": "winmini.example.ts.net.",
+                    "TailscaleIPs": ["100.86.235.65"],
+                }
+            }
+        )
+        self.assertEqual(
+            devices["winmini"],
+            ("작업용 미니 PC", "winmini.example.ts.net"),
+        )
+
     def test_parse_agent_payload_builds_addressable_records(self):
         payload = {
             "result": {
@@ -73,6 +127,124 @@ class AgentDirectoryTest(unittest.TestCase):
         self.assertEqual(records[0].qualified_name, "macbook/blue-raven")
         self.assertEqual(records[0].session_id, "session-1")
         self.assertEqual(records[0].workspace_label, "project")
+
+    def test_snapshot_uses_unicode_workspace_label_and_worktree_metadata(self):
+        payload = {
+            "result": {
+                "snapshot": {
+                    "agents": [
+                        {
+                            "agent": "codex",
+                            "agent_status": "idle",
+                            "cwd": "/work/repo/.herdr/worktrees/feature-a",
+                            "name": "blue-raven",
+                            "pane_id": "w1:p1",
+                            "workspace_id": "w1",
+                        }
+                    ],
+                    "workspaces": [
+                        {
+                            "workspace_id": "w1",
+                            "label": "결제 기능 작업트리",
+                            "worktree": {
+                                "checkout_path": "/work/repo/.herdr/worktrees/feature-a",
+                                "is_linked_worktree": True,
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+
+        records = agent_directory.parse_agent_payload(
+            payload,
+            host="local",
+            local=True,
+        )
+
+        self.assertEqual(records[0].workspace_label, "결제 기능 작업트리")
+        self.assertTrue(records[0].workspace_is_worktree)
+
+    def test_snapshot_does_not_badge_the_primary_checkout_as_a_worktree(self):
+        payload = {
+            "result": {
+                "snapshot": {
+                    "agents": [
+                        {
+                            "agent": "codex",
+                            "cwd": "/work/repo",
+                            "pane_id": "w1:p1",
+                            "workspace_id": "w1",
+                        }
+                    ],
+                    "workspaces": [
+                        {
+                            "workspace_id": "w1",
+                            "label": "기본 체크아웃",
+                            "worktree": {
+                                "checkout_path": "/work/repo",
+                                "is_linked_worktree": False,
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+
+        records = agent_directory.parse_agent_payload(
+            payload,
+            host="local",
+            local=True,
+        )
+
+        self.assertEqual(records[0].workspace_label, "기본 체크아웃")
+        self.assertFalse(records[0].workspace_is_worktree)
+
+    def test_display_metadata_alias_routes_through_current_pane(self):
+        records = agent_directory.parse_agent_payload(
+            {
+                "result": {
+                    "agents": [
+                        {
+                            "agent": "codex",
+                            "display_agent": "🟪 purple-koala",
+                            "pane_id": "w1:p4",
+                            "tokens": {
+                                "alias": "purple-koala",
+                                "color": "purple",
+                            },
+                        }
+                    ]
+                }
+            },
+            host="macbook-pro",
+            local=False,
+        )
+
+        self.assertEqual(records[0].name, "purple-koala")
+        self.assertEqual(records[0].target, "w1:p4")
+        self.assertEqual(records[0].qualified_name, "macbook-pro/purple-koala")
+
+    def test_unverified_display_metadata_is_not_an_addressable_label(self):
+        records = agent_directory.parse_agent_payload(
+            {
+                "result": {
+                    "agents": [
+                        {
+                            "agent": "codex",
+                            "display_agent": "someone else",
+                            "pane_id": "w1:p4",
+                            "tokens": {"alias": "purple-koala"},
+                        }
+                    ]
+                }
+            },
+            host="macbook-pro",
+            local=False,
+        )
+
+        self.assertEqual(records[0].name, "")
+        self.assertEqual(records[0].target, "w1:p4")
 
     def test_agent_list_payload_requires_expected_result_shape(self):
         self.assertTrue(

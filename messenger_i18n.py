@@ -75,14 +75,32 @@ MESSAGES: dict[str, dict[str, str]] = {
         "agent_unavailable": "agent unavailable",
         "host_unavailable": "host unavailable",
         "interactive_required": "Agent Messenger requires an interactive terminal.",
+        "skill_guide_title": "Agent Skill Guide",
+        "skill_guide_intro": (
+            "Use the bundled skill to route requests by host and agent label without "
+            "opening this popup."
+        ),
+        "skill_guide_install": (
+            "Run 'Install Agent Skill' from the command palette, or load this file:"
+        ),
+        "skill_guide_target": "Target format: host/label",
+        "skill_guide_example": (
+            "Example: Use the agent messenger skill to ask macbook-pro/purple-koala "
+            "for a status report."
+        ),
+        "skill_guide_close": "Ctrl+G / Esc Back",
         "help_recipients": (
             "↑↓ Move  Space Toggle  Ctrl+A All  Ctrl+D Clear  Tab Message  "
-            "Ctrl+O Mode  Ctrl+R Refresh  Esc Close"
+            "Ctrl+O Mode  Ctrl+R Refresh  Ctrl+G Skill  Esc Close"
         ),
-        "help_message": "Enter New line  Tab Recipients  Ctrl+O Mode  Ctrl+S Send  Esc Close",
+        "help_message": (
+            "Enter New line  Tab Recipients  Ctrl+O Mode  Ctrl+S Send  Ctrl+G Skill  Esc Close"
+        ),
         "help_sending": "Sending...  Esc Cancel pending submissions",
-        "help_discovery": "↑↓ Move  Enter Select  D Discover  L Local only  Esc Cancel",
-        "help_mode": "↑↓ Move  Enter Select  C Coordinator  D Direct  Esc Back",
+        "help_discovery": (
+            "↑↓ Move  Enter Select  D Discover  L Local only  Ctrl+G Skill  Esc Cancel"
+        ),
+        "help_mode": "↑↓ Move  Enter Select  C Coordinator  D Direct  Ctrl+G Skill  Esc Back",
     },
     "ko": {
         "title": "에이전트 메신저",
@@ -140,14 +158,30 @@ MESSAGES: dict[str, dict[str, str]] = {
         "agent_unavailable": "에이전트를 사용할 수 없음",
         "host_unavailable": "호스트에 연결할 수 없음",
         "interactive_required": "에이전트 메신저에는 대화형 터미널이 필요합니다.",
+        "skill_guide_title": "에이전트 스킬 안내",
+        "skill_guide_intro": (
+            "팝업을 열지 않고 호스트와 에이전트 라벨로 요청을 전달하려면 내장 스킬을 사용하세요."
+        ),
+        "skill_guide_install": (
+            "명령 팔레트에서 'Install Agent Skill'을 실행하거나 다음 파일을 불러오세요:"
+        ),
+        "skill_guide_target": "대상 형식: host/label",
+        "skill_guide_example": (
+            "예: 에이전트 메신저 스킬로 macbook-pro/purple-koala에게 상태 보고를 요청해줘."
+        ),
+        "skill_guide_close": "Ctrl+G / Esc 뒤로",
         "help_recipients": (
             "↑↓ 이동  Space 선택  Ctrl+A 전체  Ctrl+D 해제  Tab 메시지  "
-            "Ctrl+O 모드  Ctrl+R 새로고침  Esc 닫기"
+            "Ctrl+O 모드  Ctrl+R 새로고침  Ctrl+G 스킬  Esc 닫기"
         ),
-        "help_message": "Enter 줄바꿈  Tab 받는 에이전트  Ctrl+O 모드  Ctrl+S 전송  Esc 닫기",
+        "help_message": (
+            "Enter 줄바꿈  Tab 받는 에이전트  Ctrl+O 모드  Ctrl+S 전송  Ctrl+G 스킬  Esc 닫기"
+        ),
         "help_sending": "전송 중...  Esc 대기 중인 전송 취소",
-        "help_discovery": "↑↓ 이동  Enter 선택  D 탐색  L 현재 시스템만  Esc 취소",
-        "help_mode": "↑↓ 이동  Enter 선택  C 코디네이터  D 직접 전송  Esc 뒤로",
+        "help_discovery": (
+            "↑↓ 이동  Enter 선택  D 탐색  L 현재 시스템만  Ctrl+G 스킬  Esc 취소"
+        ),
+        "help_mode": "↑↓ 이동  Enter 선택  C 코디네이터  D 직접 전송  Ctrl+G 스킬  Esc 뒤로",
     },
     "ja": {
         "title": "エージェントメッセンジャー",
@@ -205,14 +239,30 @@ MESSAGES: dict[str, dict[str, str]] = {
         "agent_unavailable": "エージェントを利用できません",
         "host_unavailable": "ホストに接続できません",
         "interactive_required": "エージェントメッセンジャーには対話型ターミナルが必要です。",
+        "skill_guide_title": "エージェントスキルガイド",
+        "skill_guide_intro": (
+            "ポップアップを開かず、ホストとエージェントラベルで依頼を送るには同梱スキルを使用します。"
+        ),
+        "skill_guide_install": (
+            "コマンドパレットで 'Install Agent Skill' を実行するか、このファイルを読み込みます:"
+        ),
+        "skill_guide_target": "宛先形式: host/label",
+        "skill_guide_example": (
+            "例: エージェントメッセンジャースキルで macbook-pro/purple-koala に状況報告を依頼。"
+        ),
+        "skill_guide_close": "Ctrl+G / Esc 戻る",
         "help_recipients": (
             "↑↓ 移動  Space 選択  Ctrl+A 全選択  Ctrl+D 解除  Tab メッセージ  "
-            "Ctrl+O モード  Ctrl+R 更新  Esc 閉じる"
+            "Ctrl+O モード  Ctrl+R 更新  Ctrl+G スキル  Esc 閉じる"
         ),
-        "help_message": "Enter 改行  Tab 送信先  Ctrl+O モード  Ctrl+S 送信  Esc 閉じる",
+        "help_message": (
+            "Enter 改行  Tab 送信先  Ctrl+O モード  Ctrl+S 送信  Ctrl+G スキル  Esc 閉じる"
+        ),
         "help_sending": "送信中...  Esc 保留中の送信をキャンセル",
-        "help_discovery": "↑↓ 移動  Enter 選択  D 検索  L ローカルのみ  Esc キャンセル",
-        "help_mode": "↑↓ 移動  Enter 選択  C コーディネーター  D 直接送信  Esc 戻る",
+        "help_discovery": (
+            "↑↓ 移動  Enter 選択  D 検索  L ローカルのみ  Ctrl+G スキル  Esc キャンセル"
+        ),
+        "help_mode": "↑↓ 移動  Enter 選択  C コーディネーター  D 直接送信  Ctrl+G スキル  Esc 戻る",
     },
 }
 

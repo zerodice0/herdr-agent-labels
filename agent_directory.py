@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import selectors
 import shlex
 import socket
@@ -44,10 +45,12 @@ class AgentRecord:
     revision: int = 0
     agent_kind: str = ""
     terminal_id: str = ""
+    workspace_is_worktree: bool = False
+    route_target: str = ""
 
     @property
     def target(self) -> str:
-        return self.name or self.pane_id
+        return self.route_target or self.name or self.pane_id
 
     @property
     def identity(self) -> str:
@@ -60,7 +63,7 @@ class AgentRecord:
 
     @property
     def qualified_name(self) -> str:
-        return f"{self.host}/{self.target}"
+        return f"{self.host}/{self.name or self.pane_id}"
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,23 @@ class SendResult:
     agent: AgentRecord
     success: bool
     error: str = ""
+
+
+@dataclass(frozen=True)
+class SshHostDescriptor:
+    alias: str
+    destination: str
+    device_name: str = ""
+    dns_name: str = ""
+
+    @property
+    def display_name(self) -> str:
+        detail = self.device_name or self.destination
+        return (
+            self.alias
+            if not detail or detail == self.alias
+            else f"{self.alias} → {detail}"
+        )
 
 
 def decode_json_object(value: str) -> dict[str, Any]:
@@ -95,6 +115,27 @@ def local_host_name() -> str:
     return socket.gethostname().split(".", 1)[0] or "local"
 
 
+def agent_label(raw_agent: Mapping[str, Any]) -> tuple[str, str]:
+    """Return the visible label and a current Herdr routing target."""
+
+    registered_name = str(
+        raw_agent.get("name") or raw_agent.get("agent_name") or ""
+    )
+    pane_id = str(raw_agent.get("pane_id") or "")
+    if registered_name:
+        return registered_name, registered_name
+
+    tokens = raw_agent.get("tokens")
+    alias = str(tokens.get("alias") or "") if isinstance(tokens, dict) else ""
+    display_agent = str(raw_agent.get("display_agent") or "")
+    alias_is_displayed = display_agent == alias or display_agent.endswith(f" {alias}")
+    if re.fullmatch(r"[a-z]+-[a-z]+", alias) and alias_is_displayed:
+        # Display metadata can outlive Herdr's registered name. Keep the label
+        # addressable while routing by the pane ID that belongs to this snapshot.
+        return alias, pane_id
+    return "", pane_id
+
+
 def parse_agent_payload(
     payload: Mapping[str, Any],
     *,
@@ -104,9 +145,27 @@ def parse_agent_payload(
     result_data = payload.get("result")
     if not isinstance(result_data, dict):
         return []
-    raw_agents = result_data.get("agents")
+    snapshot = result_data.get("snapshot")
+    container = snapshot if isinstance(snapshot, dict) else result_data
+    raw_agents = container.get("agents")
     if not isinstance(raw_agents, list):
         return []
+
+    workspace_metadata: dict[str, tuple[str, bool]] = {}
+    raw_workspaces = container.get("workspaces")
+    if isinstance(raw_workspaces, list):
+        for raw_workspace in raw_workspaces:
+            if not isinstance(raw_workspace, dict):
+                continue
+            workspace_id = str(raw_workspace.get("workspace_id") or "")
+            if not workspace_id:
+                continue
+            worktree = raw_workspace.get("worktree")
+            workspace_metadata[workspace_id] = (
+                str(raw_workspace.get("label") or workspace_id),
+                isinstance(worktree, dict)
+                and bool(worktree.get("is_linked_worktree")),
+            )
 
     records: list[AgentRecord] = []
     for raw_agent in raw_agents:
@@ -116,10 +175,14 @@ def parse_agent_payload(
         agent_kind = str(raw_agent.get("agent") or "")
         if not pane_id or not agent_kind:
             continue
-        name = str(raw_agent.get("name") or raw_agent.get("agent_name") or "")
+        name, route_target = agent_label(raw_agent)
         cwd = str(raw_agent.get("cwd") or "")
         workspace_id = str(raw_agent.get("workspace_id") or "")
-        workspace_label = Path(cwd).name if cwd else workspace_id
+        fallback_label = Path(cwd).name if cwd else workspace_id
+        workspace_label, workspace_is_worktree = workspace_metadata.get(
+            workspace_id,
+            (fallback_label, False),
+        )
         session_data = raw_agent.get("agent_session")
         session_id = ""
         if isinstance(session_data, dict):
@@ -138,6 +201,8 @@ def parse_agent_payload(
                 revision=int(raw_agent.get("revision") or 0),
                 agent_kind=agent_kind,
                 terminal_id=str(raw_agent.get("terminal_id") or ""),
+                workspace_is_worktree=workspace_is_worktree,
+                route_target=route_target,
             )
         )
     return records
@@ -145,7 +210,11 @@ def parse_agent_payload(
 
 def is_agent_list_payload(payload: Mapping[str, Any]) -> bool:
     result_data = payload.get("result")
-    return isinstance(result_data, dict) and isinstance(result_data.get("agents"), list)
+    if not isinstance(result_data, dict):
+        return False
+    snapshot = result_data.get("snapshot")
+    container = snapshot if isinstance(snapshot, dict) else result_data
+    return isinstance(container.get("agents"), list)
 
 
 class OutputLimitExceeded(Exception):
@@ -249,12 +318,23 @@ def _run_command(
     return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
 
 
+def run_bounded_command(
+    command: Sequence[str],
+    *,
+    timeout: float = REMOTE_DISCOVERY_TIMEOUT_SECONDS,
+    cancel_event: threading.Event | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess with the directory's timeout, cancellation, and output cap."""
+
+    return _run_command(command, timeout=timeout, cancel_event=cancel_event)
+
+
 def query_local_agents(
     environment: Mapping[str, str] | None = None,
     *,
     cancel_event: threading.Event | None = None,
 ) -> list[AgentRecord]:
-    command = [herdr_executable(environment), "agent", "list"]
+    command = [herdr_executable(environment), "api", "snapshot"]
     result = _run_command(command, cancel_event=cancel_event)
     if result.returncode != 0:
         return []
@@ -271,20 +351,13 @@ def fetch_local_agent(
     *,
     cancel_event: threading.Event | None = None,
 ) -> AgentRecord | None:
-    command = [herdr_executable(environment), "agent", "get", pane_id]
+    command = [herdr_executable(environment), "api", "snapshot"]
     result = _run_command(command, cancel_event=cancel_event)
     if result.returncode != 0:
         return None
     payload = decode_json_object(result.stdout)
-    result_data = payload.get("result")
-    if not isinstance(result_data, dict):
-        return None
-    raw_agent = result_data.get("agent")
-    if not isinstance(raw_agent, dict):
-        return None
-    list_payload = {"result": {"agents": [raw_agent]}}
-    records = parse_agent_payload(list_payload, host=local_host_name(), local=True)
-    return records[0] if records else None
+    records = parse_agent_payload(payload, host=local_host_name(), local=True)
+    return next((record for record in records if record.pane_id == pane_id), None)
 
 
 def ssh_config_path(environment: Mapping[str, str] | None = None) -> Path:
@@ -350,6 +423,116 @@ def ssh_hosts(environment: Mapping[str, str] | None = None) -> list[str]:
     return parse_ssh_hosts(ssh_config_path(environment))
 
 
+def parse_ssh_destinations(
+    path: Path,
+    *,
+    _visited: set[Path] | None = None,
+) -> dict[str, str]:
+    """Read explicit HostName values without evaluating Match exec directives."""
+
+    visited = set() if _visited is None else _visited
+    try:
+        resolved_path = path.expanduser().resolve()
+    except OSError:
+        resolved_path = path.expanduser().absolute()
+    if resolved_path in visited:
+        return {}
+    visited.add(resolved_path)
+    try:
+        lines = resolved_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+
+    destinations: dict[str, str] = {}
+    current_hosts: list[str] = []
+    for line in lines:
+        try:
+            fields = shlex.split(line.strip(), comments=True)
+        except ValueError:
+            continue
+        if not fields:
+            continue
+        keyword = fields[0].lower()
+        if keyword == "include":
+            for pattern in fields[1:]:
+                include_path = Path(pattern).expanduser()
+                if not include_path.is_absolute():
+                    include_path = resolved_path.parent / include_path
+                for matched_path in sorted(glob.glob(os.fspath(include_path))):
+                    for alias, destination in parse_ssh_destinations(
+                        Path(matched_path),
+                        _visited=visited,
+                    ).items():
+                        destinations.setdefault(alias, destination)
+            continue
+        if keyword == "host":
+            current_hosts = [
+                host
+                for host in fields[1:]
+                if not host.startswith("-")
+                and not any(character in host for character in "*!?")
+            ]
+            continue
+        if keyword == "hostname" and len(fields) >= 2:
+            for host in current_hosts:
+                destinations.setdefault(host, fields[1])
+    return destinations
+
+
+def parse_tailscale_devices(payload: Mapping[str, Any]) -> dict[str, tuple[str, str]]:
+    devices: dict[str, tuple[str, str]] = {}
+    raw_devices: list[Any] = [payload.get("Self")]
+    peers = payload.get("Peer")
+    if isinstance(peers, dict):
+        raw_devices.extend(peers.values())
+    for raw_device in raw_devices:
+        if not isinstance(raw_device, dict):
+            continue
+        device_name = str(raw_device.get("HostName") or "")
+        dns_name = str(raw_device.get("DNSName") or "").rstrip(".")
+        keys = [dns_name, dns_name.split(".", 1)[0] if dns_name else ""]
+        addresses = raw_device.get("TailscaleIPs")
+        if isinstance(addresses, list):
+            keys.extend(str(address) for address in addresses)
+        for key in keys:
+            if key:
+                devices[key.casefold()] = (device_name, dns_name)
+    return devices
+
+
+def ssh_host_descriptors(
+    hosts: Sequence[str],
+    *,
+    config_path: Path,
+) -> dict[str, SshHostDescriptor]:
+    if not hosts:
+        return {}
+    destinations = parse_ssh_destinations(config_path)
+    tailscale_result = _run_command(
+        ["tailscale", "status", "--json"],
+        timeout=1.0,
+    )
+    tailscale_devices = (
+        parse_tailscale_devices(decode_json_object(tailscale_result.stdout))
+        if tailscale_result.returncode == 0
+        else {}
+    )
+    descriptors: dict[str, SshHostDescriptor] = {}
+    for alias in hosts:
+        destination = destinations.get(alias, alias)
+        device_name, dns_name = tailscale_devices.get(
+            destination.rstrip(".").casefold(),
+            ("", ""),
+        )
+        descriptors[alias] = SshHostDescriptor(
+            alias=alias,
+            destination=destination,
+            device_name=device_name,
+            dns_name=dns_name,
+        )
+    return descriptors
+
+
 def _remote_herdr_command(arguments: Sequence[str]) -> str:
     quoted_arguments = " ".join(shlex.quote(argument) for argument in arguments)
     script = (
@@ -403,7 +586,7 @@ def query_remote_agents(
     cancel_event: threading.Event | None = None,
 ) -> ProbeResult:
     result = _run_command(
-        ssh_command(host, ["agent", "list"], config_path=config_path),
+        ssh_command(host, ["api", "snapshot"], config_path=config_path),
         timeout=timeout,
         cancel_event=cancel_event,
     )
@@ -580,7 +763,7 @@ class RemoteDiscovery:
             if self._cancelled.is_set():
                 self.results.put(ProbeResult(host, (), False, "cancelled"))
                 return
-            command = ssh_command(host, ["agent", "list"], config_path=self.config_path)
+            command = ssh_command(host, ["api", "snapshot"], config_path=self.config_path)
             try:
                 process = subprocess.Popen(
                     command,

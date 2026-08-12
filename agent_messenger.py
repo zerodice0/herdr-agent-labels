@@ -35,6 +35,7 @@ from agent_directory import (
     herdr_executable,
     query_local_agents,
     ssh_config_path,
+    ssh_host_descriptors,
     ssh_hosts,
 )
 from messenger_i18n import detect_language, messages
@@ -42,8 +43,12 @@ from messenger_i18n import detect_language, messages
 
 PLUGIN_ID = "herdr.agent-labels"
 POPUP_ENTRYPOINT = "messenger"
-POPUP_WIDTH = "110"
-POPUP_HEIGHT = "34"
+POPUP_WIDTH = 88
+POPUP_HEIGHT = 23
+SKILL_GUIDE_ENTRYPOINT = "skill-guide"
+SKILL_GUIDE_WIDTH = 80
+SKILL_GUIDE_HEIGHT = 16
+SKILL_RELATIVE_PATH = Path(".agents/skills/herdr-agent-messenger/SKILL.md")
 SENDER_PANE_ENV = "HERDR_AGENT_MESSENGER_SENDER_PANE_ID"
 STATUS_ORDER = {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 4}
 PAIR_ACCENT = 1
@@ -53,6 +58,7 @@ PAIR_ERROR = 4
 PAIR_REMOTE = 5
 DELIVERY_DELEGATE = "delegate"
 DELIVERY_DIRECT = "direct"
+SKILL_GUIDE_KEY = "\x07"
 
 
 @dataclass(frozen=True)
@@ -180,10 +186,23 @@ def show_notification(
     return result.returncode == 0
 
 
-def launch_popup(
-    pane_id: str,
+def bundled_skill_path() -> Path:
+    return Path(__file__).resolve().parent / SKILL_RELATIVE_PATH
+
+
+def launch_plugin_popup(
+    entrypoint: str,
+    *,
+    width: int,
+    height: int,
     environment: Mapping[str, str] | None = None,
+    extra_arguments: Sequence[str] = (),
 ) -> bool:
+    popup_width, popup_height = responsive_popup_size(
+        width,
+        height,
+        environment,
+    )
     result = run_herdr(
         [
             "plugin",
@@ -192,20 +211,76 @@ def launch_popup(
             "--plugin",
             PLUGIN_ID,
             "--entrypoint",
-            POPUP_ENTRYPOINT,
+            entrypoint,
             "--placement",
             "popup",
             "--width",
-            POPUP_WIDTH,
+            str(popup_width),
             "--height",
-            POPUP_HEIGHT,
+            str(popup_height),
             "--focus",
-            "--env",
-            f"{SENDER_PANE_ENV}={pane_id}",
+            *extra_arguments,
         ],
         environment,
     )
     return result.returncode == 0
+
+
+def responsive_popup_size(
+    maximum_width: int,
+    maximum_height: int,
+    environment: Mapping[str, str] | None = None,
+) -> tuple[int, int]:
+    """Fit a popup inside the active Herdr viewport while retaining margins."""
+
+    result = run_herdr(["pane", "layout", "--current"], environment)
+    payload = decode_json_object(result.stdout)
+    result_data = payload.get("result")
+    layout = result_data.get("layout") if isinstance(result_data, dict) else None
+    area = layout.get("area") if isinstance(layout, dict) else None
+    if not isinstance(area, dict):
+        return maximum_width, maximum_height
+    try:
+        available_width = int(area.get("width") or 0)
+        available_height = int(area.get("height") or 0)
+    except (TypeError, ValueError):
+        return maximum_width, maximum_height
+    if available_width <= 0 or available_height <= 0:
+        return maximum_width, maximum_height
+    return (
+        min(maximum_width, max(32, available_width - 8)),
+        min(maximum_height, max(12, available_height - 4)),
+    )
+
+
+def launch_popup(
+    pane_id: str,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    return launch_plugin_popup(
+        POPUP_ENTRYPOINT,
+        width=POPUP_WIDTH,
+        height=POPUP_HEIGHT,
+        environment=environment,
+        extra_arguments=(
+            "--env",
+            f"{SENDER_PANE_ENV}={pane_id}",
+        ),
+    )
+
+
+def launch_skill_guide(environment: Mapping[str, str] | None = None) -> int:
+    text = messages(detect_language(environment))
+    if launch_plugin_popup(
+        SKILL_GUIDE_ENTRYPOINT,
+        width=SKILL_GUIDE_WIDTH,
+        height=SKILL_GUIDE_HEIGHT,
+        environment=environment,
+    ):
+        return 0
+    if not show_notification(text["popup_open_failed"], environment):
+        print(text["popup_open_failed"], file=sys.stderr)
+    return 1
 
 
 def launch(environment: Mapping[str, str] | None = None) -> int:
@@ -330,6 +405,79 @@ def wrap_display_text(value: str, width: int) -> list[str]:
     return [line.text for line in wrapped]
 
 
+def truncate_display_text(value: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if display_width(value) <= width:
+        return value
+    if width == 1:
+        return "…"
+    output = ""
+    for character in value:
+        if display_width(output + character) > width - 1:
+            break
+        output += character
+    return output + "…"
+
+
+def pad_display_text(value: str, width: int) -> str:
+    truncated = truncate_display_text(value, width)
+    return truncated + " " * max(0, width - display_width(truncated))
+
+
+def workspace_display(agent: AgentRecord) -> str:
+    prefix = "WT:" if agent.workspace_is_worktree else ""
+    return f"{prefix}{agent.workspace_label or agent.workspace_id}"
+
+
+def skill_guide_lines(text: Mapping[str, str], skill_path: Path) -> list[str]:
+    return [
+        text["skill_guide_intro"],
+        "",
+        text["skill_guide_target"],
+        "",
+        text["skill_guide_install"],
+        os.fspath(skill_path),
+        "",
+        text["skill_guide_example"],
+    ]
+
+
+def render_skill_guide_screen(
+    screen: curses.window,
+    text: Mapping[str, str],
+    skill_path: Path,
+) -> None:
+    screen.erase()
+    height, width = screen.getmaxyx()
+
+    def add(row: int, column: int, value: str, attribute: int = 0) -> None:
+        if row < 0 or row >= height or column < 0 or column >= width:
+            return
+        try:
+            screen.addnstr(row, column, value, max(0, width - column - 1), attribute)
+        except curses.error:
+            pass
+
+    add(0, 0, text["skill_guide_title"], curses.A_BOLD)
+    row = 2
+    for value in skill_guide_lines(text, skill_path):
+        if not value:
+            row += 1
+            continue
+        for line in wrap_display_text(value, max(1, width - 4)):
+            if row >= height - 1:
+                break
+            add(row, 2, line)
+            row += 1
+    add(height - 1, 0, text["skill_guide_close"], curses.A_DIM)
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    screen.refresh()
+
+
 @contextmanager
 def terminal_flow_control_disabled(stream: TextIO) -> Iterator[None]:
     """Let curses receive Ctrl+S instead of treating it as terminal XOFF."""
@@ -368,6 +516,10 @@ class MessengerApp:
         self.text = messages(detect_language(environment))
         self.config_path = ssh_config_path(environment)
         self.hosts = ssh_hosts(environment)
+        self.host_descriptors = ssh_host_descriptors(
+            self.hosts,
+            config_path=self.config_path,
+        )
         self.cache = AgentCache.from_environment(environment)
         self.agents = [
             agent
@@ -400,6 +552,7 @@ class MessengerApp:
         self.sending = False
         self.send_results: queue.Queue[SendJobResult] = queue.Queue()
         self.send_cancel = threading.Event()
+        self.skill_guide_visible = False
 
     def _initialize_colors(self) -> None:
         if not curses.has_colors():
@@ -448,10 +601,37 @@ class MessengerApp:
             key=lambda agent: (
                 not agent.local,
                 agent.host.casefold(),
+                agent.workspace_label.casefold(),
+                agent.workspace_id.casefold(),
                 STATUS_ORDER.get(agent.status, 9),
                 agent.target.casefold(),
             ),
         )
+
+    def _display_host(self, host: str) -> str:
+        descriptor = self.host_descriptors.get(host)
+        return descriptor.display_name if descriptor else host
+
+    def _recipient_line(self, agent: AgentRecord, marker: str, state: str) -> str:
+        _height, width = self.screen.getmaxyx()
+        workspace = workspace_display(agent)
+        target = (
+            agent.target
+            if agent.local
+            else f"{self._display_host(agent.host)}/{agent.target}"
+        )
+        if width >= 88:
+            workspace_width = min(28, max(16, width // 4))
+            target_width = max(18, width - workspace_width - 18)
+            return (
+                f"[{marker}] "
+                f"{pad_display_text(workspace, workspace_width)} "
+                f"{pad_display_text(target, target_width)} "
+                f"{state}"
+            )
+        available = max(8, width - display_width(state) - 5)
+        identity = f"{workspace} · {target}"
+        return f"[{marker}] {truncate_display_text(identity, available)} {state}"
 
     def _replace_agent_scope(
         self,
@@ -726,10 +906,7 @@ class MessengerApp:
                 if disabled
                 else self.text.get(f"status_{agent.status}", agent.status)
             )
-            line = (
-                f"[{marker}] {agent.host}/{agent.target:<20} "
-                f"{state:<10} {agent.workspace_label}"
-            )
+            line = self._recipient_line(agent, marker, state)
             if disabled:
                 line_attribute = curses.A_DIM
             elif agent.identity in self.selected:
@@ -799,6 +976,10 @@ class MessengerApp:
         return row + visible_rows
 
     def render(self) -> None:
+        if self.skill_guide_visible:
+            self.message_cursor = None
+            render_skill_guide_screen(self.screen, self.text, bundled_skill_path())
+            return
         self.screen.erase()
         self.message_cursor = None
         height, _width = self.screen.getmaxyx()
@@ -849,7 +1030,7 @@ class MessengerApp:
 
         if self.remote_enabled:
             host_summary = "  ".join(
-                f'{host}:{status or self.text["available"]}'
+                f'{self._display_host(host)}:{status or self.text["available"]}'
                 for host, status in sorted(self.host_status.items())
             )
             self._safe_add(
@@ -1113,6 +1294,22 @@ class MessengerApp:
             self.status = self.text["all_failed"]
 
     def handle_key(self, key: str | int) -> None:
+        if self.skill_guide_visible:
+            if key in (
+                SKILL_GUIDE_KEY,
+                "?",
+                "\x1b",
+                "q",
+                "Q",
+                "\n",
+                "\r",
+                curses.KEY_ENTER,
+            ):
+                self.skill_guide_visible = False
+            return
+        if key == SKILL_GUIDE_KEY and not self.sending:
+            self.skill_guide_visible = True
+            return
         if not self.discovery_choice:
             if key == curses.KEY_UP:
                 self.discovery_option = (self.discovery_option - 1) % 2
@@ -1227,11 +1424,45 @@ def popup(environment: Mapping[str, str] | None = None) -> int:
         return curses.wrapper(lambda screen: MessengerApp(screen, sender, values).run())
 
 
+def skill_guide(environment: Mapping[str, str] | None = None) -> int:
+    values = dict(os.environ if environment is None else environment)
+    text = messages(detect_language(values))
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print(text["interactive_required"], file=sys.stderr)
+        return 1
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+
+    def run(screen: curses.window) -> int:
+        screen.keypad(True)
+        while True:
+            render_skill_guide_screen(screen, text, bundled_skill_path())
+            key = screen.get_wch()
+            if key in (
+                SKILL_GUIDE_KEY,
+                "?",
+                "\x1b",
+                "q",
+                "Q",
+                "\n",
+                "\r",
+                curses.KEY_ENTER,
+            ):
+                return 0
+
+    return curses.wrapper(run)
+
+
 def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Send prompts to Herdr agents.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("launch", help="Validate the focused agent and open the popup.")
     subparsers.add_parser("popup", help="Run the interactive popup.")
+    subparsers.add_parser("guide-launch", help="Open the bundled agent skill guide.")
+    subparsers.add_parser("guide", help="Run the interactive agent skill guide.")
+    subparsers.add_parser("skill-path", help="Print the bundled SKILL.md path.")
     return parser.parse_args(argv)
 
 
@@ -1239,7 +1470,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parse_cli_arguments(argv)
     if arguments.command == "launch":
         return launch()
-    return popup()
+    if arguments.command == "popup":
+        return popup()
+    if arguments.command == "guide-launch":
+        return launch_skill_guide()
+    if arguments.command == "guide":
+        return skill_guide()
+    print(bundled_skill_path())
+    return 0
 
 
 if __name__ == "__main__":

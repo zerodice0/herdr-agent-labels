@@ -42,11 +42,59 @@ Run the `Send Prompt to Agents` action from a pane that contains an agent. The
 focused agent becomes the fixed sender; the action shows an error notification
 instead of opening the popup when the focused pane has no running agent.
 
-The popup lists agents from the current Herdr session immediately. When concrete
+The popup lists agents from the current Herdr session immediately, sorted by
+the workspace label shown by Herdr. Unicode labels are preserved, and
+worktree-backed workspaces carry a `WT:` prefix. When concrete
 `Host` aliases exist in `~/.ssh/config`, choose remote discovery to query them
-asynchronously. Only hosts that return a valid `herdr agent list` response within
+asynchronously. Only hosts that return a valid Herdr snapshot response within
 five seconds are included. Remote results are cached briefly so reopening the
 popup does not contact every host again.
+
+## Agent Skill
+
+The plugin bundles `.agents/skills/herdr-agent-messenger/SKILL.md` as the
+canonical skill and a Claude discovery entry at
+`.claude/skills/herdr-agent-messenger/SKILL.md`.
+It lets an agent route requests without opening the popup by addressing a current
+recipient as `host/label`, for example `macbook-pro/purple-koala`. Remote hosts
+must be concrete aliases in the user's SSH config, and labels are resolved again
+before every operation so a stale pane occupant is not reused.
+Only the literal host `local` selects the current Herdr server; every other host
+is treated as an SSH alias, even if it matches the local machine's hostname.
+
+In a repository checkout, Codex and Claude discover the skill from their
+project-level skill directories. To make it available from every workspace,
+open `Install Agent Skill` from Herdr's command palette and select Codex,
+Claude, or both. This installs or updates the bundled files under the user's
+agent skill directories; start a new agent session afterward. The installer
+refuses to overwrite an unrelated skill directory with the same name.
+
+For usage help, open `Agent Skill Guide` from Herdr's command palette, press
+`Ctrl+G` inside Agent Messenger, or invoke the guide action from any directory:
+
+```bash
+herdr plugin action invoke agent-skill-guide --plugin herdr.agent-labels
+```
+
+From the plugin checkout or installed plugin root, print the packaged skill path
+directly:
+
+```bash
+python3 agent_messenger.py skill-path
+```
+
+Ask Codex or Claude to read that `SKILL.md`, then request work naturally. The
+`$herdr-agent-messenger` form is available when the project-level skill has been
+discovered; an explicit natural-language request also works after loading the
+printed path:
+
+```text
+Use $herdr-agent-messenger to ask macbook-pro/purple-koala for a status report.
+```
+
+The bundled helper supports listing, sending with an optional settled-state wait,
+and reading recent output. It reuses the plugin's SSH host allowlist, forwarding
+protections, host-key policy, and current-agent verification.
 
 After SSH discovery, choose a delivery mode:
 
@@ -75,6 +123,23 @@ the configured policy requires one, usable authentication, a reachable SSH
 service, or a running Herdr server are skipped. Concrete `Host` aliases from
 recursive `Include` files are supported.
 
+Tailscale does not require a special plugin-specific SSH format. Keep a stable,
+human-readable SSH alias and point it to either the device's MagicDNS name or
+Tailscale IP, for example:
+
+```sshconfig
+Host winmini
+  HostName winmini.example-tailnet.ts.net
+  User your-remote-user
+```
+
+The plugin still probes only explicit SSH aliases; it never treats every device
+in the tailnet as authorized automatically. When the local `tailscale` CLI can
+match an alias destination to a peer, the UI shows both identities, such as
+`macbook-pro → MacBook Pro`. Otherwise it shows the SSH alias and configured
+destination. This keeps the route stable even if the friendly device name
+contains spaces or non-ASCII characters.
+
 Prompts sent remotely include the sender's local hostname and agent label. The
 private `0600` discovery cache stores remote agent labels, pane/session metadata,
 status, workspace paths, and host aliases under `HERDR_PLUGIN_STATE_DIR`.
@@ -95,6 +160,7 @@ Keyboard controls:
 - `Tab`: switch between recipients and the message editor
 - `Ctrl+O`: reopen the delivery mode screen
 - `Ctrl+R`: refresh local and authorized remote agents
+- `Ctrl+G`: show the bundled Agent Messenger skill guide
 - `Ctrl+S`: send the prompt
 - `Esc`: go back from delivery mode, cancel discovery or pending sends, then close
   the popup

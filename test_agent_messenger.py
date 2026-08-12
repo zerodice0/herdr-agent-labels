@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from pathlib import Path
 import tempfile
 import threading
 import time
@@ -16,13 +17,15 @@ def agent(
     name: str = "blue-raven",
     pane_id: str = "w1:p1",
     session_id: str = "session-1",
+    workspace_label: str = "project",
+    workspace_is_worktree: bool = False,
 ) -> agent_directory.AgentRecord:
     return agent_directory.AgentRecord(
         host="local",
         name=name,
         pane_id=pane_id,
         workspace_id="w1",
-        workspace_label="project",
+        workspace_label=workspace_label,
         status="idle",
         session_id=session_id,
         cwd="/work/project",
@@ -30,6 +33,7 @@ def agent(
         revision=1,
         agent_kind="codex",
         terminal_id=f"terminal-{pane_id}",
+        workspace_is_worktree=workspace_is_worktree,
     )
 
 
@@ -43,6 +47,69 @@ class ImmediateThread:
 
 
 class AgentMessengerTest(unittest.TestCase):
+    def test_agents_sort_by_workspace_before_status_and_label(self):
+        sender = agent()
+        zeta = agent(
+            name="alpha-agent",
+            pane_id="w1:p2",
+            session_id="session-2",
+            workspace_label="한글 작업공간",
+        )
+        alpha = agent(
+            name="zeta-agent",
+            pane_id="w2:p1",
+            session_id="session-3",
+            workspace_label="alpha-worktree",
+            workspace_is_worktree=True,
+        )
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "ko_KR.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender, zeta, alpha],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        self.assertEqual(
+            [record.name for record in app.filtered_agents()],
+            ["zeta-agent", "alpha-agent"],
+        )
+        self.assertEqual(agent_messenger.workspace_display(alpha), "WT:alpha-worktree")
+        self.assertEqual(agent_messenger.workspace_display(zeta), "한글 작업공간")
+
+    def test_narrow_recipient_line_preserves_unicode_workspace_and_target(self):
+        record = agent(
+            name="white-bison",
+            workspace_label="결제 기능 작업트리",
+            workspace_is_worktree=True,
+        )
+        sender = agent(name="blue-raven", pane_id="w1:p9", session_id="sender")
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (25, 58)
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {"HERDR_PLUGIN_STATE_DIR": state_directory}
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender, record],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(screen, sender, environment)
+
+        line = app._recipient_line(record, " ", "idle")
+        self.assertLessEqual(agent_messenger.display_width(line), 58)
+        self.assertIn("WT:결제 기능", line)
+        self.assertIn("white-bison", line)
+
     def test_focused_pane_id_prefers_plugin_context(self):
         environment = {
             "HERDR_PLUGIN_CONTEXT_JSON": '{"focused_pane_id":"w2:p3"}',
@@ -75,8 +142,39 @@ class AgentMessengerTest(unittest.TestCase):
         with mock.patch.object(agent_messenger, "run_herdr", return_value=completed) as run:
             self.assertTrue(agent_messenger.launch_popup("w1:p1", {}))
         arguments = run.call_args.args[0]
-        self.assertEqual(arguments[arguments.index("--width") + 1], "110")
-        self.assertEqual(arguments[arguments.index("--height") + 1], "34")
+        self.assertEqual(arguments[arguments.index("--width") + 1], "88")
+        self.assertEqual(arguments[arguments.index("--height") + 1], "23")
+
+    def test_popup_dimensions_fit_small_viewport(self):
+        layout = mock.Mock(
+            returncode=0,
+            stdout=(
+                '{"result":{"layout":{"area":{"width":80,"height":29}}}}'
+            ),
+        )
+        opened = mock.Mock(returncode=0, stdout="")
+        with mock.patch.object(
+            agent_messenger,
+            "run_herdr",
+            side_effect=[layout, opened],
+        ) as run:
+            self.assertTrue(agent_messenger.launch_popup("w1:p1", {}))
+        arguments = run.call_args_list[-1].args[0]
+        self.assertEqual(arguments[arguments.index("--width") + 1], "72")
+        self.assertEqual(arguments[arguments.index("--height") + 1], "23")
+
+    def test_skill_guide_action_uses_compact_popup_and_bundled_skill(self):
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(agent_messenger, "run_herdr", return_value=completed) as run:
+            self.assertEqual(agent_messenger.launch_skill_guide({}), 0)
+        arguments = run.call_args.args[0]
+        self.assertEqual(
+            arguments[arguments.index("--entrypoint") + 1],
+            agent_messenger.SKILL_GUIDE_ENTRYPOINT,
+        )
+        self.assertEqual(arguments[arguments.index("--width") + 1], "80")
+        self.assertEqual(arguments[arguments.index("--height") + 1], "16")
+        self.assertTrue(agent_messenger.bundled_skill_path().is_file())
 
     def test_language_detection_supports_three_locales(self):
         self.assertEqual(messenger_i18n.detect_language({"LANG": "en_US.UTF-8"}), "en")
@@ -105,6 +203,8 @@ class AgentMessengerTest(unittest.TestCase):
             self.assertTrue(required.issubset(text), language)
             self.assertIn("Ctrl+O", text["help_recipients"])
             self.assertIn("Ctrl+O", text["help_message"])
+            self.assertIn("Ctrl+G", text["help_recipients"])
+            self.assertIn("host/label", text["skill_guide_target"])
 
     def test_locale_precedence_stops_at_first_configured_value(self):
         self.assertEqual(
@@ -122,6 +222,76 @@ class AgentMessengerTest(unittest.TestCase):
 
     def test_display_width_accounts_for_wide_characters(self):
         self.assertEqual(agent_messenger.display_width("Agent 한글"), 10)
+
+    def test_ctrl_g_toggles_skill_guide_without_changing_editor_state(self):
+        sender = agent()
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        app.mode_choice = True
+        app.section = "message"
+        app.message_lines = ["keep this"]
+        app.handle_key(agent_messenger.SKILL_GUIDE_KEY)
+        self.assertTrue(app.skill_guide_visible)
+        app.handle_key(agent_messenger.SKILL_GUIDE_KEY)
+        self.assertFalse(app.skill_guide_visible)
+        self.assertEqual(app.section, "message")
+        self.assertEqual(app.message_lines, ["keep this"])
+
+    def test_question_mark_is_inserted_while_editing_message(self):
+        sender = agent()
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        app.mode_choice = True
+        app.section = "message"
+        app.message_lines = ["Can you review"]
+        app.message_column = len(app.message_lines[0])
+        app.handle_key("?")
+
+        self.assertFalse(app.skill_guide_visible)
+        self.assertEqual(app.message_lines, ["Can you review?"])
+
+    def test_skill_guide_wraps_long_paths_inside_popup(self):
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (14, 42)
+        with mock.patch.object(agent_messenger.curses, "curs_set"):
+            agent_messenger.render_skill_guide_screen(
+                screen,
+                messenger_i18n.messages("en"),
+                Path(
+                    "/a/very/long/plugin/path/skills/herdr-agent-messenger/SKILL.md"
+                ),
+            )
+        for call in screen.addnstr.call_args_list:
+            row, column, _value, maximum = call.args[:4]
+            self.assertLess(row, 14)
+            self.assertLess(column, 42)
+            self.assertLessEqual(maximum, 41 - column)
 
     def test_message_soft_wrap_preserves_text_and_maps_cursor(self):
         message = "현재 프로젝트 내용을 분석하고 리뷰한 내용을 종합해서 보고해줘."
