@@ -51,6 +51,8 @@ PAIR_SUCCESS = 2
 PAIR_WARNING = 3
 PAIR_ERROR = 4
 PAIR_REMOTE = 5
+DELIVERY_DELEGATE = "delegate"
+DELIVERY_DIRECT = "direct"
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,52 @@ class SendJobResult:
     results: tuple[SendResult, ...]
     error: str = ""
     cancelled: bool = False
+
+
+def _single_line(value: str) -> str:
+    return " ".join(value.split())
+
+
+def build_orchestration_request(
+    recipients: Sequence[AgentRecord],
+    original_request: str,
+) -> str:
+    """Ask the coordinator to do semantic decomposition and worker orchestration."""
+
+    worker_lines = []
+    for index, recipient in enumerate(recipients, start=1):
+        transport = "local Herdr" if recipient.local else f"SSH host {recipient.host}"
+        workspace = _single_line(recipient.workspace_label) or "unknown workspace"
+        worker_lines.append(
+            f"{index}. {recipient.qualified_name} "
+            f"(route: {transport}; workspace: {workspace}; status: {recipient.status})"
+        )
+    workers = "\n".join(worker_lines)
+    return (
+        "Agent Messenger orchestration request\n\n"
+        "You are the coordinator: the focused agent that opened Agent Messenger. "
+        "The plugin intentionally did not perform semantic task decomposition and did "
+        "not dispatch the user's request to the selected workers.\n\n"
+        "Selected workers:\n"
+        f"{workers}\n\n"
+        "User's original request (verbatim):\n"
+        "--- BEGIN ORIGINAL REQUEST ---\n"
+        f"{original_request}\n"
+        "--- END ORIGINAL REQUEST ---\n\n"
+        "Orchestrate this request now:\n"
+        "1. Analyze the complete original request and create a specific, tailored, "
+        "non-overlapping assignment for every selected worker listed above. Keep "
+        "dependencies and each worker's route/workspace in mind.\n"
+        "2. Use Herdr to send each worker its individual instruction. Use SSH transport "
+        "for remote routes when needed. Include only the context each worker needs; do "
+        "not automatically copy the full original request to every worker.\n"
+        "3. Wait for the workers' responses or settled states. Follow up when work is "
+        "missing, blocked, duplicated, or inconsistent.\n"
+        "4. Verify every result against the original request and the relevant workspace. "
+        "Run or request appropriate checks before accepting the work.\n"
+        "5. Integrate and synthesize the verified results, then report the final outcome "
+        "to the user, including failures or remaining risks.\n"
+    )
 
 
 def decode_json_object(value: str) -> dict[str, Any]:
@@ -327,6 +375,10 @@ class MessengerApp:
         self.status = self.text["no_ssh_hosts"] if not self.hosts else ""
         self.discovery_choice = bool(not self.hosts)
         self.discovery_option = 0
+        self.mode_choice = False
+        self.mode_return_to_editor = False
+        self.mode_option = 0
+        self.delivery_mode = DELIVERY_DELEGATE
         self.remote_enabled = False
         self.discovery: RemoteDiscovery | None = None
         self.pending_hosts: set[str] = set()
@@ -550,6 +602,54 @@ class MessengerApp:
             self._safe_add(row + 2 + index, 2, f"{marker} {label}", attribute)
         return row + 5
 
+    def _render_mode_choice(self, row: int) -> int:
+        self._safe_add(
+            row,
+            0,
+            self.text["mode_question"],
+            self._style(PAIR_ACCENT, curses.A_BOLD),
+        )
+        options = (
+            (
+                self.text["delegate_option"],
+                self.text["delegate_privacy"],
+            ),
+            (
+                self.text["direct_option"],
+                self.text["direct_privacy"],
+            ),
+        )
+        for index, (label, description) in enumerate(options):
+            marker = "›" if index == self.mode_option else " "
+            attribute = self._style(
+                PAIR_ACCENT if index == self.mode_option else 0,
+                curses.A_REVERSE | curses.A_BOLD
+                if index == self.mode_option
+                else curses.A_BOLD,
+            )
+            option_row = row + 2 + index * 3
+            self._safe_add(option_row, 2, f"{marker} {label}", attribute)
+            self._safe_add(option_row + 1, 6, description, curses.A_DIM)
+        return row + 8
+
+    def _render_mode_summary(self, row: int) -> int:
+        if self.delivery_mode == DELIVERY_DIRECT:
+            label = self.text["direct_option"]
+            description = self.text["direct_privacy"]
+            pair = PAIR_WARNING
+        else:
+            label = self.text["delegate_option"]
+            description = self.text["delegate_privacy"]
+            pair = PAIR_SUCCESS
+        self._safe_add(
+            row,
+            0,
+            f'{self.text["delivery_mode"]}: {label}',
+            self._style(pair, curses.A_BOLD),
+        )
+        self._safe_add(row + 1, 2, description, curses.A_DIM)
+        return row + 2
+
     def _render_recipients(self, row: int, available_rows: int) -> int:
         records = self.filtered_agents()
         selected_count = len(self.selected)
@@ -668,7 +768,7 @@ class MessengerApp:
         self._safe_add(
             1,
             0,
-            f'{self.text["from"]}: {self.sender.qualified_name}',
+            f'{self.text["coordinator"]}: {self.sender.qualified_name}',
             self._style(PAIR_SUCCESS),
         )
         row = 3
@@ -685,7 +785,20 @@ class MessengerApp:
             self.screen.refresh()
             return
 
+        if not self.mode_choice:
+            self._render_mode_choice(row)
+            self._safe_add(
+                height - 1,
+                0,
+                self.text["help_mode"],
+                curses.A_DIM,
+            )
+            self._set_cursor_visibility(False)
+            self.screen.refresh()
+            return
+
         reserved_footer = 3
+        row = self._render_mode_summary(row)
         content_height = max(6, height - row - reserved_footer)
         recipient_height = max(4, content_height // 2)
         row = self._render_recipients(row, recipient_height)
@@ -853,7 +966,11 @@ class MessengerApp:
         if not message:
             self.status = self.text["empty_message"]
             return
-        self.status = self.text["sending"]
+        self.status = (
+            self.text["delegating"]
+            if self.delivery_mode == DELIVERY_DELEGATE
+            else self.text["sending"]
+        )
         self.sending = True
         self.send_cancel.clear()
         threading.Thread(
@@ -879,10 +996,15 @@ class MessengerApp:
             if self.send_cancel.is_set():
                 self.send_results.put(SendJobResult(True, (), cancelled=True))
                 return
+            dispatch_recipients = recipients
+            dispatch_message = message
+            if self.delivery_mode == DELIVERY_DELEGATE:
+                dispatch_recipients = (self.sender,)
+                dispatch_message = build_orchestration_request(recipients, message)
             results = dispatch_prompts(
                 self.sender,
-                recipients,
-                message,
+                dispatch_recipients,
+                dispatch_message,
                 config_path=self.config_path,
                 environment=self.environment,
                 cancel_event=self.send_cancel,
@@ -911,15 +1033,32 @@ class MessengerApp:
             self.status = self.text["sender_unavailable"]
             return
         if job.error:
-            self.status = self.text["all_failed"]
+            self.status = (
+                self.text["delegate_failed"]
+                if self.delivery_mode == DELIVERY_DELEGATE
+                else self.text["all_failed"]
+            )
             return
         results = list(job.results)
+        if not results:
+            self.status = (
+                self.text["delegate_failed"]
+                if self.delivery_mode == DELIVERY_DELEGATE
+                else self.text["all_failed"]
+            )
+            return
         succeeded = [result for result in results if result.success]
         failed = [result for result in results if not result.success]
         if not failed:
-            body = self.text["sent"].format(count=len(succeeded))
+            if self.delivery_mode == DELIVERY_DELEGATE:
+                body = self.text["delegated"]
+            else:
+                body = self.text["sent"].format(count=len(succeeded))
             show_notification(body, self.environment)
             self.running = False
+            return
+        if self.delivery_mode == DELIVERY_DELEGATE:
+            self.status = self.text["delegate_failed"]
             return
         self.selected = {result.agent.identity for result in failed}
         if succeeded:
@@ -954,6 +1093,37 @@ class MessengerApp:
                 self.running = False
             return
 
+        if not self.mode_choice:
+            if key == curses.KEY_UP:
+                self.mode_option = (self.mode_option - 1) % 2
+            elif key == curses.KEY_DOWN:
+                self.mode_option = (self.mode_option + 1) % 2
+            elif key in ("\n", "\r", curses.KEY_ENTER, " "):
+                self.delivery_mode = (
+                    DELIVERY_DELEGATE if self.mode_option == 0 else DELIVERY_DIRECT
+                )
+                self.mode_choice = True
+                self.mode_return_to_editor = False
+            elif isinstance(key, str) and key.lower() == "c":
+                self.mode_option = 0
+                self.delivery_mode = DELIVERY_DELEGATE
+                self.mode_choice = True
+                self.mode_return_to_editor = False
+            elif isinstance(key, str) and key.lower() == "d":
+                self.mode_option = 1
+                self.delivery_mode = DELIVERY_DIRECT
+                self.mode_choice = True
+                self.mode_return_to_editor = False
+            elif key == "\x1b":
+                if self.mode_return_to_editor:
+                    self.mode_choice = True
+                    self.mode_return_to_editor = False
+                elif self.hosts:
+                    self.discovery_choice = False
+                else:
+                    self.running = False
+            return
+
         if self.sending:
             if key == "\x1b":
                 self.send_cancel.set()
@@ -965,6 +1135,11 @@ class MessengerApp:
                 self._cancel_discovery()
             else:
                 self.running = False
+            return
+        if key == "\x0f":
+            self.mode_option = 0 if self.delivery_mode == DELIVERY_DELEGATE else 1
+            self.mode_choice = False
+            self.mode_return_to_editor = True
             return
         if self.section == "recipients":
             self._handle_recipient_key(key)

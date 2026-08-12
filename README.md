@@ -48,6 +48,26 @@ asynchronously. Only hosts that return a valid `herdr agent list` response withi
 five seconds are included. Remote results are cached briefly so reopening the
 popup does not contact every host again.
 
+After SSH discovery, choose a delivery mode:
+
+- **Delegate through coordinator (default and recommended):** the focused agent
+  that opened the popup is the coordinator. The plugin sends that coordinator one
+  orchestration request containing the selected worker list and the user's
+  original request. It does not send the original request to the selected workers.
+  The coordinator performs the semantic task breakdown, sends each worker a
+  tailored instruction with Herdr, waits for and verifies their responses, then
+  synthesizes the result for the user. The Python plugin deliberately does not try
+  to interpret or split the work.
+- **Send directly (advanced):** preserves the original behavior. The plugin copies
+  the same complete message to every selected agent immediately.
+
+These modes have different privacy boundaries. Delegate mode exposes the complete
+request only to the coordinator; selected workers receive whatever tailored
+context the coordinator decides they need. Direct mode exposes the complete
+message to every selected agent, including agents reached through SSH. Agent and
+workspace metadata needed to route either mode remains subject to the discovery
+cache behavior described below.
+
 Remote discovery uses non-interactive SSH authentication and honors the user's
 host-key policy. It disables SSH forwarding, agent forwarding, X11 forwarding,
 and local commands for plugin probes. Hosts without an already trusted key when
@@ -68,13 +88,16 @@ Keyboard controls:
 - `Up` / `Down`: move through choices, recipients, or wrapped message lines
 - `Enter`: confirm the highlighted discovery choice
 - `D` / `L`: choose remote discovery or local-only directly
+- `C` / `D`: choose coordinator delegation or direct delivery on the mode screen
 - `Space`: toggle a recipient
 - `Ctrl+A`: select all filtered recipients
 - `Ctrl+D`: clear the selection
 - `Tab`: switch between recipients and the message editor
+- `Ctrl+O`: reopen the delivery mode screen
 - `Ctrl+R`: refresh local and authorized remote agents
 - `Ctrl+S`: send the prompt
-- `Esc`: cancel discovery or pending sends, then close the popup
+- `Esc`: go back from delivery mode, cancel discovery or pending sends, then close
+  the popup
 
 The UI follows `LC_ALL`, `LC_MESSAGES`, or `LANG` and supports English, Japanese,
 and Korean. Unsupported locales fall back to English.

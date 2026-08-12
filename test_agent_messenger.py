@@ -87,6 +87,25 @@ class AgentMessengerTest(unittest.TestCase):
         with mock.patch.object(messenger_i18n, "_macos_language", return_value=None):
             self.assertEqual(messenger_i18n.detect_language({"LANG": "fr_FR.UTF-8"}), "en")
 
+    def test_delivery_mode_copy_and_key_help_exist_in_every_language(self):
+        required = {
+            "coordinator",
+            "mode_question",
+            "delivery_mode",
+            "delegate_option",
+            "delegate_privacy",
+            "direct_option",
+            "direct_privacy",
+            "help_mode",
+        }
+        english_keys = set(messenger_i18n.messages("en"))
+        for language in messenger_i18n.SUPPORTED_LANGUAGES:
+            text = messenger_i18n.messages(language)
+            self.assertEqual(set(text), english_keys, language)
+            self.assertTrue(required.issubset(text), language)
+            self.assertIn("Ctrl+O", text["help_recipients"])
+            self.assertIn("Ctrl+O", text["help_message"])
+
     def test_locale_precedence_stops_at_first_configured_value(self):
         self.assertEqual(
             messenger_i18n.detect_language(
@@ -167,8 +186,82 @@ class AgentMessengerTest(unittest.TestCase):
         with mock.patch.object(app, "_start_remote_discovery") as discover:
             app.handle_key("\n")
         self.assertTrue(app.discovery_choice)
+        self.assertFalse(app.mode_choice)
         self.assertFalse(app.remote_enabled)
         discover.assert_not_called()
+
+    def test_delivery_mode_defaults_to_delegate_and_supports_keyboard_flow(self):
+        sender = agent()
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        self.assertTrue(app.discovery_choice)
+        self.assertFalse(app.mode_choice)
+        self.assertEqual(app.mode_option, 0)
+        self.assertEqual(app.delivery_mode, agent_messenger.DELIVERY_DELEGATE)
+
+        app.handle_key(agent_messenger.curses.KEY_DOWN)
+        self.assertEqual(app.mode_option, 1)
+        app.handle_key("\n")
+        self.assertTrue(app.mode_choice)
+        self.assertEqual(app.delivery_mode, agent_messenger.DELIVERY_DIRECT)
+
+        app.handle_key("\x0f")
+        self.assertFalse(app.mode_choice)
+        self.assertTrue(app.mode_return_to_editor)
+        app.handle_key("\x1b")
+        self.assertTrue(app.mode_choice)
+        self.assertEqual(app.delivery_mode, agent_messenger.DELIVERY_DIRECT)
+
+        app.handle_key("\x0f")
+        app.handle_key("c")
+        self.assertTrue(app.mode_choice)
+        self.assertEqual(app.delivery_mode, agent_messenger.DELIVERY_DELEGATE)
+
+        app.handle_key("\x0f")
+        app.handle_key("d")
+        self.assertTrue(app.mode_choice)
+        self.assertEqual(app.delivery_mode, agent_messenger.DELIVERY_DIRECT)
+
+    def test_escape_from_initial_mode_choice_returns_to_ssh_discovery(self):
+        sender = agent()
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(
+                    agent_messenger,
+                    "ssh_hosts",
+                    return_value=["macbook"],
+                ),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        app.handle_key("l")
+        self.assertTrue(app.discovery_choice)
+        self.assertFalse(app.mode_choice)
+        app.handle_key("\x1b")
+        self.assertFalse(app.discovery_choice)
+        self.assertTrue(app.running)
 
     def test_color_pairs_use_terminal_palette(self):
         sender = agent()
@@ -218,6 +311,7 @@ class AgentMessengerTest(unittest.TestCase):
             ):
                 app = agent_messenger.MessengerApp(screen, sender, environment)
 
+        app.mode_choice = True
         app.section = "message"
         app.message_lines = ["hello"]
         app.message_column = 5
@@ -246,6 +340,7 @@ class AgentMessengerTest(unittest.TestCase):
             ):
                 app = agent_messenger.MessengerApp(screen, sender, environment)
 
+        app.mode_choice = True
         app.section = "message"
         app.message_lines = ["긴 메시지를 입력해도 화면에서 잘리지 않아야 합니다. " * 4]
         app.message_column = len(app.message_lines[0])
@@ -276,6 +371,7 @@ class AgentMessengerTest(unittest.TestCase):
             ):
                 app = agent_messenger.MessengerApp(screen, sender, environment)
 
+        app.mode_choice = True
         app.section = "message"
         app.message_lines = ["abcdefghijklmnopqrst"]
         app.message_column = 20
@@ -301,6 +397,7 @@ class AgentMessengerTest(unittest.TestCase):
             ):
                 app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
 
+        app.mode_choice = True
         app.section = "message"
         with mock.patch.object(app, "_send") as send:
             app.handle_key("\x13")
@@ -324,6 +421,7 @@ class AgentMessengerTest(unittest.TestCase):
             ):
                 app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
 
+        app.mode_choice = True
         app.selected.add(recipient.identity)
         with mock.patch.object(
             agent_messenger,
@@ -399,7 +497,7 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertFalse(disabled[0] & agent_messenger.termios.IXOFF)
         self.assertEqual(set_attributes.call_args_list[1].args[2], original)
 
-    def test_send_dispatches_to_multiple_selected_recipients(self):
+    def test_delegate_sends_one_orchestration_request_to_coordinator_only(self):
         sender = agent()
         first = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
         second = agent(name="white-owl", pane_id="w1:p3", session_id="session-3")
@@ -419,6 +517,57 @@ class AgentMessengerTest(unittest.TestCase):
                 app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
 
         app.selected = {first.identity, second.identity}
+        app.message_lines = ["Please review this change."]
+        results = [agent_directory.SendResult(sender, True)]
+        with (
+            mock.patch.object(agent_messenger, "fetch_local_agent", return_value=sender),
+            mock.patch.object(
+                agent_messenger,
+                "dispatch_prompts",
+                return_value=results,
+            ) as dispatch,
+            mock.patch.object(agent_messenger, "show_notification"),
+            mock.patch.object(agent_messenger.threading, "Thread", ImmediateThread),
+        ):
+            app._send()
+            app._poll_send()
+
+        self.assertFalse(app.running)
+        self.assertEqual(dispatch.call_count, 1)
+        self.assertEqual(dispatch.call_args.args[1], (sender,))
+        self.assertNotIn(first, dispatch.call_args.args[1])
+        self.assertNotIn(second, dispatch.call_args.args[1])
+        orchestration_request = dispatch.call_args.args[2]
+        self.assertIn(first.qualified_name, orchestration_request)
+        self.assertIn(second.qualified_name, orchestration_request)
+        self.assertIn("Please review this change.", orchestration_request)
+        self.assertIn("tailored", orchestration_request)
+        self.assertIn("Use Herdr", orchestration_request)
+        self.assertIn("Wait for the workers", orchestration_request)
+        self.assertIn("Verify every result", orchestration_request)
+        self.assertIn("report the final outcome", orchestration_request)
+
+    def test_direct_mode_dispatches_to_multiple_selected_recipients(self):
+        sender = agent()
+        first = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
+        second = agent(name="white-owl", pane_id="w1:p3", session_id="session-3")
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender, first, second],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        app.selected = {first.identity, second.identity}
+        app.delivery_mode = agent_messenger.DELIVERY_DIRECT
         app.message_lines = ["Please review this change."]
         results = [
             agent_directory.SendResult(first, True),
@@ -468,6 +617,8 @@ class AgentMessengerTest(unittest.TestCase):
             ):
                 app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
 
+        app.mode_choice = True
+        app.delivery_mode = agent_messenger.DELIVERY_DIRECT
         app.selected = {recipient.identity}
         app.message_lines = ["Review"]
         with (
@@ -512,6 +663,7 @@ class AgentMessengerTest(unittest.TestCase):
                 app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
 
         app.sending = True
+        app.delivery_mode = agent_messenger.DELIVERY_DIRECT
         app.selected = {succeeded.identity, failed.identity}
         app.send_results.put(
             agent_messenger.SendJobResult(

@@ -1,8 +1,8 @@
 id = "herdr.agent-labels"
 name = "Agent Labels"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.8.0"
-description = "Label Herdr agents and route prompts to local or SSH-hosted peers."
+description = "Label Herdr agents and delegate or send prompts to local or SSH-hosted peers."
 platforms = ["macos", "linux"]
 
 [[actions]]
@@ -15,7 +15,7 @@ command = ["python3", "agent_labels.py", "label"]
 [[actions]]
 id = "message-agents"
 title = "Send Prompt to Agents"
-description = "Select one or more local or SSH-hosted agents and send them a prompt."
+description = "Select agents, then delegate through the coordinator or send directly."
 contexts = ["pane"]
 command = ["python3", "agent_messenger.py", "launch"]
 
