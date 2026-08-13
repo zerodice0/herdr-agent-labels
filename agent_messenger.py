@@ -7,11 +7,13 @@ import argparse
 from contextlib import contextmanager
 import curses
 from dataclasses import dataclass
+from itertools import combinations
 import json
 import locale
 import os
 from pathlib import Path
 import queue
+import re
 import subprocess
 import sys
 
@@ -45,9 +47,11 @@ POPUP_ENTRYPOINT = "messenger"
 POPUP_WIDTH = 120
 POPUP_HEIGHT = 32
 POPUP_MIN_HEIGHT = 15
-SKILL_GUIDE_ENTRYPOINT = "skill-guide"
-SKILL_GUIDE_WIDTH = 80
-SKILL_GUIDE_HEIGHT = 16
+MESSAGE_MIN_VISIBLE_ROWS = 4
+SKILL_INSTALLER_ENTRYPOINT = "skill-installer"
+SKILL_INSTALLER_WIDTH = 60
+SKILL_INSTALLER_HEIGHT = 15
+SKILL_PROJECT_ROOT_ENV = "HERDR_AGENT_SKILL_PROJECT_ROOT"
 SKILL_RELATIVE_PATH = Path(".agents/skills/herdr-agent-messenger/SKILL.md")
 SENDER_PANE_ENV = "HERDR_AGENT_MESSENGER_SENDER_PANE_ID"
 STATUS_ORDER = {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 4}
@@ -90,6 +94,12 @@ class RecipientViewRow:
     agent_index: int
     agent: AgentRecord
     group_count: int = 0
+
+
+@dataclass(frozen=True)
+class ShortcutHelpSpan:
+    text: str
+    keycap: bool = False
 
 
 def _single_line(value: str) -> str:
@@ -317,11 +327,20 @@ def estimated_recipient_counts(
 
 def launch_skill_guide(environment: Mapping[str, str] | None = None) -> int:
     text = messages(detect_language(environment))
+    values = os.environ if environment is None else environment
+    context = decode_json_object(values.get("HERDR_PLUGIN_CONTEXT_JSON", "{}"))
+    workspace = context.get("workspace")
+    nested_cwd = workspace.get("cwd") if isinstance(workspace, dict) else None
+    project_root = context.get("workspace_cwd") or nested_cwd
+    extra_arguments: tuple[str, ...] = ()
+    if isinstance(project_root, str) and project_root.strip():
+        extra_arguments = ("--env", f"{SKILL_PROJECT_ROOT_ENV}={project_root}")
     if launch_plugin_popup(
-        SKILL_GUIDE_ENTRYPOINT,
-        width=SKILL_GUIDE_WIDTH,
-        height=SKILL_GUIDE_HEIGHT,
+        SKILL_INSTALLER_ENTRYPOINT,
+        width=SKILL_INSTALLER_WIDTH,
+        height=SKILL_INSTALLER_HEIGHT,
         environment=environment,
+        extra_arguments=extra_arguments,
     ):
         return 0
     if not show_notification(text["popup_open_failed"], environment):
@@ -443,6 +462,31 @@ def wrap_message_lines(
     return wrapped, visual_cursor_row, visual_cursor_column
 
 
+def scrollbar_thumb(
+    total_rows: int,
+    visible_rows: int,
+    start: int,
+) -> tuple[int, int] | None:
+    """Return the scrollbar thumb offset and size for a vertical viewport."""
+
+    if visible_rows <= 0 or total_rows <= visible_rows:
+        return None
+    thumb_size = max(
+        1,
+        min(
+            visible_rows,
+            (visible_rows * visible_rows + total_rows - 1) // total_rows,
+        ),
+    )
+    scroll_range = total_rows - visible_rows
+    thumb_range = visible_rows - thumb_size
+    clamped_start = min(max(0, start), scroll_range)
+    thumb_start = (
+        clamped_start * thumb_range + scroll_range // 2
+    ) // scroll_range
+    return thumb_start, thumb_size
+
+
 def character_index_at_display_column(value: str, column: int) -> int:
     """Map a terminal-cell column to the nearest character boundary."""
 
@@ -466,26 +510,89 @@ def wrap_display_text(value: str, width: int) -> list[str]:
 
 
 def wrap_help_text(value: str, width: int) -> list[str]:
-    """Wrap shortcut help without splitting a key-label pair mid-word."""
+    """Return the plain-text form of keycap-styled shortcut help lines."""
+
+    return [
+        "".join(span.text for span in line)
+        for line in shortcut_help_spans(value, width)
+    ]
+
+
+def shortcut_help_spans(
+    value: str,
+    width: int,
+) -> list[tuple[ShortcutHelpSpan, ...]]:
+    """Lay out shortcut items while keeping each key and action together."""
 
     width = max(1, width)
-    lines: list[str] = []
-    current = ""
-    for word in value.split():
-        candidate = word if not current else f"{current} {word}"
-        if display_width(candidate) <= width:
-            current = candidate
+    items: list[tuple[ShortcutHelpSpan, ...]] = []
+    for raw_item in re.split(r"\s{2,}", value.strip()):
+        if not raw_item:
             continue
-        if current:
-            lines.append(current)
-        if display_width(word) <= width:
-            current = word
+        parts = raw_item.split(maxsplit=1)
+        key = parts[0]
+        is_key = bool(
+            key in {"↑↓", "Enter", "Space", "Tab", "Esc", "?"}
+            or re.fullmatch(r"Ctrl\+[A-Za-z]", key)
+            or re.fullmatch(r"[A-Z]", key)
+        )
+        if len(parts) == 1 or not is_key:
+            items.append((ShortcutHelpSpan(parts[0]),))
+            if len(parts) > 1:
+                items[-1] = (ShortcutHelpSpan(raw_item),)
             continue
-        pieces = wrap_display_text(word, width)
-        lines.extend(pieces[:-1])
-        current = pieces[-1]
-    if current or not lines:
-        lines.append(current)
+        label = parts[1]
+        items.append(
+            (
+                ShortcutHelpSpan(f"[{key}]", keycap=True),
+                ShortcutHelpSpan(f" {label}"),
+            )
+        )
+
+    if not items:
+        return [(ShortcutHelpSpan(""),)]
+
+    item_widths = [sum(display_width(span.text) for span in item) for item in items]
+
+    def segment_width(start: int, end: int) -> int:
+        return sum(item_widths[start:end]) + max(0, end - start - 1)
+
+    minimum_lines = 1
+    current_width = 0
+    for item_width in item_widths:
+        if current_width and current_width + 1 + item_width > width:
+            minimum_lines += 1
+            current_width = item_width
+        else:
+            current_width += (1 if current_width else 0) + item_width
+
+    best_boundaries: tuple[int, ...] | None = None
+    best_score: tuple[int, int] | None = None
+    for cuts in combinations(range(1, len(items)), minimum_lines - 1):
+        boundaries = (0, *cuts, len(items))
+        widths = [
+            segment_width(boundaries[index], boundaries[index + 1])
+            for index in range(minimum_lines)
+        ]
+        if any(line_width > width for line_width in widths):
+            continue
+        score = (max(widths), max(widths) - min(widths))
+        if best_score is None or score < best_score:
+            best_score = score
+            best_boundaries = boundaries
+
+    if best_boundaries is None:
+        best_boundaries = (0, len(items))
+
+    lines: list[tuple[ShortcutHelpSpan, ...]] = []
+    for boundary_index in range(len(best_boundaries) - 1):
+        start, end = best_boundaries[boundary_index : boundary_index + 2]
+        spans: list[ShortcutHelpSpan] = []
+        for item_index in range(start, end):
+            if spans:
+                spans.append(ShortcutHelpSpan(" "))
+            spans.extend(items[item_index])
+        lines.append(tuple(spans))
     return lines
 
 
@@ -633,7 +740,7 @@ class MessengerApp:
         self.sending = False
         self.send_results: queue.Queue[SendJobResult] = queue.Queue()
         self.send_cancel = threading.Event()
-        self.skill_guide_visible = False
+        self.open_skill_installer = False
         self.remote_details_visible = False
         self.remote_details_offset = 0
 
@@ -844,7 +951,8 @@ class MessengerApp:
 
     @staticmethod
     def _recipient_panel_height(record_count: int, content_height: int) -> int:
-        maximum = max(3, content_height - 3)
+        message_panel_height = 1 + MESSAGE_MIN_VISIBLE_ROWS
+        maximum = max(3, content_height - message_panel_height)
         desired = 2 + max(1, record_count)
         return max(3, min(desired, maximum))
 
@@ -1060,12 +1168,7 @@ class MessengerApp:
                 truncate_display_text(line, max(1, width - 1)),
                 self._style(PAIR_WARNING, curses.A_BOLD),
             )
-        self._safe_add(
-            height - 1,
-            0,
-            self.text["remote_details_help"],
-            curses.A_DIM,
-        )
+        self._render_help_footer(self.text["remote_details_help"])
         self._set_cursor_visibility(False)
         self.screen.refresh()
 
@@ -1082,16 +1185,24 @@ class MessengerApp:
         except curses.error:
             pass
 
-    def _help_lines(self, value: str) -> list[str]:
+    def _help_lines(self, value: str) -> list[tuple[ShortcutHelpSpan, ...]]:
         _height, width = self.screen.getmaxyx()
-        return wrap_help_text(value, max(1, width - 1))
+        return shortcut_help_spans(value, max(1, width - 1))
 
     def _render_help_footer(self, value: str) -> int:
         height, _width = self.screen.getmaxyx()
         lines = self._help_lines(value)
         start = max(0, height - len(lines))
-        for offset, line in enumerate(lines):
-            self._safe_add(start + offset, 0, line, curses.A_DIM)
+        for offset, spans in enumerate(lines):
+            column = 0
+            for span in spans:
+                attribute = (
+                    self._style(PAIR_ACCENT, curses.A_BOLD)
+                    if span.keycap
+                    else curses.A_DIM
+                )
+                self._safe_add(start + offset, column, span.text, attribute)
+                column += display_width(span.text)
         return len(lines)
 
     def _render_choice(self, row: int) -> int:
@@ -1286,14 +1397,17 @@ class MessengerApp:
         row += 1
         visible_rows = max(2, available_rows - 1)
         _height, width = self.screen.getmaxyx()
+        editor_width = max(1, width - 5)
         wrapped_lines, cursor_row, cursor_column = wrap_message_lines(
             self.message_lines,
-            width=max(1, width - 4),
+            width=editor_width,
             cursor_row=self.message_row,
             cursor_column=self.message_column,
         )
         start = max(0, cursor_row - visible_rows + 1)
         visible_lines = wrapped_lines[start : start + visible_rows]
+        thumb = scrollbar_thumb(len(wrapped_lines), visible_rows, start)
+        scrollbar_column = width - 2
         for offset in range(visible_rows):
             marker = "│"
             if offset == 0 and start > 0:
@@ -1319,6 +1433,19 @@ class MessengerApp:
                 )
             else:
                 self._safe_add(row + offset, 2, line)
+            if thumb is not None and scrollbar_column > 2:
+                thumb_start, thumb_size = thumb
+                scrollbar_glyph = (
+                    "█"
+                    if thumb_start <= offset < thumb_start + thumb_size
+                    else "│"
+                )
+                self._safe_add(
+                    row + offset,
+                    scrollbar_column,
+                    scrollbar_glyph,
+                    self._style(PAIR_ACCENT, curses.A_DIM),
+                )
         if self.section == "message":
             self.message_cursor = (
                 row + cursor_row - start,
@@ -1330,10 +1457,6 @@ class MessengerApp:
         if self.remote_details_visible:
             self.message_cursor = None
             self._render_remote_details()
-            return
-        if self.skill_guide_visible:
-            self.message_cursor = None
-            render_skill_guide_screen(self.screen, self.text, bundled_skill_path())
             return
         self.screen.erase()
         self.message_cursor = None
@@ -1658,21 +1781,9 @@ class MessengerApp:
             elif key in (REMOTE_DETAILS_KEY, "\x1b", "q", "Q"):
                 self.remote_details_visible = False
             return
-        if self.skill_guide_visible:
-            if key in (
-                SKILL_GUIDE_KEY,
-                "?",
-                "\x1b",
-                "q",
-                "Q",
-                "\n",
-                "\r",
-                curses.KEY_ENTER,
-            ):
-                self.skill_guide_visible = False
-            return
         if key == SKILL_GUIDE_KEY and not self.sending:
-            self.skill_guide_visible = True
+            self.open_skill_installer = True
+            self.running = False
             return
         if (
             key == REMOTE_DETAILS_KEY
@@ -1792,8 +1903,33 @@ def popup(environment: Mapping[str, str] | None = None) -> int:
         locale.setlocale(locale.LC_ALL, "")
     except locale.Error:
         pass
+    app: MessengerApp | None = None
+
+    def run(screen: curses.window) -> int:
+        nonlocal app
+        app = MessengerApp(screen, sender, values)
+        return app.run()
+
     with terminal_flow_control_disabled(sys.stdin):
-        return curses.wrapper(lambda screen: MessengerApp(screen, sender, values).run())
+        result = curses.wrapper(run)
+    if app is not None and app.open_skill_installer:
+        installer_values = dict(values)
+        if sender.cwd:
+            installer_values[SKILL_PROJECT_ROOT_ENV] = sender.cwd
+        if not launch_plugin_popup(
+            SKILL_INSTALLER_ENTRYPOINT,
+            width=SKILL_INSTALLER_WIDTH,
+            height=SKILL_INSTALLER_HEIGHT,
+            environment=installer_values,
+            extra_arguments=(
+                "--env",
+                f"{SKILL_PROJECT_ROOT_ENV}={sender.cwd}",
+            )
+            if sender.cwd
+            else (),
+        ):
+            return 1
+    return result
 
 
 def skill_guide(environment: Mapping[str, str] | None = None) -> int:

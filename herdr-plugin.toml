@@ -1,6 +1,6 @@
 id = "herdr.agent-labels"
 name = "Agent Labels"
-version = "0.6.0"
+version = "0.6.1"
 min_herdr_version = "0.8.0"
 description = "Label Herdr agents and delegate or send prompts to local or SSH-hosted peers."
 platforms = ["macos", "linux"]
@@ -21,15 +21,8 @@ command = ["python3", "agent_messenger.py", "launch"]
 
 [[actions]]
 id = "agent-skill-guide"
-title = "Agent Skill Guide"
-description = "Show how Codex or Claude can message agents by host and label."
-contexts = ["workspace", "pane"]
-command = ["python3", "agent_messenger.py", "guide-launch"]
-
-[[actions]]
-id = "install-agent-skill"
-title = "Install Agent Skill"
-description = "Install or update Agent Messenger for Codex, Claude, or both."
+title = "Agent Skill"
+description = "Install, update, or learn how to use Agent Messenger."
 contexts = ["workspace", "pane"]
 command = ["python3", "agent_skill_installer.py", "launch"]
 
@@ -44,13 +37,7 @@ placement = "popup"
 command = ["python3", "agent_messenger.py", "popup"]
 
 [[panes]]
-id = "skill-guide"
-title = "Agent Skill Guide"
-placement = "popup"
-command = ["python3", "agent_messenger.py", "guide"]
-
-[[panes]]
 id = "skill-installer"
-title = "Install Agent Skill"
+title = "Agent Skill"
 placement = "popup"
 command = ["python3", "agent_skill_installer.py", "popup"]

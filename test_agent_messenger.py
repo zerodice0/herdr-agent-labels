@@ -172,7 +172,60 @@ class AgentMessengerTest(unittest.TestCase):
         panel_height = agent_messenger.MessengerApp._recipient_panel_height
         self.assertEqual(panel_height(1, 12), 3)
         self.assertEqual(panel_height(4, 12), 6)
-        self.assertEqual(panel_height(20, 12), 9)
+        self.assertEqual(panel_height(20, 12), 7)
+
+    def test_long_message_keeps_four_rows_and_shows_scrollbar(self):
+        sender = agent()
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (18, 40)
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(screen, sender, environment)
+
+        app.section = "message"
+        app.message_lines = [f"line {index}" for index in range(8)]
+        app.message_row = 7
+        app.message_column = len(app.message_lines[-1])
+        rendered: list[tuple[int, int, str]] = []
+
+        def record(row, column, value, _attribute=0):
+            rendered.append((row, column, value))
+
+        with (
+            mock.patch.object(app, "_safe_add", side_effect=record),
+            mock.patch.object(app, "_style", return_value=0),
+        ):
+            app._render_message(0, 5)
+
+        message_markers = [
+            value
+            for row, column, value in rendered
+            if 1 <= row <= 4 and column == 0
+        ]
+        scrollbar = [
+            value
+            for row, column, value in rendered
+            if 1 <= row <= 4 and column == 38
+        ]
+        self.assertEqual(len(message_markers), 4)
+        self.assertEqual(scrollbar, ["│", "│", "█", "█"])
+
+    def test_scrollbar_thumb_tracks_start_middle_and_end(self):
+        self.assertIsNone(agent_messenger.scrollbar_thumb(4, 4, 0))
+        self.assertEqual(agent_messenger.scrollbar_thumb(8, 4, 0), (0, 2))
+        self.assertEqual(agent_messenger.scrollbar_thumb(8, 4, 2), (1, 2))
+        self.assertEqual(agent_messenger.scrollbar_thumb(8, 4, 4), (2, 2))
 
     def test_remote_recipients_are_grouped_and_show_label_workspace_and_pane(self):
         sender = agent()
@@ -401,17 +454,17 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertEqual(arguments[arguments.index("--width") + 1], "72")
         self.assertEqual(arguments[arguments.index("--height") + 1], "23")
 
-    def test_skill_guide_action_uses_compact_popup_and_bundled_skill(self):
+    def test_legacy_skill_guide_action_opens_interactive_skill_popup(self):
         completed = mock.Mock(returncode=0)
         with mock.patch.object(agent_messenger, "run_herdr", return_value=completed) as run:
             self.assertEqual(agent_messenger.launch_skill_guide({}), 0)
         arguments = run.call_args.args[0]
         self.assertEqual(
             arguments[arguments.index("--entrypoint") + 1],
-            agent_messenger.SKILL_GUIDE_ENTRYPOINT,
+            agent_messenger.SKILL_INSTALLER_ENTRYPOINT,
         )
-        self.assertEqual(arguments[arguments.index("--width") + 1], "80")
-        self.assertEqual(arguments[arguments.index("--height") + 1], "16")
+        self.assertEqual(arguments[arguments.index("--width") + 1], "60")
+        self.assertEqual(arguments[arguments.index("--height") + 1], "15")
         self.assertTrue(agent_messenger.bundled_skill_path().is_file())
 
     def test_language_detection_supports_three_locales(self):
@@ -474,15 +527,11 @@ class AgentMessengerTest(unittest.TestCase):
                 "help_sending",
             ):
                 lines = agent_messenger.wrap_help_text(text[key], 71)
-                self.assertEqual(
-                    " ".join(lines),
-                    " ".join(text[key].split()),
-                    (language, key),
-                )
                 self.assertTrue(
                     all(agent_messenger.display_width(line) <= 71 for line in lines),
                     (language, key),
                 )
+                self.assertTrue(lines, (language, key))
             self.assertEqual(
                 len(agent_messenger.wrap_help_text(text["help_recipients"], 71)),
                 2,
@@ -508,24 +557,34 @@ class AgentMessengerTest(unittest.TestCase):
             ):
                 app = agent_messenger.MessengerApp(screen, sender, environment)
 
-        rendered: list[tuple[int, str]] = []
+        rendered: list[tuple[int, str, int]] = []
         with mock.patch.object(
             app,
             "_safe_add",
-            side_effect=lambda row, _column, value, _attribute=0: rendered.append(
-                (row, value)
+            side_effect=lambda row, _column, value, attribute=0: rendered.append(
+                (row, value, attribute)
             ),
         ):
             line_count = app._render_help_footer(app.text["help_recipients"])
 
         self.assertEqual(line_count, 2)
-        self.assertEqual([row for row, _value in rendered], [16, 17])
-        combined = " ".join(value for _row, value in rendered)
-        self.assertIn("Ctrl+R 새로고침", combined)
-        self.assertIn("Ctrl+G 스킬", combined)
-        self.assertIn("Esc 닫기", combined)
+        self.assertEqual(sorted({row for row, _value, _attribute in rendered}), [16, 17])
+        combined = "".join(value for _row, value, _attribute in rendered)
+        self.assertIn("[Ctrl+R] 새로고침", combined)
+        self.assertIn("[Ctrl+G] 스킬", combined)
+        self.assertIn("[Esc] 닫기", combined)
+        keycaps = [
+            attribute
+            for _row, value, attribute in rendered
+            if value in {"[↑↓]", "[Space]", "[Ctrl+R]", "[Ctrl+G]", "[Esc]"}
+        ]
+        self.assertTrue(keycaps)
+        self.assertTrue(all(attribute & agent_messenger.curses.A_BOLD for attribute in keycaps))
+        self.assertTrue(
+            all(not attribute & agent_messenger.curses.A_REVERSE for attribute in keycaps)
+        )
 
-    def test_ctrl_g_toggles_skill_guide_without_changing_editor_state(self):
+    def test_ctrl_g_exits_messenger_to_open_interactive_skill_popup(self):
         sender = agent()
         with tempfile.TemporaryDirectory() as state_directory:
             environment = {
@@ -546,9 +605,8 @@ class AgentMessengerTest(unittest.TestCase):
         app.section = "message"
         app.message_lines = ["keep this"]
         app.handle_key(agent_messenger.SKILL_GUIDE_KEY)
-        self.assertTrue(app.skill_guide_visible)
-        app.handle_key(agent_messenger.SKILL_GUIDE_KEY)
-        self.assertFalse(app.skill_guide_visible)
+        self.assertTrue(app.open_skill_installer)
+        self.assertFalse(app.running)
         self.assertEqual(app.section, "message")
         self.assertEqual(app.message_lines, ["keep this"])
 
@@ -575,7 +633,7 @@ class AgentMessengerTest(unittest.TestCase):
         app.message_column = len(app.message_lines[0])
         app.handle_key("?")
 
-        self.assertFalse(app.skill_guide_visible)
+        self.assertFalse(app.open_skill_installer)
         self.assertEqual(app.message_lines, ["Can you review?"])
 
     def test_skill_guide_wraps_long_paths_inside_popup(self):

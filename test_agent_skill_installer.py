@@ -22,6 +22,64 @@ class AgentSkillInstallerTest(unittest.TestCase):
             Path("/tmp/example-home/.claude/skills/herdr-agent-messenger"),
         )
 
+    def test_targets_include_project_and_system_scopes(self):
+        targets = agent_skill_installer.installation_targets(
+            {
+                "HOME": "/tmp/example-home",
+                "HERDR_PLUGIN_CONTEXT_JSON": (
+                    '{"workspace_cwd":"/tmp/example-project"}'
+                ),
+            }
+        )
+
+        self.assertEqual(
+            [(target.scope, target.agent) for target in targets],
+            [
+                ("project", "codex"),
+                ("project", "claude"),
+                ("system", "codex"),
+                ("system", "claude"),
+            ],
+        )
+        self.assertEqual(
+            targets[0].destination,
+            Path("/tmp/example-project").resolve()
+            / ".agents"
+            / "skills"
+            / "herdr-agent-messenger",
+        )
+
+    def test_installation_status_distinguishes_current_outdated_and_conflict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current = root / "current"
+            agent_skill_installer.install_skill(current)
+            self.assertEqual(
+                agent_skill_installer.installation_status(current),
+                agent_skill_installer.STATUS_CURRENT,
+            )
+
+            (current / "SKILL.md").write_text(
+                "---\nname: herdr-agent-messenger\n---\nchanged\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                agent_skill_installer.installation_status(current),
+                agent_skill_installer.STATUS_OUTDATED,
+            )
+
+            conflict = root / "conflict"
+            conflict.mkdir()
+            (conflict / "SKILL.md").write_text("unrelated", encoding="utf-8")
+            self.assertEqual(
+                agent_skill_installer.installation_status(conflict),
+                agent_skill_installer.STATUS_CONFLICT,
+            )
+            self.assertEqual(
+                agent_skill_installer.installation_status(root / "missing"),
+                agent_skill_installer.STATUS_MISSING,
+            )
+
     def test_install_both_copies_the_bundled_skill(self):
         with tempfile.TemporaryDirectory() as directory:
             environment = {"HOME": directory}
@@ -56,16 +114,17 @@ class AgentSkillInstallerTest(unittest.TestCase):
             self.assertEqual(agent_skill_installer.launch({"LANG": "ko_KR.UTF-8"}), 0)
 
         launch_popup.assert_called_once_with(
-            "skill-installer",
-            width=52,
-            height=12,
+            agent_skill_installer.SKILL_INSTALLER_ENTRYPOINT,
+            width=60,
+            height=15,
             environment={"LANG": "ko_KR.UTF-8"},
+            extra_arguments=(),
         )
 
     def test_popup_arrow_selection_installs_the_highlighted_target(self):
         screen = mock.Mock()
-        screen.getmaxyx.return_value = (12, 52)
-        screen.get_wch.side_effect = [curses.KEY_DOWN, "\n", "\x1b"]
+        screen.getmaxyx.return_value = (15, 60)
+        screen.get_wch.side_effect = [curses.KEY_DOWN, curses.KEY_DOWN, "\n", "\x1b"]
 
         def run_wrapper(callback):
             return callback(screen)
@@ -77,7 +136,8 @@ class AgentSkillInstallerTest(unittest.TestCase):
                 side_effect=run_wrapper,
             ),
             mock.patch.object(agent_skill_installer.curses, "curs_set"),
-            mock.patch.object(agent_skill_installer, "install_selected") as install,
+            mock.patch.object(agent_skill_installer.curses, "has_colors", return_value=False),
+            mock.patch.object(agent_skill_installer, "install_target") as install,
         ):
             self.assertEqual(
                 agent_skill_installer.popup(
@@ -86,10 +146,33 @@ class AgentSkillInstallerTest(unittest.TestCase):
                 0,
             )
 
-        install.assert_called_once_with(
-            "claude",
-            {"HOME": "/tmp/example-home", "LANG": "en_US.UTF-8"},
-        )
+        target = install.call_args.args[0]
+        self.assertEqual((target.scope, target.agent), ("system", "codex"))
+
+    def test_question_mark_opens_usage_and_escape_returns_to_targets(self):
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (15, 60)
+        screen.get_wch.side_effect = ["?", "\x1b", "\x1b"]
+
+        with (
+            mock.patch.object(
+                agent_skill_installer.curses,
+                "wrapper",
+                side_effect=lambda callback: callback(screen),
+            ),
+            mock.patch.object(agent_skill_installer.curses, "curs_set"),
+            mock.patch.object(agent_skill_installer.curses, "has_colors", return_value=False),
+        ):
+            self.assertEqual(
+                agent_skill_installer.popup(
+                    {"HOME": "/tmp/example-home", "LANG": "en_US.UTF-8"}
+                ),
+                0,
+            )
+
+        rendered = [call.args[2] for call in screen.addnstr.call_args_list]
+        self.assertIn("Usage", rendered)
+        self.assertIn("Target: host/label", rendered)
 
 
 if __name__ == "__main__":

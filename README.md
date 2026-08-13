@@ -64,13 +64,18 @@ is treated as an SSH alias, even if it matches the local machine's hostname.
 
 In a repository checkout, Codex and Claude discover the skill from their
 project-level skill directories. To make it available from every workspace,
-open `Install Agent Skill` from Herdr's command palette and select Codex,
-Claude, or both. This installs or updates the bundled files under the user's
-agent skill directories; start a new agent session afterward. The installer
-refuses to overwrite an unrelated skill directory with the same name.
+open `Agent Skill` from Herdr's command palette and select Codex, Claude, and
+either the current project or the whole system. The same interactive screen
+opens with `Ctrl+G` from Agent Messenger; press `?` to switch to concise usage
+help. Each target carries
+a compact badge: `✓` current, `↑` update available, `○` not installed, or `!`
+conflicting files. The selected badge is explained at the bottom of the popup.
+System-wide installs use the user's agent skill directories; project installs
+use the active Herdr workspace. Start a new agent session afterward. The
+installer refuses to overwrite an unrelated skill directory with the same name.
 
-For usage help, open `Agent Skill Guide` from Herdr's command palette, press
-`Ctrl+G` inside Agent Messenger, or invoke the guide action from any directory:
+For usage help, open `Agent Skill` from Herdr's command palette and press `?`,
+press `Ctrl+G` inside Agent Messenger, or invoke the action from any directory:
 
 ```bash
 herdr plugin action invoke agent-skill-guide --plugin herdr.agent-labels
@@ -134,7 +139,10 @@ is applied only as a redundant state cue, so the meaning remains visible in
 monochrome and selected rows retain their actual status. The popup starts at a
 height appropriate for the known local recipient count, then gives additional
 discovered agents most of the available editor space while preserving a message
-area. The recipient heading shows the visible range when scrolling is required.
+area. When the terminal has enough room, the editor always keeps at least four
+soft-wrapped message rows visible. Longer messages follow the text cursor and
+show a right-side scrollbar with the current viewport position. The recipient
+heading shows the visible range when scrolling is required.
 When remote agents are present, recipients are grouped under a single host
 heading instead of repeating the host on every row. A long group keeps its host
 heading visible while scrolling. Each row prioritizes the Agent Labels name,
