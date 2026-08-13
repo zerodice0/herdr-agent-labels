@@ -94,7 +94,10 @@ class AgentMessengerTest(unittest.TestCase):
         screen = mock.Mock()
         screen.getmaxyx.return_value = (25, 58)
         with tempfile.TemporaryDirectory() as state_directory:
-            environment = {"HERDR_PLUGIN_STATE_DIR": state_directory}
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
             with (
                 mock.patch.object(
                     agent_messenger,
@@ -110,6 +113,199 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertIn("WT:결제 기능", line)
         self.assertIn("white-bison", line)
 
+    def test_recipient_cursor_selection_and_status_use_independent_styles(self):
+        sender = agent()
+        recipient = agent(
+            name="white-bison",
+            pane_id="w1:p2",
+            session_id="session-2",
+        )
+        recipient = agent_directory.replace(recipient, status="working")
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (18, 88)
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender, recipient],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(screen, sender, environment)
+
+        app.selected = {recipient.identity}
+        rendered: list[tuple[int, int, str, int]] = []
+
+        def record(row, column, value, attribute=0):
+            rendered.append((row, column, value, attribute))
+
+        style = lambda pair=0, attribute=0: pair * 100_000 + attribute
+        with (
+            mock.patch.object(app, "_safe_add", side_effect=record),
+            mock.patch.object(app, "_style", side_effect=style),
+        ):
+            app._render_recipients(0, 3)
+
+        identity = next(
+            item for item in rendered if "white-bison" in item[2]
+        )
+        cursor = next(item for item in rendered if item[2] == "›")
+        checkbox = next(item for item in rendered if item[2] == "[x]")
+        status = next(item for item in rendered if item[2] == "● working")
+        self.assertEqual(identity[3], agent_messenger.curses.A_BOLD)
+        self.assertEqual(
+            cursor[3],
+            style(agent_messenger.PAIR_ACCENT, agent_messenger.curses.A_BOLD),
+        )
+        self.assertEqual(checkbox[3], cursor[3])
+        self.assertEqual(
+            status[3],
+            style(agent_messenger.PAIR_WARNING, agent_messenger.curses.A_BOLD),
+        )
+
+    def test_recipient_panel_grows_until_message_minimum(self):
+        panel_height = agent_messenger.MessengerApp._recipient_panel_height
+        self.assertEqual(panel_height(1, 12), 3)
+        self.assertEqual(panel_height(4, 12), 6)
+        self.assertEqual(panel_height(20, 12), 9)
+
+    def test_remote_recipients_are_grouped_and_show_label_workspace_and_pane(self):
+        sender = agent()
+        first = agent_directory.replace(
+            agent(name="purple-koala", pane_id="w3:pQ", session_id="remote-1"),
+            host="macbook-pro",
+            local=False,
+            workspace_label="aibridge",
+        )
+        second = agent_directory.replace(
+            agent(name="brown-fox", pane_id="w2:p2Q", session_id="remote-2"),
+            host="macbook-pro",
+            local=False,
+            workspace_label="edgedx_mobile",
+        )
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (18, 88)
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(screen, sender, environment)
+
+        app.agents = [first, second]
+        rows = app._recipient_view_rows(app.filtered_agents())
+        self.assertEqual([row.kind for row in rows], ["header", "agent", "agent"])
+        self.assertEqual(rows[0].group_count, 2)
+        self.assertEqual(app._group_header(rows[0]), "▾ macbook-pro · 2 agents")
+
+        line = app._recipient_line(first, " ", "○ idle")
+        self.assertIn("purple-koala", line)
+        self.assertIn("aibridge", line)
+        self.assertIn("w3:pQ", line)
+        self.assertNotIn("macbook-pro", line)
+
+    def test_long_host_group_keeps_sticky_header_while_scrolling(self):
+        sender = agent()
+        recipients = [
+            agent_directory.replace(
+                agent(
+                    name=f"agent-{index}",
+                    pane_id=f"w1:p{index}",
+                    session_id=f"remote-{index}",
+                ),
+                host="macbook-pro",
+                local=False,
+            )
+            for index in range(5)
+        ]
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (18, 88)
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {"HERDR_PLUGIN_STATE_DIR": state_directory}
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(screen, sender, environment)
+
+        app.agents = recipients
+        app.cursor = 3
+        visible, has_more = app._visible_recipient_rows(app.filtered_agents(), 3)
+        self.assertEqual(visible[0].kind, "header")
+        self.assertEqual(visible[0].group_count, 5)
+        self.assertEqual(
+            [row.agent_index for row in visible if row.kind == "agent"],
+            [2, 3],
+        )
+        self.assertTrue(has_more)
+
+    def test_search_matches_label_pane_and_full_session_id(self):
+        sender = agent()
+        recipient = agent(
+            name="purple-koala",
+            pane_id="w3:pQ",
+            session_id="019ff833-session-value",
+        )
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {"HERDR_PLUGIN_STATE_DIR": state_directory}
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender, recipient],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        for query in ("purple-koala", "w3:pQ", "019ff833"):
+            app.search = query
+            self.assertEqual(app.filtered_agents(), [recipient])
+
+    def test_estimated_recipient_counts_include_remote_cache_groups(self):
+        sender = agent()
+        local = agent(name="white-bison", pane_id="w1:p2", session_id="local-2")
+        cache = mock.Mock()
+        cache.agents.side_effect = lambda host: [mock.Mock()] * {
+            "macbook-pro": 2,
+            "winmini": 1,
+        }[host]
+        with (
+            mock.patch.object(
+                agent_messenger.AgentCache,
+                "from_environment",
+                return_value=cache,
+            ),
+            mock.patch.object(
+                agent_messenger,
+                "ssh_hosts",
+                return_value=["macbook-pro", "winmini"],
+            ),
+        ):
+            counts = agent_messenger.estimated_recipient_counts(
+                [sender, local],
+                sender,
+                {},
+            )
+        self.assertEqual(counts, (4, 3))
+
     def test_focused_pane_id_prefers_plugin_context(self):
         environment = {
             "HERDR_PLUGIN_CONTEXT_JSON": '{"focused_pane_id":"w2:p3"}',
@@ -120,7 +316,7 @@ class AgentMessengerTest(unittest.TestCase):
     def test_launch_notifies_when_focused_pane_has_no_agent(self):
         environment = {"HERDR_PANE_ID": "w1:p1", "LANG": "en_US.UTF-8"}
         with (
-            mock.patch.object(agent_messenger, "fetch_local_agent", return_value=None),
+            mock.patch.object(agent_messenger, "query_local_agents", return_value=[]),
             mock.patch.object(agent_messenger, "show_notification", return_value=True) as notify,
             mock.patch.object(agent_messenger, "launch_popup") as popup,
         ):
@@ -130,20 +326,60 @@ class AgentMessengerTest(unittest.TestCase):
 
     def test_launch_opens_popup_for_focused_agent(self):
         environment = {"HERDR_PANE_ID": "w1:p1", "LANG": "en_US.UTF-8"}
+        sender = agent()
+        recipient = agent(name="white-bison", pane_id="w1:p2", session_id="session-2")
         with (
-            mock.patch.object(agent_messenger, "fetch_local_agent", return_value=agent()),
+            mock.patch.object(
+                agent_messenger,
+                "query_local_agents",
+                return_value=[sender, recipient],
+            ),
             mock.patch.object(agent_messenger, "launch_popup", return_value=True) as popup,
+            mock.patch.object(
+                agent_messenger,
+                "estimated_recipient_counts",
+                return_value=(1, 0),
+            ),
         ):
             self.assertEqual(agent_messenger.launch(environment), 0)
-        popup.assert_called_once_with("w1:p1", environment)
+        popup.assert_called_once_with(
+            "w1:p1",
+            environment,
+            recipient_count=1,
+            group_count=0,
+        )
 
-    def test_launch_popup_uses_compact_dimensions(self):
+    def test_launch_popup_height_scales_with_known_recipients(self):
         completed = mock.Mock(returncode=0)
         with mock.patch.object(agent_messenger, "run_herdr", return_value=completed) as run:
-            self.assertTrue(agent_messenger.launch_popup("w1:p1", {}))
+            self.assertTrue(
+                agent_messenger.launch_popup("w1:p1", {}, recipient_count=4)
+            )
         arguments = run.call_args.args[0]
-        self.assertEqual(arguments[arguments.index("--width") + 1], "88")
-        self.assertEqual(arguments[arguments.index("--height") + 1], "23")
+        self.assertEqual(arguments[arguments.index("--width") + 1], "120")
+        self.assertEqual(arguments[arguments.index("--height") + 1], "17")
+        self.assertEqual(agent_messenger.desired_popup_height(0), 15)
+        self.assertEqual(agent_messenger.desired_popup_height(50), 32)
+
+    def test_popup_expands_for_large_viewport(self):
+        layout = mock.Mock(
+            returncode=0,
+            stdout=(
+                '{"result":{"layout":{"area":{"width":293,"height":84}}}}'
+            ),
+        )
+        opened = mock.Mock(returncode=0, stdout="")
+        with mock.patch.object(
+            agent_messenger,
+            "run_herdr",
+            side_effect=[layout, opened],
+        ) as run:
+            self.assertTrue(
+                agent_messenger.launch_popup("w1:p1", {}, recipient_count=25)
+            )
+        arguments = run.call_args_list[-1].args[0]
+        self.assertEqual(arguments[arguments.index("--width") + 1], "120")
+        self.assertEqual(arguments[arguments.index("--height") + 1], "32")
 
     def test_popup_dimensions_fit_small_viewport(self):
         layout = mock.Mock(
@@ -158,7 +394,9 @@ class AgentMessengerTest(unittest.TestCase):
             "run_herdr",
             side_effect=[layout, opened],
         ) as run:
-            self.assertTrue(agent_messenger.launch_popup("w1:p1", {}))
+            self.assertTrue(
+                agent_messenger.launch_popup("w1:p1", {}, recipient_count=50)
+            )
         arguments = run.call_args_list[-1].args[0]
         self.assertEqual(arguments[arguments.index("--width") + 1], "72")
         self.assertEqual(arguments[arguments.index("--height") + 1], "23")
@@ -224,6 +462,68 @@ class AgentMessengerTest(unittest.TestCase):
 
     def test_display_width_accounts_for_wide_characters(self):
         self.assertEqual(agent_messenger.display_width("Agent 한글"), 10)
+
+    def test_shortcut_help_wraps_without_losing_any_items(self):
+        for language in messenger_i18n.SUPPORTED_LANGUAGES:
+            text = messenger_i18n.messages(language)
+            for key in (
+                "help_discovery",
+                "help_mode",
+                "help_recipients",
+                "help_message",
+                "help_sending",
+            ):
+                lines = agent_messenger.wrap_help_text(text[key], 71)
+                self.assertEqual(
+                    " ".join(lines),
+                    " ".join(text[key].split()),
+                    (language, key),
+                )
+                self.assertTrue(
+                    all(agent_messenger.display_width(line) <= 71 for line in lines),
+                    (language, key),
+                )
+            self.assertEqual(
+                len(agent_messenger.wrap_help_text(text["help_recipients"], 71)),
+                2,
+                language,
+            )
+
+    def test_recipient_footer_displays_refresh_skill_and_close_shortcuts(self):
+        sender = agent()
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (18, 72)
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "ko_KR.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(screen, sender, environment)
+
+        rendered: list[tuple[int, str]] = []
+        with mock.patch.object(
+            app,
+            "_safe_add",
+            side_effect=lambda row, _column, value, _attribute=0: rendered.append(
+                (row, value)
+            ),
+        ):
+            line_count = app._render_help_footer(app.text["help_recipients"])
+
+        self.assertEqual(line_count, 2)
+        self.assertEqual([row for row, _value in rendered], [16, 17])
+        combined = " ".join(value for _row, value in rendered)
+        self.assertIn("Ctrl+R 새로고침", combined)
+        self.assertIn("Ctrl+G 스킬", combined)
+        self.assertIn("Esc 닫기", combined)
 
     def test_ctrl_g_toggles_skill_guide_without_changing_editor_state(self):
         sender = agent()
@@ -634,7 +934,7 @@ class AgentMessengerTest(unittest.TestCase):
             app._initialize_colors()
 
         self.assertTrue(app.colors_enabled)
-        self.assertEqual(init_pair.call_count, 5)
+        self.assertEqual(init_pair.call_count, 4)
         self.assertTrue(all(call.args[2] == -1 for call in init_pair.call_args_list))
 
     def test_message_cursor_is_placed_after_footer_rendering(self):

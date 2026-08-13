@@ -35,7 +35,6 @@ from agent_directory import (
     herdr_executable,
     query_local_agents,
     ssh_config_path,
-    ssh_host_descriptors,
     ssh_hosts,
 )
 from messenger_i18n import detect_language, messages
@@ -43,19 +42,26 @@ from messenger_i18n import detect_language, messages
 
 PLUGIN_ID = "herdr.agent-labels"
 POPUP_ENTRYPOINT = "messenger"
-POPUP_WIDTH = 88
-POPUP_HEIGHT = 23
+POPUP_WIDTH = 120
+POPUP_HEIGHT = 32
+POPUP_MIN_HEIGHT = 15
 SKILL_GUIDE_ENTRYPOINT = "skill-guide"
 SKILL_GUIDE_WIDTH = 80
 SKILL_GUIDE_HEIGHT = 16
 SKILL_RELATIVE_PATH = Path(".agents/skills/herdr-agent-messenger/SKILL.md")
 SENDER_PANE_ENV = "HERDR_AGENT_MESSENGER_SENDER_PANE_ID"
 STATUS_ORDER = {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 4}
+STATUS_GLYPHS = {
+    "blocked": "!",
+    "working": "●",
+    "done": "✓",
+    "idle": "○",
+    "unknown": "?",
+}
 PAIR_ACCENT = 1
 PAIR_SUCCESS = 2
 PAIR_WARNING = 3
 PAIR_ERROR = 4
-PAIR_REMOTE = 5
 DELIVERY_DELEGATE = "delegate"
 DELIVERY_DIRECT = "direct"
 SKILL_GUIDE_KEY = "\x07"
@@ -76,6 +82,14 @@ class SendJobResult:
     results: tuple[SendResult, ...]
     error: str = ""
     cancelled: bool = False
+
+
+@dataclass(frozen=True)
+class RecipientViewRow:
+    kind: str
+    agent_index: int
+    agent: AgentRecord
+    group_count: int = 0
 
 
 def _single_line(value: str) -> str:
@@ -250,24 +264,55 @@ def responsive_popup_size(
         return maximum_width, maximum_height
     return (
         min(maximum_width, max(32, available_width - 8)),
-        min(maximum_height, max(12, available_height - 4)),
+        min(maximum_height, max(12, available_height - 6)),
     )
 
 
 def launch_popup(
     pane_id: str,
     environment: Mapping[str, str] | None = None,
+    *,
+    recipient_count: int = 0,
+    group_count: int = 0,
 ) -> bool:
     return launch_plugin_popup(
         POPUP_ENTRYPOINT,
         width=POPUP_WIDTH,
-        height=POPUP_HEIGHT,
+        height=desired_popup_height(recipient_count, group_count),
         environment=environment,
         extra_arguments=(
             "--env",
             f"{SENDER_PANE_ENV}={pane_id}",
         ),
     )
+
+
+def desired_popup_height(recipient_count: int, group_count: int = 0) -> int:
+    """Size the editor for known local recipients without growing unbounded."""
+
+    visible_rows = min(19, max(2, recipient_count + group_count))
+    return min(POPUP_HEIGHT, max(POPUP_MIN_HEIGHT, 13 + visible_rows))
+
+
+def estimated_recipient_counts(
+    local_agents: Sequence[AgentRecord],
+    sender: AgentRecord,
+    environment: Mapping[str, str],
+) -> tuple[int, int]:
+    """Estimate popup rows from local agents and the last remote cache."""
+
+    local_count = sum(record.identity != sender.identity for record in local_agents)
+    remote_counts: list[int] = []
+    cache = AgentCache.from_environment(environment)
+    for host in ssh_hosts(environment):
+        count = len(cache.agents(host))
+        if count:
+            remote_counts.append(count)
+    remote_count = sum(remote_counts)
+    if not remote_count:
+        return local_count, 0
+    group_count = len(remote_counts) + int(local_count > 0)
+    return local_count + remote_count, group_count
 
 
 def launch_skill_guide(environment: Mapping[str, str] | None = None) -> int:
@@ -288,12 +333,26 @@ def launch(environment: Mapping[str, str] | None = None) -> int:
     values = os.environ if environment is None else environment
     text = messages(detect_language(values))
     pane_id = focused_pane_id(values)
-    sender = fetch_local_agent(pane_id, values) if pane_id else None
+    local_agents = query_local_agents(values) if pane_id else []
+    sender = next(
+        (record for record in local_agents if record.pane_id == pane_id),
+        None,
+    )
     if sender is None:
         if not show_notification(text["no_focused_agent"], values):
             print(text["no_focused_agent"], file=sys.stderr)
         return 0
-    if not launch_popup(pane_id, values):
+    recipient_count, group_count = estimated_recipient_counts(
+        local_agents,
+        sender,
+        values,
+    )
+    if not launch_popup(
+        pane_id,
+        values,
+        recipient_count=recipient_count,
+        group_count=group_count,
+    ):
         if not show_notification(text["popup_open_failed"], values):
             print(text["popup_open_failed"], file=sys.stderr)
         return 1
@@ -404,6 +463,30 @@ def wrap_display_text(value: str, width: int) -> list[str]:
         cursor_column=len(value),
     )
     return [line.text for line in wrapped]
+
+
+def wrap_help_text(value: str, width: int) -> list[str]:
+    """Wrap shortcut help without splitting a key-label pair mid-word."""
+
+    width = max(1, width)
+    lines: list[str] = []
+    current = ""
+    for word in value.split():
+        candidate = word if not current else f"{current} {word}"
+        if display_width(candidate) <= width:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+        if display_width(word) <= width:
+            current = word
+            continue
+        pieces = wrap_display_text(word, width)
+        lines.extend(pieces[:-1])
+        current = pieces[-1]
+    if current or not lines:
+        lines.append(current)
+    return lines
 
 
 def truncate_display_text(value: str, width: int) -> str:
@@ -517,10 +600,6 @@ class MessengerApp:
         self.text = messages(detect_language(environment))
         self.config_path = ssh_config_path(environment)
         self.hosts = ssh_hosts(environment)
-        self.host_descriptors = ssh_host_descriptors(
-            self.hosts,
-            config_path=self.config_path,
-        )
         self.cache = AgentCache.from_environment(environment)
         self.agents = [
             agent
@@ -572,7 +651,6 @@ class MessengerApp:
             curses.init_pair(PAIR_SUCCESS, curses.COLOR_GREEN, background)
             curses.init_pair(PAIR_WARNING, curses.COLOR_YELLOW, background)
             curses.init_pair(PAIR_ERROR, curses.COLOR_RED, background)
-            curses.init_pair(PAIR_REMOTE, curses.COLOR_MAGENTA, background)
         except curses.error:
             return
         self.colors_enabled = True
@@ -593,7 +671,10 @@ class MessengerApp:
                 in " ".join(
                     (
                         agent.host,
+                        agent.name,
                         agent.target,
+                        agent.pane_id,
+                        agent.session_id,
                         agent.workspace_label,
                         agent.workspace_id,
                         agent.status,
@@ -613,29 +694,159 @@ class MessengerApp:
         )
 
     def _display_host(self, host: str) -> str:
-        descriptor = self.host_descriptors.get(host)
-        return descriptor.display_name if descriptor else host
+        return host
 
-    def _recipient_line(self, agent: AgentRecord, marker: str, state: str) -> str:
+    @staticmethod
+    def _recipient_group_key(agent: AgentRecord) -> tuple[bool, str]:
+        return agent.local, agent.host
+
+    def _recipient_view_rows(
+        self,
+        records: Sequence[AgentRecord],
+    ) -> list[RecipientViewRow]:
+        if not records:
+            return []
+        group_count = len(
+            {self._recipient_group_key(record) for record in records}
+        )
+        show_headers = group_count > 1 or any(not record.local for record in records)
+        rows: list[RecipientViewRow] = []
+        previous_key: tuple[bool, str] | None = None
+        counts: dict[tuple[bool, str], int] = {}
+        for record in records:
+            key = self._recipient_group_key(record)
+            counts[key] = counts.get(key, 0) + 1
+        for agent_index, record in enumerate(records):
+            key = self._recipient_group_key(record)
+            if show_headers and key != previous_key:
+                rows.append(
+                    RecipientViewRow(
+                        kind="header",
+                        agent_index=agent_index,
+                        agent=record,
+                        group_count=counts[key],
+                    )
+                )
+            rows.append(
+                RecipientViewRow(
+                    kind="agent",
+                    agent_index=agent_index,
+                    agent=record,
+                )
+            )
+            previous_key = key
+        return rows
+
+    @staticmethod
+    def _header_before(
+        rows: Sequence[RecipientViewRow],
+        offset: int,
+    ) -> RecipientViewRow | None:
+        if not rows or offset <= 0 or rows[offset].kind == "header":
+            return None
+        key = MessengerApp._recipient_group_key(rows[offset].agent)
+        for index in range(offset - 1, -1, -1):
+            row = rows[index]
+            if row.kind == "header":
+                return row if MessengerApp._recipient_group_key(row.agent) == key else None
+        return None
+
+    def _visible_recipient_rows(
+        self,
+        records: Sequence[AgentRecord],
+        list_rows: int,
+    ) -> tuple[list[RecipientViewRow], bool]:
+        rows = self._recipient_view_rows(records)
+        if not rows:
+            self.recipient_offset = 0
+            return [], False
+        cursor_row = next(
+            (
+                index
+                for index, row in enumerate(rows)
+                if row.kind == "agent" and row.agent_index == self.cursor
+            ),
+            0,
+        )
+        self.recipient_offset = min(self.recipient_offset, max(0, len(rows) - 1))
+        if cursor_row < self.recipient_offset:
+            self.recipient_offset = cursor_row
+        while True:
+            sticky = self._header_before(rows, self.recipient_offset)
+            capacity = max(1, list_rows - int(sticky is not None and list_rows > 1))
+            if cursor_row < self.recipient_offset + capacity:
+                break
+            self.recipient_offset = cursor_row - capacity + 1
+        sticky = self._header_before(rows, self.recipient_offset)
+        visible: list[RecipientViewRow] = []
+        if sticky is not None and list_rows > 1:
+            visible.append(sticky)
+        visible.extend(
+            rows[
+                self.recipient_offset : self.recipient_offset
+                + max(1, list_rows - len(visible))
+            ]
+        )
+        consumed_rows = max(1, list_rows - int(sticky is not None))
+        has_more = self.recipient_offset + consumed_rows < len(rows)
+        return visible, has_more
+
+    def _group_header(self, row: RecipientViewRow) -> str:
+        host = self._display_host(row.agent.host)
+        key = "group_agent" if row.group_count == 1 else "group_agents"
+        suffix = self.text[key].format(count=row.group_count)
+        return f"▾ {host} · {suffix}"
+
+    def _recipient_line(
+        self,
+        agent: AgentRecord,
+        marker: str,
+        state: str,
+        *,
+        focused: bool = False,
+    ) -> str:
         _height, width = self.screen.getmaxyx()
         workspace = workspace_display(agent)
-        target = (
-            agent.target
-            if agent.local
-            else f"{self._display_host(agent.host)}/{agent.target}"
-        )
+        label = agent.name or agent.agent_kind or agent.pane_id
+        pane = agent.pane_id
+        cursor_marker = "›" if focused else " "
+        prefix = f"{cursor_marker} [{marker}] "
+        state_width = display_width(state)
         if width >= 88:
-            workspace_width = min(28, max(16, width // 4))
-            target_width = max(18, width - workspace_width - 18)
+            label_width = min(20, max(14, width // 5))
+            pane_width = min(12, max(7, display_width(pane)))
+            workspace_width = max(
+                8,
+                width - label_width - pane_width - state_width - 11,
+            )
             return (
-                f"[{marker}] "
+                prefix + f"{pad_display_text(label, label_width)} "
                 f"{pad_display_text(workspace, workspace_width)} "
-                f"{pad_display_text(target, target_width)} "
+                f"{pad_display_text(pane, pane_width)} "
                 f"{state}"
             )
-        available = max(8, width - display_width(state) - 5)
-        identity = f"{workspace} · {target}"
-        return f"[{marker}] {truncate_display_text(identity, available)} {state}"
+        available = max(4, width - state_width - 8)
+        identity = f"{label} · {pane} · {workspace}"
+        return f"{prefix}{truncate_display_text(identity, available)} {state}"
+
+    def _status_attribute(self, agent: AgentRecord) -> int:
+        if agent.stale:
+            return curses.A_DIM
+        if agent.status == "blocked":
+            return self._style(PAIR_ERROR, curses.A_BOLD)
+        if agent.status == "working":
+            return self._style(PAIR_WARNING, curses.A_BOLD)
+        if agent.status == "done":
+            return self._style(PAIR_SUCCESS)
+        if agent.status in ("idle", "unknown"):
+            return curses.A_DIM
+        return 0
+
+    @staticmethod
+    def _recipient_panel_height(record_count: int, content_height: int) -> int:
+        maximum = max(3, content_height - 3)
+        desired = 2 + max(1, record_count)
+        return max(3, min(desired, maximum))
 
     def _replace_agent_scope(
         self,
@@ -871,6 +1082,18 @@ class MessengerApp:
         except curses.error:
             pass
 
+    def _help_lines(self, value: str) -> list[str]:
+        _height, width = self.screen.getmaxyx()
+        return wrap_help_text(value, max(1, width - 1))
+
+    def _render_help_footer(self, value: str) -> int:
+        height, _width = self.screen.getmaxyx()
+        lines = self._help_lines(value)
+        start = max(0, height - len(lines))
+        for offset, line in enumerate(lines):
+            self._safe_add(start + offset, 0, line, curses.A_DIM)
+        return len(lines)
+
     def _render_choice(self, row: int) -> int:
         self._safe_add(
             row,
@@ -959,7 +1182,25 @@ class MessengerApp:
     def _render_recipients(self, row: int, available_rows: int) -> int:
         records = self.filtered_agents()
         selected_count = len(self.selected)
-        heading = f'{self.text["recipients"]}: {selected_count} {self.text["selected"]}'
+        list_rows = max(1, available_rows - 2)
+        visible, has_more = self._visible_recipient_rows(records, list_rows)
+        visible_agent_indexes = [
+            view_row.agent_index
+            for view_row in visible
+            if view_row.kind == "agent"
+        ]
+        if visible_agent_indexes:
+            first = min(visible_agent_indexes) + 1
+            last = max(visible_agent_indexes) + 1
+            before = "↑" if first > 1 else ""
+            after = "↓" if has_more else ""
+            position = f"{before}{first}-{last}/{len(records)}{after}"
+        else:
+            position = "0/0"
+        heading = (
+            f'{self.text["recipients"]}: {selected_count} '
+            f'{self.text["selected"]} · {position}'
+        )
         attribute = self._style(
             PAIR_ACCENT,
             curses.A_REVERSE if self.section == "recipients" else curses.A_BOLD,
@@ -974,39 +1215,66 @@ class MessengerApp:
         )
         row += 1
 
-        list_rows = max(1, available_rows - 2)
-        if self.cursor < self.recipient_offset:
-            self.recipient_offset = self.cursor
-        if self.cursor >= self.recipient_offset + list_rows:
-            self.recipient_offset = self.cursor - list_rows + 1
-        visible = records[self.recipient_offset : self.recipient_offset + list_rows]
-        for visible_index, agent in enumerate(visible):
-            absolute_index = self.recipient_offset + visible_index
+        for visible_index, view_row in enumerate(visible):
+            line_row = row + visible_index
+            if view_row.kind == "header":
+                header_attribute = self._style(
+                    PAIR_ACCENT,
+                    curses.A_BOLD,
+                )
+                self._safe_add(
+                    line_row,
+                    0,
+                    self._group_header(view_row),
+                    header_attribute,
+                )
+                continue
+            agent = view_row.agent
+            absolute_index = view_row.agent_index
             marker = "x" if agent.identity in self.selected else " "
             disabled = agent.stale
-            state = (
+            state_label = (
                 self.text["stale"]
                 if disabled
                 else self.text.get(f"status_{agent.status}", agent.status)
             )
-            line = self._recipient_line(agent, marker, state)
+            state_glyph = "~" if disabled else STATUS_GLYPHS.get(agent.status, "?")
+            state = f"{state_glyph} {state_label}"
+            focused = absolute_index == self.cursor and self.section == "recipients"
+            line = self._recipient_line(
+                agent,
+                marker,
+                state,
+                focused=focused,
+            )
             if disabled:
                 line_attribute = curses.A_DIM
             elif agent.identity in self.selected:
-                line_attribute = self._style(PAIR_SUCCESS, curses.A_BOLD)
-            elif agent.status == "blocked":
-                line_attribute = self._style(PAIR_ERROR)
-            elif agent.status == "working":
-                line_attribute = self._style(PAIR_WARNING)
-            elif agent.status == "done":
-                line_attribute = self._style(PAIR_SUCCESS)
-            elif not agent.local:
-                line_attribute = self._style(PAIR_REMOTE)
+                line_attribute = curses.A_BOLD
             else:
                 line_attribute = 0
-            if absolute_index == self.cursor and self.section == "recipients":
-                line_attribute |= curses.A_REVERSE
-            self._safe_add(row + visible_index, 0, line, line_attribute)
+            self._safe_add(line_row, 0, line, line_attribute)
+            if focused:
+                self._safe_add(
+                    line_row,
+                    0,
+                    "›",
+                    self._style(PAIR_ACCENT, curses.A_BOLD),
+                )
+            if agent.identity in self.selected:
+                self._safe_add(
+                    line_row,
+                    2,
+                    "[x]",
+                    self._style(PAIR_ACCENT, curses.A_BOLD),
+                )
+            status_column = display_width(line) - display_width(state)
+            self._safe_add(
+                line_row,
+                status_column,
+                state,
+                self._status_attribute(agent),
+            )
         return row + list_rows
 
     def _render_message(self, row: int, available_rows: int) -> int:
@@ -1086,59 +1354,54 @@ class MessengerApp:
 
         if not self.discovery_choice:
             self._render_choice(row)
-            self._safe_add(
-                height - 1,
-                0,
-                self.text["help_discovery"],
-                curses.A_DIM,
-            )
+            self._render_help_footer(self.text["help_discovery"])
             self._set_cursor_visibility(False)
             self.screen.refresh()
             return
 
         if not self.mode_choice:
             self._render_mode_choice(row)
-            self._safe_add(
-                height - 1,
-                0,
-                self.text["help_mode"],
-                curses.A_DIM,
-            )
+            self._render_help_footer(self.text["help_mode"])
             self._set_cursor_visibility(False)
             self.screen.refresh()
             return
 
-        reserved_footer = 3
-        row = self._render_mode_summary(row)
-        content_height = max(6, height - row - reserved_footer)
-        recipient_height = max(4, content_height // 2)
-        row = self._render_recipients(row, recipient_height)
-        row = self._render_message(row + 1, max(3, height - row - reserved_footer - 1))
-
-        if self.remote_enabled:
-            _available, _refreshing, unavailable = self._remote_counts()
-            self._safe_add(
-                height - 3,
-                0,
-                self._remote_summary(),
-                self._style(
-                    PAIR_WARNING if unavailable else PAIR_REMOTE,
-                    curses.A_BOLD if unavailable else curses.A_DIM,
-                ),
-            )
-        self._safe_add(
-            height - 2,
-            0,
-            self.status,
-            self._style(PAIR_WARNING, curses.A_BOLD),
-        )
         if self.sending:
             help_text = self.text["help_sending"]
         elif self.section == "message":
             help_text = self.text["help_message"]
         else:
             help_text = self.text["help_recipients"]
-        self._safe_add(height - 1, 0, help_text, curses.A_DIM)
+        help_lines = self._help_lines(help_text)
+        reserved_footer = 2 + len(help_lines)
+        row = self._render_mode_summary(row)
+        content_height = max(6, height - row - reserved_footer)
+        filtered_records = self.filtered_agents()
+        recipient_height = self._recipient_panel_height(
+            len(self._recipient_view_rows(filtered_records)),
+            content_height,
+        )
+        row = self._render_recipients(row, recipient_height)
+        self._render_message(row, max(3, content_height - recipient_height))
+
+        if self.remote_enabled:
+            _available, _refreshing, unavailable = self._remote_counts()
+            self._safe_add(
+                height - len(help_lines) - 2,
+                0,
+                self._remote_summary(),
+                self._style(
+                    PAIR_WARNING if unavailable else PAIR_ACCENT,
+                    curses.A_BOLD if unavailable else curses.A_DIM,
+                ),
+            )
+        self._safe_add(
+            height - len(help_lines) - 1,
+            0,
+            self.status,
+            self._style(PAIR_WARNING, curses.A_BOLD),
+        )
+        self._render_help_footer(help_text)
         if self.sending:
             self.message_cursor = None
         self._set_cursor_visibility(self.message_cursor is not None)

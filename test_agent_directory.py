@@ -81,60 +81,6 @@ class AgentDirectoryTest(unittest.TestCase):
             allowlist.write_text("# Local only\n", encoding="utf-8")
             self.assertEqual(agent_directory.ssh_hosts(environment), [])
 
-    def test_ssh_descriptors_map_alias_to_tailscale_device_name(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / "config"
-            config.write_text(
-                "Host macbook-pro\n  HostName 100.122.240.112\n",
-                encoding="utf-8",
-            )
-            status = subprocess.CompletedProcess(
-                ["tailscale"],
-                0,
-                json.dumps(
-                    {
-                        "Peer": {
-                            "node": {
-                                "HostName": "MacBook Pro",
-                                "DNSName": "macbook-pro.example.ts.net.",
-                                "TailscaleIPs": ["100.122.240.112"],
-                            }
-                        }
-                    }
-                ),
-                "",
-            )
-            with mock.patch.object(
-                agent_directory,
-                "_run_command",
-                return_value=status,
-            ):
-                descriptors = agent_directory.ssh_host_descriptors(
-                    ["macbook-pro"],
-                    config_path=config,
-                )
-
-        descriptor = descriptors["macbook-pro"]
-        self.assertEqual(descriptor.destination, "100.122.240.112")
-        self.assertEqual(descriptor.device_name, "MacBook Pro")
-        self.assertEqual(descriptor.dns_name, "macbook-pro.example.ts.net")
-        self.assertEqual(descriptor.display_name, "macbook-pro → MacBook Pro")
-
-    def test_parse_tailscale_devices_accepts_magicdns_short_name(self):
-        devices = agent_directory.parse_tailscale_devices(
-            {
-                "Self": {
-                    "HostName": "작업용 미니 PC",
-                    "DNSName": "winmini.example.ts.net.",
-                    "TailscaleIPs": ["100.86.235.65"],
-                }
-            }
-        )
-        self.assertEqual(
-            devices["winmini"],
-            ("작업용 미니 PC", "winmini.example.ts.net"),
-        )
-
     def test_parse_agent_payload_builds_addressable_records(self):
         payload = {
             "result": {

@@ -1,6 +1,6 @@
 id = "herdr.agent-labels"
 name = "Agent Labels"
-version = "0.5.1"
+version = "0.6.0"
 min_herdr_version = "0.8.0"
 description = "Label Herdr agents and delegate or send prompts to local or SSH-hosted peers."
 platforms = ["macos", "linux"]

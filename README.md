@@ -127,6 +127,21 @@ The editor shows a compact remote summary instead of listing every SSH alias.
 When any host is unavailable, the warning is highlighted; press `Ctrl+U` to open
 a scrollable list of the affected aliases and their latest errors.
 
+Recipient rows keep interaction and lifecycle state separate: `›` is the
+keyboard cursor, `[x]` means selected, and the final icon plus localized text is
+the agent state (`●` working, `○` idle, `✓` done, `!` blocked, `~` stale). Color
+is applied only as a redundant state cue, so the meaning remains visible in
+monochrome and selected rows retain their actual status. The popup starts at a
+height appropriate for the known local recipient count, then gives additional
+discovered agents most of the available editor space while preserving a message
+area. The recipient heading shows the visible range when scrolling is required.
+When remote agents are present, recipients are grouped under a single host
+heading instead of repeating the host on every row. A long group keeps its host
+heading visible while scrolling. Each row prioritizes the Agent Labels name,
+workspace, Herdr pane ID, and lifecycle state; the full agent session ID remains
+searchable without consuming the main list width. The last successful remote
+cache contributes to the next popup's initial height estimate.
+
 By default, the plugin probes every concrete alias for backward compatibility.
 That is usually broader than necessary when `~/.ssh/config` also contains work,
 deployment, or dormant hosts. To restrict discovery, create `ssh-hosts` in the
@@ -154,11 +169,10 @@ Host winmini
 ```
 
 The plugin still probes only explicit SSH aliases; it never treats every device
-in the tailnet as authorized automatically. When the local `tailscale` CLI can
-match an alias destination to a peer, the UI shows both identities, such as
-`macbook-pro → MacBook Pro`. Otherwise it shows the SSH alias and configured
-destination. This keeps the route stable even if the friendly device name
-contains spaces or non-ASCII characters.
+in the tailnet as authorized automatically. The UI displays only the stable SSH
+alias, such as `macbook-pro`, rather than combining it with a Tailscale device
+name or destination. This keeps host groups concise and avoids implying a
+sender-to-recipient relationship.
 
 Prompts sent remotely include the sender's local hostname and agent label. The
 private `0600` discovery cache stores remote agent labels, pane/session metadata,
@@ -185,6 +199,15 @@ Keyboard controls:
 - `Ctrl+S`: send the prompt
 - `Esc`: go back from delivery mode, cancel discovery or pending sends, then close
   the popup
+
+Shortcut hints wrap onto additional footer rows at word boundaries when the
+popup is narrow, so later actions such as refresh, skill guide, and close remain
+visible instead of being clipped.
+
+The main messenger grows up to 120 columns by 32 rows on large Herdr viewports,
+while retaining margins and shrinking to fit compact devices. Host headings and
+healthy remote summaries use the brighter terminal accent color; lifecycle
+colors remain reserved for working, done, blocked, and warning states.
 
 The UI follows `LC_ALL`, `LC_MESSAGES`, or `LANG` and supports English, Japanese,
 and Korean. Unsupported locales fall back to English.
