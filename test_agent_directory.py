@@ -52,6 +52,35 @@ class AgentDirectoryTest(unittest.TestCase):
                 ["included-host", "root-host"],
             )
 
+    def test_ssh_host_allowlist_restricts_discovery_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config"
+            allowlist = root / "ssh-hosts"
+            config.write_text(
+                "Host macbook-pro desktop rogallyx\n",
+                encoding="utf-8",
+            )
+            environment = {
+                "HERDR_AGENT_LABELS_SSH_CONFIG": str(config),
+                "HERDR_AGENT_LABELS_SSH_HOSTS_FILE": str(allowlist),
+            }
+
+            self.assertEqual(
+                agent_directory.ssh_hosts(environment),
+                ["macbook-pro", "desktop", "rogallyx"],
+            )
+            allowlist.write_text(
+                "# Personal Herdr peers\nrogallyx macbook-pro\nunknown-host\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                agent_directory.ssh_hosts(environment),
+                ["macbook-pro", "rogallyx"],
+            )
+            allowlist.write_text("# Local only\n", encoding="utf-8")
+            self.assertEqual(agent_directory.ssh_hosts(environment), [])
+
     def test_ssh_descriptors_map_alias_to_tailscale_device_name(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "config"

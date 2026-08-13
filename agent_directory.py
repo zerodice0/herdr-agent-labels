@@ -366,6 +366,52 @@ def ssh_config_path(environment: Mapping[str, str] | None = None) -> Path:
     return Path(configured).expanduser() if configured else Path.home() / ".ssh" / "config"
 
 
+def ssh_hosts_allowlist_path(
+    environment: Mapping[str, str] | None = None,
+) -> Path:
+    values = os.environ if environment is None else environment
+    configured = values.get("HERDR_AGENT_LABELS_SSH_HOSTS_FILE")
+    if configured:
+        return Path(configured).expanduser()
+    plugin_config = values.get("HERDR_PLUGIN_CONFIG_DIR")
+    config_directory = (
+        Path(plugin_config)
+        if plugin_config
+        else Path.home()
+        / ".config"
+        / "herdr"
+        / "plugins"
+        / "config"
+        / "herdr.agent-labels"
+    )
+    return config_directory / "ssh-hosts"
+
+
+def parse_ssh_hosts_allowlist(path: Path) -> list[str] | None:
+    """Return an ordered host allowlist, or None when no allowlist exists.
+
+    An existing but unreadable file intentionally disables remote discovery. It
+    is safer than silently expanding the scope back to every SSH alias.
+    """
+
+    try:
+        lines = path.expanduser().read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return []
+    hosts: list[str] = []
+    for line in lines:
+        try:
+            fields = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        for host in fields:
+            if host not in hosts:
+                hosts.append(host)
+    return hosts
+
+
 def parse_ssh_hosts(
     path: Path,
     *,
@@ -420,7 +466,12 @@ def parse_ssh_hosts(
 
 
 def ssh_hosts(environment: Mapping[str, str] | None = None) -> list[str]:
-    return parse_ssh_hosts(ssh_config_path(environment))
+    configured_hosts = parse_ssh_hosts(ssh_config_path(environment))
+    allowlist = parse_ssh_hosts_allowlist(ssh_hosts_allowlist_path(environment))
+    if allowlist is None:
+        return configured_hosts
+    allowed = set(allowlist)
+    return [host for host in configured_hosts if host in allowed]
 
 
 def parse_ssh_destinations(

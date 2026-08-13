@@ -195,6 +195,8 @@ class AgentMessengerTest(unittest.TestCase):
             "direct_option",
             "direct_privacy",
             "help_mode",
+            "remote_warning_summary",
+            "remote_details_help",
         }
         english_keys = set(messenger_i18n.messages("en"))
         for language in messenger_i18n.SUPPORTED_LANGUAGES:
@@ -474,6 +476,7 @@ class AgentMessengerTest(unittest.TestCase):
         app.remote_enabled = True
         app.pending_hosts = {"macbook"}
         app.host_status = {"macbook": app.text["refreshing"]}
+        app.host_errors = {"macbook": "timeout"}
         app.agents.append(remote_recipient)
         app.selected = {local_recipient.identity, remote_recipient.identity}
 
@@ -485,8 +488,70 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertFalse(app.remote_enabled)
         self.assertFalse(app.pending_hosts)
         self.assertFalse(app.host_status)
+        self.assertFalse(app.host_errors)
         self.assertEqual(app.agents, [local_recipient])
         self.assertEqual(app.selected, {local_recipient.identity})
+
+    def test_remote_failures_use_compact_warning_and_scrollable_details(self):
+        sender = agent()
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (7, 52)
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(screen, sender, environment)
+
+        app.remote_enabled = True
+        app.host_status = {
+            "available-host": "",
+            **{
+                f"failed-host-{index}": app.text["unavailable"]
+                for index in range(5)
+            },
+        }
+        app.host_errors = {
+            f"failed-host-{index}": f"connection error {index}"
+            for index in range(5)
+        }
+
+        summary = app._remote_summary()
+        self.assertTrue(summary.startswith("⚠ 5 remote unavailable"))
+        self.assertIn("Ctrl+U Details", summary)
+        self.assertIn("1 available", summary)
+        self.assertNotIn("failed-host-0", summary)
+
+        app.handle_key(agent_messenger.REMOTE_DETAILS_KEY)
+        self.assertTrue(app.remote_details_visible)
+        app.handle_key(agent_messenger.curses.KEY_DOWN)
+        self.assertEqual(app.remote_details_offset, 1)
+
+        rendered: list[str] = []
+        with (
+            mock.patch.object(
+                app,
+                "_safe_add",
+                side_effect=lambda _row, _column, value, _attribute=0: rendered.append(
+                    value
+                ),
+            ),
+            mock.patch.object(app, "_set_cursor_visibility"),
+        ):
+            app._render_remote_details()
+        self.assertTrue(any("failed-host-1" in value for value in rendered))
+        self.assertTrue(any("connection error 1" in value for value in rendered))
+
+        app.handle_key("\x1b")
+        self.assertFalse(app.remote_details_visible)
 
     def test_mode_privacy_copy_wraps_on_narrow_screens_in_every_language(self):
         sender = agent()

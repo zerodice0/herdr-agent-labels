@@ -123,6 +123,26 @@ the configured policy requires one, usable authentication, a reachable SSH
 service, or a running Herdr server are skipped. Concrete `Host` aliases from
 recursive `Include` files are supported.
 
+The editor shows a compact remote summary instead of listing every SSH alias.
+When any host is unavailable, the warning is highlighted; press `Ctrl+U` to open
+a scrollable list of the affected aliases and their latest errors.
+
+By default, the plugin probes every concrete alias for backward compatibility.
+That is usually broader than necessary when `~/.ssh/config` also contains work,
+deployment, or dormant hosts. To restrict discovery, create `ssh-hosts` in the
+plugin config directory with one authorized alias per line:
+
+```text
+macbook-pro
+winmini
+```
+
+Only aliases that also exist in the SSH config are used. An empty file selects
+local-only discovery, while a missing file retains the all-alias behavior. Set
+`HERDR_AGENT_LABELS_SSH_HOSTS_FILE` to use a different allowlist path. Herdr
+provides the default path through `HERDR_PLUGIN_CONFIG_DIR`; it normally resolves
+to `~/.config/herdr/plugins/config/herdr.agent-labels/ssh-hosts`.
+
 Tailscale does not require a special plugin-specific SSH format. Keep a stable,
 human-readable SSH alias and point it to either the device's MagicDNS name or
 Tailscale IP, for example:
@@ -160,6 +180,7 @@ Keyboard controls:
 - `Tab`: switch between recipients and the message editor
 - `Ctrl+O`: reopen the delivery mode screen
 - `Ctrl+R`: refresh local and authorized remote agents
+- `Ctrl+U`: show unavailable remote hosts and their latest errors
 - `Ctrl+G`: show the bundled Agent Messenger skill guide
 - `Ctrl+S`: send the prompt
 - `Esc`: go back from delivery mode, cancel discovery or pending sends, then close

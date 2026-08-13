@@ -59,6 +59,7 @@ PAIR_REMOTE = 5
 DELIVERY_DELEGATE = "delegate"
 DELIVERY_DIRECT = "direct"
 SKILL_GUIDE_KEY = "\x07"
+REMOTE_DETAILS_KEY = "\x15"
 
 
 @dataclass(frozen=True)
@@ -545,6 +546,7 @@ class MessengerApp:
         self.discovery: RemoteDiscovery | None = None
         self.pending_hosts: set[str] = set()
         self.host_status: dict[str, str] = {}
+        self.host_errors: dict[str, str] = {}
         self.skipped_hosts = 0
         self.running = True
         self.colors_enabled = False
@@ -553,6 +555,8 @@ class MessengerApp:
         self.send_results: queue.Queue[SendJobResult] = queue.Queue()
         self.send_cancel = threading.Event()
         self.skill_guide_visible = False
+        self.remote_details_visible = False
+        self.remote_details_offset = 0
 
     def _initialize_colors(self) -> None:
         if not curses.has_colors():
@@ -662,6 +666,7 @@ class MessengerApp:
             self.discovery.cancel()
         self.remote_enabled = True
         self.skipped_hosts = 0
+        self.host_errors.clear()
         hosts_to_probe: list[str] = []
         now = time.time()
         for host in self.hosts:
@@ -682,6 +687,7 @@ class MessengerApp:
                         records=self.cache.agents(host, stale=True),
                     )
                     self.host_status[host] = self.text["unavailable"]
+                    self.host_errors[host] = str(entry.get("error") or "unavailable")
                     self.skipped_hosts += 1
                 continue
 
@@ -724,6 +730,7 @@ class MessengerApp:
                     records=result.agents,
                 )
                 self.host_status[result.host] = ""
+                self.host_errors.pop(result.host, None)
             else:
                 stale_agents = self.cache.agents(result.host, stale=True)
                 self._replace_agent_scope(
@@ -732,6 +739,7 @@ class MessengerApp:
                     records=stale_agents,
                 )
                 self.host_status[result.host] = self.text["unavailable"]
+                self.host_errors[result.host] = result.error or "unavailable"
                 self.skipped_hosts += 1
         if not self.pending_hosts:
             self.cache.save()
@@ -744,6 +752,7 @@ class MessengerApp:
                 result = ProbeResult(host, (), False, "timeout")
                 self.cache.update(result)
                 self.host_status[host] = self.text["unavailable"]
+                self.host_errors[host] = result.error
                 self.skipped_hosts += 1
             self.pending_hosts.clear()
             self.cache.save()
@@ -770,10 +779,84 @@ class MessengerApp:
         self.agents = [agent for agent in self.agents if agent.local]
         self.pending_hosts.clear()
         self.host_status.clear()
+        self.host_errors.clear()
         self.skipped_hosts = 0
         self.remote_enabled = False
         self.status = ""
         self._clamp_cursor()
+
+    def _remote_counts(self) -> tuple[int, int, int]:
+        available = sum(
+            status != self.text["unavailable"] and status != self.text["refreshing"]
+            for status in self.host_status.values()
+        )
+        refreshing = sum(
+            status == self.text["refreshing"] for status in self.host_status.values()
+        )
+        unavailable = sum(
+            status == self.text["unavailable"] for status in self.host_status.values()
+        )
+        return available, refreshing, unavailable
+
+    def _remote_summary(self) -> str:
+        available, refreshing, unavailable = self._remote_counts()
+        if unavailable:
+            summary = self.text["remote_warning_summary"].format(
+                unavailable=unavailable,
+                available=available,
+                details=self.text["remote_details_hint"],
+            )
+        else:
+            summary = self.text["remote_summary"].format(available=available)
+        if refreshing:
+            summary += " " + self.text["remote_refreshing_count"].format(
+                count=refreshing
+            )
+        return summary
+
+    def _unavailable_hosts(self) -> list[tuple[str, str]]:
+        return sorted(
+            (
+                self._display_host(host),
+                _single_line(self.host_errors.get(host, "unavailable")),
+            )
+            for host, status in self.host_status.items()
+            if status == self.text["unavailable"]
+        )
+
+    def _render_remote_details(self) -> None:
+        self.screen.erase()
+        height, width = self.screen.getmaxyx()
+        failures = self._unavailable_hosts()
+        self._safe_add(
+            0,
+            0,
+            self.text["remote_details_title"],
+            self._style(PAIR_WARNING, curses.A_BOLD),
+        )
+        self._safe_add(1, 0, self._remote_summary(), self._style(PAIR_WARNING))
+        visible_rows = max(1, height - 4)
+        maximum_offset = max(0, len(failures) - visible_rows)
+        self.remote_details_offset = min(self.remote_details_offset, maximum_offset)
+        visible = failures[
+            self.remote_details_offset : self.remote_details_offset + visible_rows
+        ]
+        for index, (host, error) in enumerate(visible, start=3):
+            line = f"! {host} — {error}"
+            self._safe_add(
+                index,
+                0,
+                truncate_display_text(line, max(1, width - 1)),
+                self._style(PAIR_WARNING, curses.A_BOLD),
+            )
+        self._safe_add(
+            height - 1,
+            0,
+            self.text["remote_details_help"],
+            curses.A_DIM,
+        )
+        self._set_cursor_visibility(False)
+        self.screen.refresh()
 
     def _clamp_cursor(self) -> None:
         records = self.filtered_agents()
@@ -976,6 +1059,10 @@ class MessengerApp:
         return row + visible_rows
 
     def render(self) -> None:
+        if self.remote_details_visible:
+            self.message_cursor = None
+            self._render_remote_details()
+            return
         if self.skill_guide_visible:
             self.message_cursor = None
             render_skill_guide_screen(self.screen, self.text, bundled_skill_path())
@@ -1029,15 +1116,15 @@ class MessengerApp:
         row = self._render_message(row + 1, max(3, height - row - reserved_footer - 1))
 
         if self.remote_enabled:
-            host_summary = "  ".join(
-                f'{self._display_host(host)}:{status or self.text["available"]}'
-                for host, status in sorted(self.host_status.items())
-            )
+            _available, _refreshing, unavailable = self._remote_counts()
             self._safe_add(
                 height - 3,
                 0,
-                host_summary,
-                self._style(PAIR_REMOTE, curses.A_DIM),
+                self._remote_summary(),
+                self._style(
+                    PAIR_WARNING if unavailable else PAIR_REMOTE,
+                    curses.A_BOLD if unavailable else curses.A_DIM,
+                ),
             )
         self._safe_add(
             height - 2,
@@ -1294,6 +1381,20 @@ class MessengerApp:
             self.status = self.text["all_failed"]
 
     def handle_key(self, key: str | int) -> None:
+        if self.remote_details_visible:
+            failures = self._unavailable_hosts()
+            height, _width = self.screen.getmaxyx()
+            maximum_offset = max(0, len(failures) - max(1, height - 4))
+            if key == curses.KEY_UP:
+                self.remote_details_offset = max(0, self.remote_details_offset - 1)
+            elif key == curses.KEY_DOWN:
+                self.remote_details_offset = min(
+                    maximum_offset,
+                    self.remote_details_offset + 1,
+                )
+            elif key in (REMOTE_DETAILS_KEY, "\x1b", "q", "Q"):
+                self.remote_details_visible = False
+            return
         if self.skill_guide_visible:
             if key in (
                 SKILL_GUIDE_KEY,
@@ -1309,6 +1410,14 @@ class MessengerApp:
             return
         if key == SKILL_GUIDE_KEY and not self.sending:
             self.skill_guide_visible = True
+            return
+        if (
+            key == REMOTE_DETAILS_KEY
+            and not self.sending
+            and self._unavailable_hosts()
+        ):
+            self.remote_details_visible = True
+            self.remote_details_offset = 0
             return
         if not self.discovery_choice:
             if key == curses.KEY_UP:
