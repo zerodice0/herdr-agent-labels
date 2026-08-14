@@ -29,6 +29,8 @@ from agent_batch_dispatch import (
     parse_batch_json,
 )
 from agent_directory import (
+    LEGACY_PLUGIN_ID,
+    PLUGIN_ID,
     REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     AgentRecord,
     fetch_local_agent,
@@ -244,13 +246,24 @@ def _request_state_store(
     if configured:
         directory = Path(configured).expanduser()
     elif values.get("HERDR_PLUGIN_STATE_DIR"):
-        directory = Path(values["HERDR_PLUGIN_STATE_DIR"]).expanduser() / "requests"
+        plugin_state = Path(values["HERDR_PLUGIN_STATE_DIR"]).expanduser()
+        directory = plugin_state / "requests"
+        legacy = plugin_state.with_name(LEGACY_PLUGIN_ID) / "requests"
+        if (
+            plugin_state.name == PLUGIN_ID
+            and not directory.exists()
+            and legacy.exists()
+        ):
+            directory = legacy
     else:
         state_home = values.get("XDG_STATE_HOME")
         configured_home = values.get("HOME")
         home = Path(configured_home).expanduser() if configured_home else Path.home()
         root = Path(state_home).expanduser() if state_home else home / ".local/state"
-        directory = root / "herdr-agent-labels" / "requests"
+        directory = root / "herdr-agent-messenger" / "requests"
+        legacy = root / "herdr-agent-labels" / "requests"
+        if not directory.exists() and legacy.exists():
+            directory = legacy
     return JsonRequestStateStore(directory)
 
 

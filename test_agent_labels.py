@@ -60,6 +60,26 @@ class AgentLabelsTest(unittest.TestCase):
             self.assertEqual(agent_labels.assign_label("w1:p3"), 0)
         self.assertEqual(run.call_count, 1)
 
+    def test_metadata_migration_clears_legacy_source_before_reporting_new(self):
+        completed = mock.Mock(returncode=0, stdout="{}", stderr="")
+        with mock.patch.object(
+            agent_labels,
+            "run_herdr",
+            return_value=completed,
+        ) as run:
+            agent_labels.report_agent_label_metadata(
+                "w1:p3",
+                "codex",
+                "blue-otter",
+                "🟦",
+                "blue",
+            )
+
+        self.assertEqual(
+            [call.args[4] for call in run.call_args_list],
+            [agent_labels.LEGACY_SOURCE, agent_labels.SOURCE],
+        )
+
     def test_invalid_agent_response_shape_is_ignored(self):
         result = mock.Mock(returncode=0, stdout='{"result":null}', stderr="")
         with mock.patch.object(agent_labels, "run_herdr", return_value=result):

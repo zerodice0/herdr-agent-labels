@@ -44,7 +44,7 @@ from agent_route import encode_agent_route
 from messenger_i18n import detect_language, messages
 
 
-PLUGIN_ID = "herdr.agent-labels"
+PLUGIN_ID = "herdr.agent-messenger"
 POPUP_ENTRYPOINT = "messenger"
 POPUP_WIDTH = 120
 POPUP_HEIGHT = 32
@@ -52,7 +52,7 @@ POPUP_MIN_HEIGHT = 15
 MESSAGE_MIN_VISIBLE_ROWS = 4
 SKILL_INSTALLER_ENTRYPOINT = "skill-installer"
 SKILL_INSTALLER_WIDTH = 60
-SKILL_INSTALLER_HEIGHT = 15
+SKILL_INSTALLER_HEIGHT = 22
 SKILL_PROJECT_ROOT_ENV = "HERDR_AGENT_SKILL_PROJECT_ROOT"
 SKILL_RELATIVE_PATH = Path(".agents/skills/herdr-agent-messenger/SKILL.md")
 SENDER_PANE_ENV = "HERDR_AGENT_MESSENGER_SENDER_PANE_ID"

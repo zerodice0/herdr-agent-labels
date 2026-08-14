@@ -55,6 +55,30 @@ def agent(
 
 
 class AgentSkillCliTest(unittest.TestCase):
+    def test_request_state_default_falls_back_to_legacy_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            legacy = home / ".local/state/herdr-agent-labels/requests"
+            legacy.mkdir(parents=True)
+
+            store = agent_skill_cli._request_state_store({"HOME": str(home)})
+
+        self.assertEqual(store.directory, legacy)
+
+    def test_request_state_runtime_falls_back_to_legacy_plugin_sibling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            current = state_root / agent_directory.PLUGIN_ID
+            legacy = state_root / agent_directory.LEGACY_PLUGIN_ID / "requests"
+            current.mkdir()
+            legacy.mkdir(parents=True)
+
+            store = agent_skill_cli._request_state_store(
+                {"HERDR_PLUGIN_STATE_DIR": str(current)}
+            )
+
+        self.assertEqual(store.directory, legacy)
+
     def test_route_token_resolves_exact_current_occupant(self):
         recipient = agent(name="", pane_id="w7:p9")
         token = agent_skill_cli.encode_agent_route(recipient)
@@ -1005,8 +1029,40 @@ class AgentSkillWrapperTest(unittest.TestCase):
                 "list",
                 "--json",
                 "--plugin",
-                "herdr.agent-labels",
+                "herdr.agent-messenger",
             ],
+        )
+
+    def test_standalone_wrapper_falls_back_to_legacy_plugin_id(self):
+        plugin_root = Path(__file__).resolve().parent
+        missing = subprocess.CompletedProcess(
+            ["herdr"],
+            0,
+            '{"result":{"plugins":[]}}',
+            "",
+        )
+        legacy = subprocess.CompletedProcess(
+            ["herdr"],
+            0,
+            (
+                '{"result":{"plugins":[{"plugin_root":"'
+                + str(plugin_root)
+                + '"}]}}'
+            ),
+            "",
+        )
+        runner = mock.Mock(side_effect=(missing, legacy))
+
+        self.assertEqual(
+            self.wrapper.find_plugin_root(
+                Path("/tmp/copied-skill/scripts/herdr_agent_messenger.py"),
+                runner,
+            ),
+            plugin_root,
+        )
+        self.assertEqual(
+            runner.call_args_list[1].args[0][-1],
+            "herdr.agent-labels",
         )
 
     def test_standalone_wrapper_rejects_invalid_plugin_responses(self):

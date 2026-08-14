@@ -1,8 +1,8 @@
-id = "herdr.agent-labels"
-name = "Agent Labels"
-version = "0.7.0"
+id = "herdr.agent-messenger"
+name = "HAM"
+version = "0.8.0"
 min_herdr_version = "0.8.0"
-description = "Label Herdr agents and delegate or send prompts to local or SSH-hosted peers."
+description = "Label Herdr agents and coordinate prompts with HAM, the Herdr Agent Messenger."
 platforms = ["macos", "linux"]
 
 [[actions]]
@@ -14,15 +14,15 @@ command = ["python3", "agent_labels.py", "label"]
 
 [[actions]]
 id = "message-agents"
-title = "Send Prompt to Agents"
+title = "HAM: Send Prompt to Agents"
 description = "Select agents, then delegate through the coordinator or send directly."
 contexts = ["pane"]
 command = ["python3", "agent_messenger.py", "launch"]
 
 [[actions]]
 id = "agent-skill-guide"
-title = "Agent Skill"
-description = "Install, update, or learn how to use Agent Messenger."
+title = "HAM Skill"
+description = "Install, update, or learn how to use HAM."
 contexts = ["workspace", "pane"]
 command = ["python3", "agent_skill_installer.py", "launch"]
 
@@ -32,12 +32,12 @@ command = ["python3", "agent_labels.py", "event"]
 
 [[panes]]
 id = "messenger"
-title = "Agent Messenger"
+title = "HAM"
 placement = "popup"
 command = ["python3", "agent_messenger.py", "popup"]
 
 [[panes]]
 id = "skill-installer"
-title = "Agent Skill"
+title = "HAM Skill"
 placement = "popup"
 command = ["python3", "agent_skill_installer.py", "popup"]

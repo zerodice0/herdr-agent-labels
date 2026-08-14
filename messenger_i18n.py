@@ -89,7 +89,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "opening this popup."
         ),
         "skill_guide_install": (
-            "Run 'Install Agent Skill' from the command palette, or load this file:"
+            "Run 'HAM Skill' from the command palette, or load this file:"
         ),
         "skill_guide_target": "Target format: host/label",
         "skill_guide_example": (
@@ -179,7 +179,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "팝업을 열지 않고 호스트와 에이전트 라벨로 요청을 전달하려면 내장 스킬을 사용하세요."
         ),
         "skill_guide_install": (
-            "명령 팔레트에서 'Install Agent Skill'을 실행하거나 다음 파일을 불러오세요:"
+            "명령 팔레트에서 'HAM Skill'을 실행하거나 다음 파일을 불러오세요:"
         ),
         "skill_guide_target": "대상 형식: host/label",
         "skill_guide_example": (
@@ -268,7 +268,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "ポップアップを開かず、ホストとエージェントラベルで依頼を送るには同梱スキルを使用します。"
         ),
         "skill_guide_install": (
-            "コマンドパレットで 'Install Agent Skill' を実行するか、このファイルを読み込みます:"
+            "コマンドパレットで 'HAM Skill' を実行するか、このファイルを読み込みます:"
         ),
         "skill_guide_target": "宛先形式: host/label",
         "skill_guide_example": (

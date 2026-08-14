@@ -62,8 +62,8 @@ class AgentDirectoryTest(unittest.TestCase):
                 encoding="utf-8",
             )
             environment = {
-                "HERDR_AGENT_LABELS_SSH_CONFIG": str(config),
-                "HERDR_AGENT_LABELS_SSH_HOSTS_FILE": str(allowlist),
+                "HERDR_AGENT_MESSENGER_SSH_CONFIG": str(config),
+                "HERDR_AGENT_MESSENGER_SSH_HOSTS_FILE": str(allowlist),
             }
 
             self.assertEqual(
@@ -80,6 +80,68 @@ class AgentDirectoryTest(unittest.TestCase):
             )
             allowlist.write_text("# Local only\n", encoding="utf-8")
             self.assertEqual(agent_directory.ssh_hosts(environment), [])
+
+    def test_new_ssh_environment_names_precede_legacy_names(self):
+        environment = {
+            "HERDR_AGENT_MESSENGER_SSH_CONFIG": "/new/config",
+            "HERDR_AGENT_LABELS_SSH_CONFIG": "/legacy/config",
+            "HERDR_AGENT_MESSENGER_SSH_HOSTS_FILE": "/new/hosts",
+            "HERDR_AGENT_LABELS_SSH_HOSTS_FILE": "/legacy/hosts",
+        }
+
+        self.assertEqual(
+            agent_directory.ssh_config_path(environment),
+            Path("/new/config"),
+        )
+        self.assertEqual(
+            agent_directory.ssh_hosts_allowlist_path(environment),
+            Path("/new/hosts"),
+        )
+
+    def test_allowlist_default_falls_back_to_legacy_plugin_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_root = Path(directory)
+            current = config_root / agent_directory.PLUGIN_ID
+            legacy = config_root / agent_directory.LEGACY_PLUGIN_ID
+            legacy.mkdir()
+            legacy_allowlist = legacy / "ssh-hosts"
+            legacy_allowlist.write_text("macbook-pro\n", encoding="utf-8")
+
+            self.assertEqual(
+                agent_directory.ssh_hosts_allowlist_path(
+                    {"HERDR_PLUGIN_CONFIG_DIR": str(current)}
+                ),
+                legacy_allowlist,
+            )
+
+    def test_cache_default_falls_back_to_legacy_state_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            legacy = home / ".local/state/herdr-agent-labels"
+            legacy.mkdir(parents=True)
+            with mock.patch.object(agent_directory.Path, "home", return_value=home):
+                cache = agent_directory.AgentCache.from_environment({})
+
+            self.assertEqual(cache.path, legacy / "agent-directory.json")
+
+    def test_cache_runtime_state_falls_back_to_legacy_plugin_sibling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            current = state_root / agent_directory.PLUGIN_ID
+            legacy = state_root / agent_directory.LEGACY_PLUGIN_ID
+            current.mkdir()
+            legacy.mkdir()
+            legacy_cache = legacy / "agent-directory.json"
+            legacy_cache.write_text(
+                '{"version":1,"hosts":{}}',
+                encoding="utf-8",
+            )
+
+            cache = agent_directory.AgentCache.from_environment(
+                {"HERDR_PLUGIN_STATE_DIR": str(current)}
+            )
+
+            self.assertEqual(cache.path, legacy_cache)
 
     def test_parse_agent_payload_builds_addressable_records(self):
         payload = {

@@ -466,7 +466,10 @@ class AgentMessengerTest(unittest.TestCase):
             agent_messenger.SKILL_INSTALLER_ENTRYPOINT,
         )
         self.assertEqual(arguments[arguments.index("--width") + 1], "60")
-        self.assertEqual(arguments[arguments.index("--height") + 1], "15")
+        self.assertEqual(
+            arguments[arguments.index("--height") + 1],
+            str(agent_messenger.SKILL_INSTALLER_HEIGHT),
+        )
         self.assertTrue(agent_messenger.bundled_skill_path().is_file())
 
     def test_language_detection_supports_three_locales(self):

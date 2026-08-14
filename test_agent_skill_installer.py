@@ -116,14 +116,14 @@ class AgentSkillInstallerTest(unittest.TestCase):
         launch_popup.assert_called_once_with(
             agent_skill_installer.SKILL_INSTALLER_ENTRYPOINT,
             width=60,
-            height=15,
+            height=22,
             environment={"LANG": "ko_KR.UTF-8"},
             extra_arguments=(),
         )
 
     def test_popup_arrow_selection_installs_the_highlighted_target(self):
         screen = mock.Mock()
-        screen.getmaxyx.return_value = (15, 60)
+        screen.getmaxyx.return_value = (22, 60)
         screen.get_wch.side_effect = [curses.KEY_DOWN, curses.KEY_DOWN, "\n", "\x1b"]
 
         def run_wrapper(callback):
@@ -151,7 +151,7 @@ class AgentSkillInstallerTest(unittest.TestCase):
 
     def test_question_mark_opens_usage_and_escape_returns_to_targets(self):
         screen = mock.Mock()
-        screen.getmaxyx.return_value = (15, 60)
+        screen.getmaxyx.return_value = (22, 60)
         screen.get_wch.side_effect = ["?", "\x1b", "\x1b"]
 
         with (
@@ -171,8 +171,14 @@ class AgentSkillInstallerTest(unittest.TestCase):
             )
 
         rendered = [call.args[2] for call in screen.addnstr.call_args_list]
-        self.assertIn("Usage", rendered)
-        self.assertIn("Target: host/label", rendered)
+        rendered_text = "".join(rendered)
+        self.assertIn("Use HAM", rendered)
+        self.assertIn(
+            "Codex: type $ham, then select HAM — Herdr Agent Messenger.",
+            rendered_text,
+        )
+        self.assertIn("Claude Code: invoke /herdr-agent-messenger.", rendered)
+        self.assertIn("Example target: local/yellow-falcon", rendered)
 
 
 if __name__ == "__main__":

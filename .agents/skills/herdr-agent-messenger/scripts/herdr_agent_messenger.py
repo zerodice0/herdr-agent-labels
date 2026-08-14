@@ -9,6 +9,9 @@ import sys
 from pathlib import Path
 
 
+PLUGIN_IDS = ("herdr.agent-messenger", "herdr.agent-labels")
+
+
 def find_plugin_root(
     script_path: Path | None = None,
     runner=subprocess.run,
@@ -18,38 +21,44 @@ def find_plugin_root(
         if (bundled_root / "agent_skill_cli.py").is_file():
             return bundled_root
 
-    try:
-        result = runner(
-            [
-                "herdr",
-                "plugin",
-                "list",
-                "--json",
-                "--plugin",
-                "herdr.agent-labels",
-            ],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise SystemExit(
-            "Could not query the installed herdr.agent-labels plugin."
-        ) from error
-    try:
-        payload = json.loads(result.stdout)
-        plugins = payload["result"]["plugins"]
-        installed_root = Path(plugins[0]["plugin_root"])
-    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        raise SystemExit(
-            "Could not locate the installed herdr.agent-labels plugin."
-        ) from error
-    if result.returncode != 0 or not (installed_root / "agent_skill_cli.py").is_file():
-        raise SystemExit(
-            "The installed herdr.agent-labels plugin does not include the skill CLI."
-        )
-    return installed_root
+    last_error: Exception | None = None
+    for plugin_id in PLUGIN_IDS:
+        try:
+            result = runner(
+                [
+                    "herdr",
+                    "plugin",
+                    "list",
+                    "--json",
+                    "--plugin",
+                    plugin_id,
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=10,
+            )
+            payload = json.loads(result.stdout)
+            plugins = payload["result"]["plugins"]
+            installed_root = Path(plugins[0]["plugin_root"])
+        except (
+            IndexError,
+            KeyError,
+            OSError,
+            subprocess.TimeoutExpired,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as error:
+            last_error = error
+            continue
+        if result.returncode == 0 and (installed_root / "agent_skill_cli.py").is_file():
+            return installed_root
+
+    raise SystemExit(
+        "Could not locate HAM as herdr.agent-messenger or the legacy "
+        "herdr.agent-labels plugin."
+    ) from last_error
 
 
 PLUGIN_ROOT = find_plugin_root()

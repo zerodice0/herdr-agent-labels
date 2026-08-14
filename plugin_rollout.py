@@ -1,4 +1,4 @@
-"""Safely roll out one exact Agent Labels commit to selected SSH aliases."""
+"""Safely roll out one exact HAM commit to selected SSH aliases."""
 
 from __future__ import annotations
 
@@ -26,7 +26,8 @@ from agent_directory import (
 )
 
 
-PLUGIN_ID = "herdr.agent-labels"
+PLUGIN_ID = "herdr.agent-messenger"
+LEGACY_PLUGIN_ID = "herdr.agent-labels"
 PLUGIN_SOURCE = "zerodice0/herdr-agent-labels"
 SOURCE_OWNER, SOURCE_REPO = PLUGIN_SOURCE.split("/", 1)
 CORE_ACTION_IDS = frozenset(
@@ -48,6 +49,7 @@ SMOKE_CHECKS = (
     "config",
     "reload",
     "actions",
+    "migration",
 )
 FULL_CHECKS = (
     "preflight",
@@ -61,6 +63,7 @@ FULL_CHECKS = (
     "config",
     "reload",
     "actions",
+    "migration",
 )
 
 _HASH_SCRIPT = """\
@@ -116,6 +119,7 @@ class TargetSnapshot:
 
 @dataclass(frozen=True)
 class PreviousInstallation:
+    plugin_id: str | None
     ref: str | None
     enabled: bool
 
@@ -301,10 +305,15 @@ def install_command(host: str, ref: str, *, config_path: Path) -> list[str]:
     )
 
 
-def uninstall_command(host: str, *, config_path: Path) -> list[str]:
+def uninstall_command(
+    host: str,
+    *,
+    plugin_id: str = PLUGIN_ID,
+    config_path: Path,
+) -> list[str]:
     return ssh_command(
         host,
-        ["plugin", "uninstall", PLUGIN_ID],
+        ["plugin", "uninstall", plugin_id],
         config_path=config_path,
     )
 
@@ -313,19 +322,29 @@ def enabled_command(
     host: str,
     *,
     enabled: bool,
+    plugin_id: str = PLUGIN_ID,
     config_path: Path,
 ) -> list[str]:
     return ssh_command(
         host,
-        ["plugin", "enable" if enabled else "disable", PLUGIN_ID],
+        ["plugin", "enable" if enabled else "disable", plugin_id],
         config_path=config_path,
     )
 
 
-def plugin_list_command(host: str, *, config_path: Path) -> list[str]:
+def plugin_list_command(
+    host: str,
+    *,
+    plugin_id: str | None = PLUGIN_ID,
+    config_path: Path,
+) -> list[str]:
+    arguments = ["plugin", "list"]
+    if plugin_id is not None:
+        arguments.extend(["--plugin", plugin_id])
+    arguments.append("--json")
     return ssh_command(
         host,
-        ["plugin", "list", "--plugin", PLUGIN_ID, "--json"],
+        arguments,
         config_path=config_path,
     )
 
@@ -396,15 +415,22 @@ def _json_object(value: str) -> dict[str, Any]:
     return {}
 
 
-def _installed_plugin(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+def _plugin_by_id(
+    payload: Mapping[str, Any],
+    plugin_id: str,
+) -> dict[str, Any] | None:
     result = payload.get("result")
     plugins = result.get("plugins") if isinstance(result, dict) else None
     if not isinstance(plugins, list):
         return None
     for plugin in plugins:
-        if isinstance(plugin, dict) and plugin.get("plugin_id") == PLUGIN_ID:
+        if isinstance(plugin, dict) and plugin.get("plugin_id") == plugin_id:
             return plugin
     return None
+
+
+def _installed_plugin(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    return _plugin_by_id(payload, PLUGIN_ID)
 
 
 def _previous_installation(
@@ -414,9 +440,15 @@ def _previous_installation(
     plugins = result.get("plugins") if isinstance(result, dict) else None
     if not isinstance(plugins, list):
         raise RolloutError("preflight plugin metadata is invalid")
-    plugin = _installed_plugin(payload)
+    current = _installed_plugin(payload)
+    legacy = _plugin_by_id(payload, LEGACY_PLUGIN_ID)
+    if current is not None and legacy is not None:
+        raise RolloutError(
+            f"both {PLUGIN_ID!r} and legacy {LEGACY_PLUGIN_ID!r} are installed"
+        )
+    plugin = current or legacy
     if plugin is None:
-        return PreviousInstallation(None, False)
+        return PreviousInstallation(None, None, False)
     source = plugin.get("source")
     if not isinstance(source, dict):
         raise RolloutError("the existing plugin has no restorable source metadata")
@@ -429,7 +461,12 @@ def _previous_installation(
     ref = source.get("resolved_commit")
     if not isinstance(ref, str) or EXACT_COMMIT_PATTERN.fullmatch(ref) is None:
         raise RolloutError("the existing plugin commit cannot be safely restored")
-    return PreviousInstallation(ref.lower(), plugin.get("enabled") is True)
+    plugin_id = str(plugin.get("plugin_id") or "")
+    return PreviousInstallation(
+        plugin_id,
+        ref.lower(),
+        plugin.get("enabled") is True,
+    )
 
 
 def _active_action_ids(payload: Mapping[str, Any]) -> set[str] | None:
@@ -511,7 +548,10 @@ def _planned_result(
 ) -> HostResult:
     result = HostResult(host, profile)
     commands = [
-        ("preflight", plugin_list_command(host, config_path=config_path)),
+        (
+            "preflight",
+            plugin_list_command(host, plugin_id=None, config_path=config_path),
+        ),
         ("install", install_command(host, target.ref, config_path=config_path)),
         (
             "stage",
@@ -551,6 +591,23 @@ def _planned_result(
             ("config", config_check_command(host, config_path=config_path)),
             ("reload", reload_command(host, config_path=config_path)),
             ("actions", action_list_command(host, config_path=config_path)),
+            (
+                "legacy-disable",
+                enabled_command(
+                    host,
+                    enabled=False,
+                    plugin_id=LEGACY_PLUGIN_ID,
+                    config_path=config_path,
+                ),
+            ),
+            (
+                "legacy-uninstall",
+                uninstall_command(
+                    host,
+                    plugin_id=LEGACY_PLUGIN_ID,
+                    config_path=config_path,
+                ),
+            ),
         ]
     )
     for step, command in commands:
@@ -595,7 +652,7 @@ def _rollback_installation(
         absence = _invoke(
             host_result,
             "rollback-verify-absent",
-            plugin_list_command(host, config_path=config_path),
+            plugin_list_command(host, plugin_id=None, config_path=config_path),
             CHECK_TIMEOUT_SECONDS,
             runner,
         )
@@ -616,6 +673,15 @@ def _rollback_installation(
             disable_fallback(detail)
             return
     else:
+        if previous.plugin_id == LEGACY_PLUGIN_ID:
+            error = invoke(
+                "rollback-uninstall-new",
+                uninstall_command(host, config_path=config_path),
+                INSTALL_TIMEOUT_SECONDS,
+            )
+            if error:
+                disable_fallback(f"rollback-uninstall-new: {error}")
+                return
         error = invoke(
             "rollback-install",
             install_command(host, previous.ref, config_path=config_path),
@@ -629,6 +695,7 @@ def _rollback_installation(
             enabled_command(
                 host,
                 enabled=previous.enabled,
+                plugin_id=previous.plugin_id or PLUGIN_ID,
                 config_path=config_path,
             ),
             CHECK_TIMEOUT_SECONDS,
@@ -657,7 +724,7 @@ def _rollback_installation(
     verified = _invoke(
         host_result,
         "rollback-verify",
-        plugin_list_command(host, config_path=config_path),
+        plugin_list_command(host, plugin_id=None, config_path=config_path),
         CHECK_TIMEOUT_SECONDS,
         runner,
     )
@@ -681,7 +748,9 @@ def _rollback_installation(
     restored_detail = (
         "plugin absent"
         if previous.ref is None
-        else f"ref {previous.ref}, enabled={previous.enabled}"
+        else (
+            f"{previous.plugin_id} ref {previous.ref}, enabled={previous.enabled}"
+        )
     )
     host_result.add("rollback", "pass", f"restored {restored_detail}")
 
@@ -721,7 +790,7 @@ def _rollout_host(
     preflight = _invoke(
         host_result,
         "preflight",
-        plugin_list_command(host, config_path=config_path),
+        plugin_list_command(host, plugin_id=None, config_path=config_path),
         CHECK_TIMEOUT_SECONDS,
         runner,
     )
@@ -738,7 +807,9 @@ def _rollout_host(
     previous_detail = (
         "plugin absent"
         if previous.ref is None
-        else f"ref {previous.ref}, enabled={previous.enabled}"
+        else (
+            f"{previous.plugin_id} ref {previous.ref}, enabled={previous.enabled}"
+        )
     )
     host_result.add("preflight", "pass", previous_detail)
 
@@ -897,6 +968,31 @@ def _rollout_host(
             )
         host_result.add("unittest", "pass", "python3 -W error -m unittest -q")
 
+    migrating_legacy = previous.plugin_id == LEGACY_PLUGIN_ID
+    if migrating_legacy:
+        legacy_disabled = _invoke(
+            host_result,
+            "legacy-disable",
+            enabled_command(
+                host,
+                enabled=False,
+                plugin_id=LEGACY_PLUGIN_ID,
+                config_path=config_path,
+            ),
+            CHECK_TIMEOUT_SECONDS,
+            runner,
+        )
+        if legacy_disabled.returncode != 0:
+            return _abort_after_install(
+                host_result,
+                host,
+                previous,
+                remaining,
+                "legacy plugin could not be disabled before activation",
+                config_path=config_path,
+                runner=runner,
+            )
+
     enabled_result = _invoke(
         host_result,
         "enable",
@@ -1017,6 +1113,65 @@ def _rollout_host(
             runner=runner,
         )
     host_result.add("actions", "pass", ", ".join(sorted(CORE_ACTION_IDS)))
+    if migrating_legacy:
+        removed = _invoke(
+            host_result,
+            "legacy-uninstall",
+            uninstall_command(
+                host,
+                plugin_id=LEGACY_PLUGIN_ID,
+                config_path=config_path,
+            ),
+            INSTALL_TIMEOUT_SECONDS,
+            runner,
+        )
+        if removed.returncode != 0:
+            host_result.add("migration", "fail", _command_failure(removed))
+            return _abort_after_install(
+                host_result,
+                host,
+                previous,
+                remaining,
+                "legacy plugin removal failed",
+                config_path=config_path,
+                runner=runner,
+            )
+        migrated = _invoke(
+            host_result,
+            "migration-metadata",
+            plugin_list_command(host, plugin_id=None, config_path=config_path),
+            CHECK_TIMEOUT_SECONDS,
+            runner,
+        )
+        migration_payload = _json_object(migrated.stdout)
+        legacy_absent = (
+            migrated.returncode == 0
+            and _plugin_by_id(migration_payload, LEGACY_PLUGIN_ID) is None
+            and _installed_plugin(migration_payload) is not None
+        )
+        if not legacy_absent:
+            detail = (
+                _command_failure(migrated)
+                if migrated.returncode != 0
+                else "legacy plugin is still installed"
+            )
+            host_result.add("migration", "fail", detail)
+            return _abort_after_install(
+                host_result,
+                host,
+                previous,
+                remaining,
+                "legacy plugin removal could not be verified",
+                config_path=config_path,
+                runner=runner,
+            )
+        host_result.add(
+            "migration",
+            "pass",
+            f"replaced {LEGACY_PLUGIN_ID} with {PLUGIN_ID}",
+        )
+    else:
+        host_result.add("migration", "pass", "legacy plugin not installed")
     return host_result
 
 
@@ -1103,7 +1258,7 @@ def render_table(results: Sequence[HostResult]) -> str:
 def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Install and validate one exact Agent Labels commit on explicit SSH aliases."
+            "Install, migrate, and validate one exact HAM commit on explicit SSH aliases."
         )
     )
     parser.add_argument("--host", action="append", required=True, dest="hosts")

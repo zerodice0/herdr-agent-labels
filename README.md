@@ -1,8 +1,13 @@
-# Herdr Agent Labels
+<p align="center">
+  <img src="assets/ham-logo.png" alt="HAM — Herdr Agent Messenger mascot logo" width="360">
+</p>
 
-Assigns an unused `color-animal` name to every unnamed agent detected by Herdr,
-then uses those names to route prompts to one or more agents from a keyboard-first
-popup. Manually named agents are left unchanged.
+# HAM — Herdr Agent Messenger
+
+HAM is an agent-labeling and multi-agent messaging plugin for Herdr. It assigns
+an unused `color-animal` name to every unnamed agent, then uses those names to
+route prompts to one or more agents from a keyboard-first popup or an AI skill.
+Manually named agents are left unchanged.
 
 The routable agent name stays ASCII, for example `blue-otter`. The sidebar and
 pane border display a color marker, for example `🟦 blue-otter`.
@@ -36,6 +41,44 @@ herdr plugin link "$PWD" --enabled
 Existing unnamed agents can be labeled with the `Assign Agent Label` plugin
 action. Agents detected after installation are labeled automatically.
 
+### Migrate from 0.7.x
+
+Version 0.8.0 changes the plugin ID from `herdr.agent-labels` to
+`herdr.agent-messenger`. The GitHub repository and install source remain
+`zerodice0/herdr-agent-labels`.
+
+For an existing GitHub installation, disable the legacy ID, install the new
+version, verify it, and then remove the legacy registration:
+
+```bash
+herdr plugin disable herdr.agent-labels
+herdr plugin install zerodice0/herdr-agent-labels --yes
+herdr plugin list --plugin herdr.agent-messenger --json
+herdr plugin action invoke agent-skill-guide --plugin herdr.agent-messenger
+herdr plugin uninstall herdr.agent-labels
+```
+
+For a local development link, update the checkout and reload Herdr. Local links
+are path-backed, so Herdr rereads the 0.8.0 manifest and adopts the new ID without
+an unlink/relink cycle:
+
+```bash
+git pull --ff-only
+herdr config check
+herdr server reload-config
+herdr plugin list --plugin herdr.agent-messenger --json
+herdr plugin action invoke agent-skill-guide --plugin herdr.agent-messenger
+```
+
+HAM reads the legacy `ssh-hosts` allowlist when the new config path does not yet
+contain one, and it falls back to legacy cache and request-state directories when
+their new counterparts are absent. The old environment variables remain
+compatibility fallbacks, but new configuration should use the
+`HERDR_AGENT_MESSENGER_*` names documented below. Use the `HAM Skill` screen to
+update any previously copied project or system skill before removing the legacy
+plugin. The 0.8.0 launcher checks the new plugin ID first and then the legacy ID,
+while an unchanged 0.7.x copy knows only the legacy ID.
+
 ## Agent Messenger
 
 Run the `Send Prompt to Agents` action from a pane that contains an agent. The
@@ -50,52 +93,119 @@ asynchronously. Only hosts that return a valid Herdr snapshot response within
 five seconds are included. Remote results are cached briefly so reopening the
 popup does not contact every host again.
 
-## Agent Skill
+## HAM agent skill
 
-The plugin bundles `.agents/skills/herdr-agent-messenger/SKILL.md` as the
-canonical skill and a Claude discovery entry at
-`.claude/skills/herdr-agent-messenger/SKILL.md`.
-It lets an agent route requests without opening the popup by addressing a current
-recipient as `host/label`, for example `macbook-pro/purple-koala`. Remote hosts
-must be concrete aliases in the user's SSH config, and labels are resolved again
-before every operation so a stale pane occupant is not reused.
-Only the literal host `local` selects the current Herdr server; every other host
-is treated as an SSH alias, even if it matches the local machine's hostname.
+HAM (Herdr Agent Messenger) lets Codex or Claude route requests without opening
+the popup. Address each current recipient as `host/label`:
 
-In a repository checkout, Codex and Claude discover the skill from their
-project-level skill directories. To make it available from every workspace,
-open `Agent Skill` from Herdr's command palette and select Codex, Claude, and
-either the current project or the whole system. The same interactive screen
-opens with `Ctrl+G` from Agent Messenger; press `?` to switch to concise usage
-help. Each target carries
-a compact badge: `✓` current, `↑` update available, `○` not installed, or `!`
-conflicting files. The selected badge is explained at the bottom of the popup.
-System-wide installs use the user's agent skill directories; project installs
-use the active Herdr workspace. Start a new agent session afterward. The
+- `local/yellow-falcon` targets this Herdr server.
+- `macbook-pro/purple-koala` targets the concrete `macbook-pro` alias from the
+  user's SSH config.
+
+Use the exact Agent Labels value. HAM resolves the label again before every
+operation so it does not silently reuse a stale pane occupant. Only the literal
+host `local` selects the current server; every other host is treated as SSH.
+
+The packaged skill keeps the canonical name `herdr-agent-messenger` for
+compatibility. `HAM` is its shorter user-facing name.
+
+### Install HAM with the plugin
+
+The plugin bundles `.agents/skills/herdr-agent-messenger/SKILL.md` for Codex and
+`.claude/skills/herdr-agent-messenger/SKILL.md` for Claude Code. A checkout is
+discovered at project scope. To use HAM from every workspace, open `HAM Skill`
+from Herdr's command palette and install the Codex or Claude target at `System`
+scope. `Project` affects only the active Herdr workspace.
+
+The same installer opens with `Ctrl+G` from Agent Messenger. Press `?` for the
+HAM invocation and prompt guide. Each target carries a compact badge: `✓`
+current, `↑` update available, `○` not installed, or `!` conflicting files. The
 installer refuses to overwrite an unrelated skill directory with the same name.
+Codex normally detects skill changes automatically and Claude Code live-reloads
+skills when its watched directory already exists. If HAM does not appear, start
+a new agent session.
 
-For usage help, open `Agent Skill` from Herdr's command palette and press `?`,
-press `Ctrl+G` inside Agent Messenger, or invoke the action from any directory:
+You can also open the installer from any directory:
 
 ```bash
-herdr plugin action invoke agent-skill-guide --plugin herdr.agent-labels
+herdr plugin action invoke agent-skill-guide --plugin herdr.agent-messenger
 ```
 
-From the plugin checkout or installed plugin root, print the packaged skill path
-directly:
+From the plugin checkout or installed plugin root, print the packaged skill path:
 
 ```bash
 python3 agent_messenger.py skill-path
 ```
 
-Ask Codex or Claude to read that `SKILL.md`, then request work naturally. The
-`$herdr-agent-messenger` form is available when the project-level skill has been
-discovered; an explicit natural-language request also works after loading the
-printed path:
+### Invoke HAM
+
+Codex CLI and the IDE extension use `$` mentions. Type `$ham`, then select
+**HAM — Herdr Agent Messenger** from the skill picker. `$ham` is a convenient
+search term; the selected skill's canonical name remains
+`herdr-agent-messenger`.
+
+Claude Code supports the same skill and can choose it automatically from a
+matching natural-language request. Its explicit syntax uses the exact skill
+name, so invoke `/herdr-agent-messenger`; `$ham` is not a Claude Code command.
+
+Give the host-qualified target, the task, and what to do with the response:
 
 ```text
-Use $herdr-agent-messenger to ask macbook-pro/purple-koala for a status report.
+$ham Ask local/yellow-falcon what language label dxp-ui uses. Wait for the
+reply, then align this work and its defaults with that answer.
 ```
+
+For Claude Code, the equivalent explicit request is:
+
+```text
+/herdr-agent-messenger Ask local/yellow-falcon what language label dxp-ui uses.
+Wait for the reply, then align this work and its defaults with that answer.
+```
+
+Do not write only `yellow-falcon`: another agent host may use the same label,
+and an AI client may mistake the bare label for one of its own subagent names.
+
+### Use HAM without the plugin
+
+HAM can run with Herdr without installing or enabling the HAM plugin,
+but the current standalone setup is source-backed: the skill wrapper loads its
+router modules from a persistent checkout of this repository. Copying only the
+skill directory, including via a generic skill installer, is not yet a
+self-contained installation.
+
+Clone the source once, then link its Codex and Claude entries into the personal
+skill locations. These commands expect the destination links not to exist:
+
+```bash
+git clone https://github.com/zerodice0/herdr-agent-labels.git \
+  "$HOME/.local/share/ham"
+mkdir -p "$HOME/.agents/skills" "$HOME/.claude/skills"
+ln -s "$HOME/.local/share/ham/.agents/skills/herdr-agent-messenger" \
+  "$HOME/.agents/skills/herdr-agent-messenger"
+ln -s "$HOME/.local/share/ham/.claude/skills/herdr-agent-messenger" \
+  "$HOME/.claude/skills/herdr-agent-messenger"
+```
+
+Update this installation with:
+
+```bash
+git -C "$HOME/.local/share/ham" pull --ff-only
+```
+
+Plugin-free HAM keeps label-based request, wait, read, and batch routing, but it
+does not provide the popup, command-palette installer, automatic `color-animal`
+assignment, or the agent-detected event hook. Give each recipient a unique name
+yourself before using HAM:
+
+```bash
+herdr api snapshot
+herdr agent rename <pane-id> yellow-falcon
+```
+
+Herdr must be installed and running on the local machine and on every selected
+SSH host. Remote hosts must be concrete aliases in `~/.ssh/config`. If the new
+skill directories were created after Codex or Claude Code started, restart that
+agent session so the directories are discovered.
 
 The bundled helper supports listing and a unified request lifecycle that resolves
 the recipient, submits a prompt, safely observes a fresh turn, and returns bounded
@@ -120,8 +230,9 @@ reports each target as
 semantic decomposition. Waiting batches use the same correlated request lifecycle
 per target and return request IDs plus bounded responses. `submitted` means prompt
 acceptance was confirmed but settlement was not; a submission timeout whose
-acceptance cannot be confirmed remains `timeout`. The helper reuses the plugin's SSH host allowlist,
-forwarding protections, host-key policy, and current-agent verification.
+acceptance cannot be confirmed remains `timeout`. The helper uses the same SSH
+host allowlist location, forwarding protections, host-key policy, and
+current-agent verification as the plugin, including in source-backed mode.
 
 The skill is optional for the popup workflow. Coordinator delegation embeds the
 installed plugin's executable router path and an opaque route token for every
@@ -203,9 +314,11 @@ winmini
 
 Only aliases that also exist in the SSH config are used. An empty file selects
 local-only discovery, while a missing file retains the all-alias behavior. Set
-`HERDR_AGENT_LABELS_SSH_HOSTS_FILE` to use a different allowlist path. Herdr
+`HERDR_AGENT_MESSENGER_SSH_HOSTS_FILE` to use a different allowlist path. The
+legacy `HERDR_AGENT_LABELS_SSH_HOSTS_FILE` name remains supported. Herdr
 provides the default path through `HERDR_PLUGIN_CONFIG_DIR`; it normally resolves
-to `~/.config/herdr/plugins/config/herdr.agent-labels/ssh-hosts`.
+to `~/.config/herdr/plugins/config/herdr.agent-messenger/ssh-hosts`. When that
+file is absent, HAM also checks the former `herdr.agent-labels` config directory.
 
 Tailscale does not require a special plugin-specific SSH format. Keep a stable,
 human-readable SSH alias and point it to either the device's MagicDNS name or
@@ -227,7 +340,8 @@ Prompts sent remotely include the sender's local hostname and agent label. The
 private `0600` discovery cache stores remote agent labels, pane/session metadata,
 status, workspace paths, and host aliases under `HERDR_PLUGIN_STATE_DIR`.
 
-Set `HERDR_AGENT_LABELS_SSH_CONFIG` to use a different SSH config file.
+Set `HERDR_AGENT_MESSENGER_SSH_CONFIG` to use a different SSH config file. The
+legacy `HERDR_AGENT_LABELS_SSH_CONFIG` name remains supported.
 The popup uses Herdr's inherited terminal palette, so its accent and status
 colors follow the active Herdr theme instead of defining a separate theme.
 
@@ -263,11 +377,11 @@ and Korean. Unsupported locales fall back to English.
 
 ## Safe SSH Rollout
 
-`rollout_plugin.py` is a standalone operator helper for installing or updating
-this plugin on explicitly selected remote Herdr hosts. It accepts only full
-40-character commit SHAs and only concrete SSH aliases authorized by the same
-SSH config and optional `ssh-hosts` allowlist used by Agent Messenger. It never
-discovers or adds rollout targets on its own.
+`rollout_plugin.py` is a standalone operator helper for installing, migrating,
+or updating this plugin on explicitly selected remote Herdr hosts. It accepts
+only full 40-character commit SHAs and only concrete SSH aliases authorized by
+the same SSH config and optional `ssh-hosts` allowlist used by Agent Messenger.
+It never discovers or adds rollout targets on its own.
 
 Preview the exact commands without opening an SSH connection:
 
@@ -301,11 +415,18 @@ hashes and runs tests, and only then re-enables it and reloads the server. This
 minimizes—but cannot eliminate—the brief interval between install and disable.
 Full tests disable bytecode writes.
 
-Before changing a host, the helper records the existing plugin's exact GitHub
-commit and enabled state. Any install or post-install validation failure triggers
-a best-effort rollback to that state; if the plugin was previously absent, the
-failed installation is removed. Rollback success or failure is included in that
-host's result.
+Before changing a host, the helper records either the current
+`herdr.agent-messenger` installation or the legacy `herdr.agent-labels`
+installation, including its exact GitHub commit and enabled state. A validated
+rollout disables and removes the legacy ID only after the new ID is working. Any
+install, migration, or post-install validation failure triggers a best-effort
+rollback to the recorded identity and state; if the plugin was previously absent,
+the failed installation is removed. Rollback success or failure is included in
+that host's result.
+
+The rollout helper updates the Herdr plugin registration, not separately copied
+Codex or Claude skill directories. After migrating a host that has a project- or
+system-installed 0.7.x skill, open its `HAM Skill` action and update that copy.
 
 Each host is reported independently, and a failure on one host does not stop
 later selected hosts. Exit status is `0` only when every selected host passes,

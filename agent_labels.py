@@ -11,7 +11,8 @@ import subprocess
 from typing import Any, Iterator, NamedTuple
 
 
-SOURCE = "herdr.agent-labels"
+SOURCE = "herdr.agent-messenger"
+LEGACY_SOURCE = "herdr.agent-labels"
 SEED_HASH_BYTES = 4
 # Coprime with the current alias count, so every alias is visited exactly once.
 CANDIDATE_STRIDE = 37
@@ -127,18 +128,19 @@ def fetch_agent_info(pane_id: str) -> dict[str, Any]:
 
 
 def clear_agent_label_metadata(pane_id: str) -> None:
-    run_herdr(
-        "pane",
-        "report-metadata",
-        pane_id,
-        "--source",
-        SOURCE,
-        "--clear-display-agent",
-        "--clear-token",
-        "alias",
-        "--clear-token",
-        "color",
-    )
+    for source in (SOURCE, LEGACY_SOURCE):
+        run_herdr(
+            "pane",
+            "report-metadata",
+            pane_id,
+            "--source",
+            source,
+            "--clear-display-agent",
+            "--clear-token",
+            "alias",
+            "--clear-token",
+            "color",
+        )
 
 
 def report_agent_label_metadata(
@@ -148,6 +150,18 @@ def report_agent_label_metadata(
     marker: str,
     color: str,
 ) -> None:
+    run_herdr(
+        "pane",
+        "report-metadata",
+        pane_id,
+        "--source",
+        LEGACY_SOURCE,
+        "--clear-display-agent",
+        "--clear-token",
+        "alias",
+        "--clear-token",
+        "color",
+    )
     run_herdr(
         "pane",
         "report-metadata",

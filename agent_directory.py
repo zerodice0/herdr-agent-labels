@@ -27,6 +27,12 @@ REMOTE_FAILURE_TTL_SECONDS = 30.0
 MAX_REMOTE_WORKERS = 8
 MAX_SEND_WORKERS = 8
 MAX_CAPTURE_BYTES = 2 * 1024 * 1024
+PLUGIN_ID = "herdr.agent-messenger"
+LEGACY_PLUGIN_ID = "herdr.agent-labels"
+SSH_CONFIG_ENV = "HERDR_AGENT_MESSENGER_SSH_CONFIG"
+LEGACY_SSH_CONFIG_ENV = "HERDR_AGENT_LABELS_SSH_CONFIG"
+SSH_HOSTS_FILE_ENV = "HERDR_AGENT_MESSENGER_SSH_HOSTS_FILE"
+LEGACY_SSH_HOSTS_FILE_ENV = "HERDR_AGENT_LABELS_SSH_HOSTS_FILE"
 TaskResult = TypeVar("TaskResult")
 
 
@@ -345,7 +351,7 @@ def fetch_local_agent(
 
 def ssh_config_path(environment: Mapping[str, str] | None = None) -> Path:
     values = os.environ if environment is None else environment
-    configured = values.get("HERDR_AGENT_LABELS_SSH_CONFIG")
+    configured = values.get(SSH_CONFIG_ENV) or values.get(LEGACY_SSH_CONFIG_ENV)
     return Path(configured).expanduser() if configured else Path.home() / ".ssh" / "config"
 
 
@@ -353,7 +359,9 @@ def ssh_hosts_allowlist_path(
     environment: Mapping[str, str] | None = None,
 ) -> Path:
     values = os.environ if environment is None else environment
-    configured = values.get("HERDR_AGENT_LABELS_SSH_HOSTS_FILE")
+    configured = values.get(SSH_HOSTS_FILE_ENV) or values.get(
+        LEGACY_SSH_HOSTS_FILE_ENV
+    )
     if configured:
         return Path(configured).expanduser()
     plugin_config = values.get("HERDR_PLUGIN_CONFIG_DIR")
@@ -365,9 +373,13 @@ def ssh_hosts_allowlist_path(
         / "herdr"
         / "plugins"
         / "config"
-        / "herdr.agent-labels"
+        / PLUGIN_ID
     )
-    return config_directory / "ssh-hosts"
+    current = config_directory / "ssh-hosts"
+    if current.exists():
+        return current
+    legacy = config_directory.with_name(LEGACY_PLUGIN_ID) / "ssh-hosts"
+    return legacy if legacy.exists() else current
 
 
 def parse_ssh_hosts_allowlist(path: Path) -> list[str] | None:
@@ -582,11 +594,22 @@ class AgentCache:
     ) -> "AgentCache":
         values = os.environ if environment is None else environment
         configured = values.get("HERDR_PLUGIN_STATE_DIR")
-        state_dir = (
-            Path(configured)
-            if configured
-            else Path.home() / ".local" / "state" / "herdr-agent-labels"
-        )
+        if configured:
+            state_dir = Path(configured)
+            current = state_dir / "agent-directory.json"
+            legacy = state_dir.with_name(LEGACY_PLUGIN_ID) / "agent-directory.json"
+            if (
+                state_dir.name == PLUGIN_ID
+                and not current.exists()
+                and legacy.exists()
+            ):
+                state_dir = legacy.parent
+        else:
+            state_root = Path.home() / ".local" / "state"
+            state_dir = state_root / "herdr-agent-messenger"
+            legacy = state_root / "herdr-agent-labels"
+            if not state_dir.exists() and legacy.exists():
+                state_dir = legacy
         return cls(state_dir / "agent-directory.json")
 
     def _load(self) -> dict[str, Any]:

@@ -18,7 +18,7 @@ EXACT_REF = "1" * 40
 def target_snapshot() -> plugin_rollout.TargetSnapshot:
     return plugin_rollout.TargetSnapshot(
         EXACT_REF,
-        "0.7.0",
+        "0.8.0",
         {
             "agent_labels.py": plugin_rollout.FileFingerprint("file", "a" * 64),
             "herdr-plugin.toml": plugin_rollout.FileFingerprint("file", "b" * 64),
@@ -31,14 +31,15 @@ def plugin_list_payload(
     ref: str = EXACT_REF,
     enabled: bool = True,
     present: bool = True,
+    plugin_id: str = plugin_rollout.PLUGIN_ID,
 ) -> str:
     plugins = []
     if present:
         plugins.append(
             {
-                "plugin_id": plugin_rollout.PLUGIN_ID,
+                "plugin_id": plugin_id,
                 "enabled": enabled,
-                "version": "0.7.0",
+                "version": "0.8.0",
                 "plugin_root": "/managed/plugin",
                 "source": {
                     "kind": "github",
@@ -57,6 +58,32 @@ def plugin_list_payload(
             }
         }
     )
+
+
+def plugins_payload(plugins: Sequence[dict[str, object]]) -> str:
+    return json.dumps({"result": {"plugins": list(plugins)}})
+
+
+def installed_plugin(
+    plugin_id: str,
+    *,
+    ref: str = EXACT_REF,
+    enabled: bool = True,
+) -> dict[str, object]:
+    return {
+        "plugin_id": plugin_id,
+        "enabled": enabled,
+        "version": "0.8.0",
+        "plugin_root": "/managed/plugin",
+        "source": {
+            "kind": "github",
+            "owner": "zerodice0",
+            "repo": "herdr-agent-labels",
+            "requested_ref": ref,
+            "resolved_commit": ref,
+            "managed_path": "/managed/plugin",
+        },
+    }
 
 
 def action_list_payload() -> str:
@@ -152,6 +179,74 @@ class FakeRemoteRunner:
         return subprocess.CompletedProcess(argv, 0, "{}", "")
 
 
+class LegacyMigrationRunner:
+    def __init__(self):
+        self.calls: list[tuple[list[str], float]] = []
+        self.plugins: dict[str, dict[str, object]] = {
+            plugin_rollout.LEGACY_PLUGIN_ID: installed_plugin(
+                plugin_rollout.LEGACY_PLUGIN_ID
+            )
+        }
+
+    def __call__(
+        self,
+        command: list[str] | tuple[str, ...],
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        argv = list(command)
+        self.calls.append((argv, timeout))
+        remote = argv[-1]
+        if "plugin install" in remote:
+            match = re.search(r"--ref ([0-9a-f]{40})", remote)
+            ref = match.group(1) if match else EXACT_REF
+            self.plugins[plugin_rollout.PLUGIN_ID] = installed_plugin(
+                plugin_rollout.PLUGIN_ID,
+                ref=ref,
+            )
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        for operation in ("uninstall", "enable", "disable"):
+            if f"plugin {operation}" not in remote:
+                continue
+            plugin_id = next(
+                (
+                    candidate
+                    for candidate in (
+                        plugin_rollout.LEGACY_PLUGIN_ID,
+                        plugin_rollout.PLUGIN_ID,
+                    )
+                    if candidate in remote
+                ),
+                plugin_rollout.PLUGIN_ID,
+            )
+            if operation == "uninstall":
+                self.plugins.pop(plugin_id, None)
+            elif plugin_id in self.plugins:
+                self.plugins[plugin_id]["enabled"] = operation == "enable"
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        if "plugin list" in remote:
+            selected = list(self.plugins.values())
+            for plugin_id in (
+                plugin_rollout.LEGACY_PLUGIN_ID,
+                plugin_rollout.PLUGIN_ID,
+            ):
+                if f"--plugin {plugin_id}" in remote:
+                    selected = (
+                        [self.plugins[plugin_id]]
+                        if plugin_id in self.plugins
+                        else []
+                    )
+                    break
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                plugins_payload(selected),
+                "",
+            )
+        if "plugin action list" in remote:
+            return subprocess.CompletedProcess(argv, 0, action_list_payload(), "")
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+
 class PluginRolloutTest(unittest.TestCase):
     def test_selected_hosts_are_explicit_concrete_authorized_aliases(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -164,8 +259,8 @@ class PluginRolloutTest(unittest.TestCase):
             )
             allowlist.write_text("desktop\nspare\n", encoding="utf-8")
             environment = {
-                "HERDR_AGENT_LABELS_SSH_CONFIG": str(config),
-                "HERDR_AGENT_LABELS_SSH_HOSTS_FILE": str(allowlist),
+                "HERDR_AGENT_MESSENGER_SSH_CONFIG": str(config),
+                "HERDR_AGENT_MESSENGER_SSH_HOSTS_FILE": str(allowlist),
             }
 
             self.assertEqual(
@@ -220,8 +315,51 @@ class PluginRolloutTest(unittest.TestCase):
                 "config",
                 "reload",
                 "actions",
+                "legacy-disable",
+                "legacy-uninstall",
             ],
         )
+
+    def test_preflight_recognizes_legacy_identity_and_rejects_duplicates(self):
+        legacy = plugin_rollout._previous_installation(
+            json.loads(
+                plugin_list_payload(plugin_id=plugin_rollout.LEGACY_PLUGIN_ID)
+            )
+        )
+
+        self.assertEqual(legacy.plugin_id, plugin_rollout.LEGACY_PLUGIN_ID)
+        with self.assertRaises(plugin_rollout.RolloutError):
+            plugin_rollout._previous_installation(
+                json.loads(
+                    plugins_payload(
+                        [
+                            installed_plugin(plugin_rollout.PLUGIN_ID),
+                            installed_plugin(plugin_rollout.LEGACY_PLUGIN_ID),
+                        ]
+                    )
+                )
+            )
+
+    def test_smoke_rollout_replaces_legacy_identity_after_validation(self):
+        runner = LegacyMigrationRunner()
+
+        result = plugin_rollout.rollout_hosts(
+            ["desktop"],
+            "smoke",
+            target_snapshot(),
+            config_path=Path("/tmp/ssh-config"),
+            dry_run=False,
+            runner=runner,
+        )[0]
+
+        self.assertTrue(result.success)
+        self.assertNotIn(plugin_rollout.LEGACY_PLUGIN_ID, runner.plugins)
+        self.assertTrue(runner.plugins[plugin_rollout.PLUGIN_ID]["enabled"])
+        checks = {check.name: check.status for check in result.checks}
+        self.assertEqual(checks["migration"], "pass")
+        steps = [command["step"] for command in result.commands]
+        self.assertLess(steps.index("legacy-disable"), steps.index("enable"))
+        self.assertLess(steps.index("actions"), steps.index("legacy-uninstall"))
 
     def test_cli_requires_explicit_confirmation_before_preflight(self):
         stdout = io.StringIO()
@@ -277,7 +415,7 @@ class PluginRolloutTest(unittest.TestCase):
                     "--format",
                     "json",
                 ],
-                {"HERDR_AGENT_LABELS_SSH_CONFIG": "/tmp/ssh-config"},
+                {"HERDR_AGENT_MESSENGER_SSH_CONFIG": "/tmp/ssh-config"},
             )
 
         self.assertEqual(exit_code, 0)

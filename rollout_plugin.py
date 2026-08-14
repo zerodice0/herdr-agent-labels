@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone entry point for the Agent Labels rollout helper."""
+"""Standalone entry point for the HAM rollout helper."""
 
 from plugin_rollout import main
 
