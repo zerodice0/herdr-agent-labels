@@ -107,7 +107,22 @@ the returned output as a fresh bounded snapshot; `delta` will be false. When
 1. List each requested host and verify every label.
 2. Decompose the request into specific, non-overlapping assignments.
 3. Send only the context each worker needs. Do not copy the complete original request to every worker unless the user explicitly requests direct broadcast.
-4. Dispatch independent assignments concurrently when safe.
+4. Encode the already-tailored assignments as route/message JSON and let the
+   bundled CLI dispatch them with bounded concurrency. The CLI does not interpret,
+   split, or rewrite messages:
+
+```bash
+python3 scripts/herdr_agent_messenger.py batch \
+  --requests-json '[{"route":"ROUTE_TOKEN","message":"Tailored instruction."}]' \
+  --wait \
+  --timeout 120000 \
+  --max-workers 4
+```
+
+   Use `--requests-json -` to read the same JSON array from stdin. Batch results
+   remain in input order and report each target as `succeeded`, `submitted`,
+   `failed`, `timeout`, or `cancelled`. A `submitted` result means delivery was
+   accepted but this invocation did not verify the matching request's completion.
 5. Wait for every requested worker or a clear terminal failure.
 6. Read each response, verify it against the relevant workspace, and follow up on missing or inconsistent work.
 7. Synthesize the results for the user, identifying unavailable hosts, timed-out agents, unverified claims, and remaining risks.

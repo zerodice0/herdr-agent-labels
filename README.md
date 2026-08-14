@@ -113,9 +113,12 @@ record. `read --max-bytes` caps UTF-8 output without splitting a character, and
 its returned cursor can be supplied to the next `read --cursor` call. Cursors
 use snapshot hashes and terminal-tail overlap; if a terminal screen was rewritten
 or the overlap is no longer safe, the helper returns a bounded current snapshot
-with `cursor_status` set to `expired`. The helper reuses the plugin's SSH host
-allowlist, forwarding protections, host-key policy, and current-agent
-verification.
+with `cursor_status` set to `expired`. It also supports bounded batch sends of
+already-tailored route/message JSON. Batch dispatch preserves input order and
+reports each target as
+`succeeded`, `submitted`, `failed`, `timeout`, or `cancelled`; it does not perform
+semantic decomposition. The helper reuses the plugin's SSH host allowlist,
+forwarding protections, host-key policy, and current-agent verification.
 
 The skill is optional for the popup workflow. Coordinator delegation embeds the
 installed plugin's executable router path and an opaque route token for every
@@ -139,11 +142,12 @@ After SSH discovery, choose a delivery mode:
   self-contained orchestration request containing the selected worker list,
   verified route tokens, bundled router commands, and the user's original request.
   It does not send the original request to the selected workers.
-  The coordinator performs the semantic task breakdown, sends each worker a
-  tailored instruction with Herdr, waits for and verifies their responses, then
-  synthesizes the result for the user. This route does not depend on a globally or
-  project-installed Agent Messenger skill. The Python plugin deliberately does
-  not try to interpret or split the work.
+  The coordinator performs the semantic task breakdown, creates route/message JSON
+  with one tailored instruction per worker, and hands that fixed list to the
+  bundled batch command for bounded delivery. It then waits for and verifies the
+  responses and synthesizes the result for the user. This route does not depend on
+  a globally or project-installed Agent Messenger skill. The Python plugin
+  deliberately does not try to interpret or split the work.
 - **Send directly (advanced):** preserves the original behavior. The plugin copies
   the same complete message to every selected agent immediately.
 
