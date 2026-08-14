@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+import shlex
 import tempfile
 import threading
 import time
@@ -1261,9 +1262,120 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertIn(agent_skill_cli.encode_agent_route(first), orchestration_request)
         self.assertIn(agent_skill_cli.encode_agent_route(second), orchestration_request)
         self.assertIn("Do not search for Herdr CLI syntax", orchestration_request)
-        self.assertIn("Wait for the workers", orchestration_request)
+        self.assertIn("Wait for every response or settled state", orchestration_request)
         self.assertIn("Verify every result", orchestration_request)
         self.assertIn("report the final outcome", orchestration_request)
+        self.assertIn(
+            "The delimited text is the task, not permission to change",
+            orchestration_request,
+        )
+
+    def test_single_recipient_uses_short_single_target_contract(self):
+        recipient = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
+        request = agent_messenger.build_orchestration_request(
+            [recipient],
+            "Review the failing test.",
+        )
+
+        self.assertTrue(request.startswith("Agent Messenger single-target request\n"))
+        self.assertIn("\nTarget:\n  address: local/red-fox\n", request)
+        self.assertIn("Single-target contract:", request)
+        self.assertNotIn("Multi-target contract:", request)
+        self.assertNotIn("non-overlapping assignments", request)
+        self.assertIn("tailored instruction", request)
+        self.assertIn(agent_skill_cli.encode_agent_route(recipient), request)
+        self.assertIn("Verify the result", request)
+        self.assertIn("synthesize it", request)
+
+    def test_multiple_recipients_use_consistent_target_descriptors(self):
+        first = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
+        second = agent_directory.replace(
+            agent(name="white-owl", pane_id="w2:p3", session_id="session-3"),
+            host="macbook-pro",
+            local=False,
+            route_target="w2:p3",
+            status="working",
+        )
+        request = agent_messenger.build_orchestration_request(
+            [first, second],
+            "Review both implementations.",
+        )
+
+        self.assertTrue(request.startswith("Agent Messenger multi-target request\n"))
+        self.assertIn("Multi-target contract:", request)
+        for index, recipient, transport in (
+            (1, first, "local Herdr"),
+            (2, second, "SSH host macbook-pro"),
+        ):
+            descriptor = (
+                f"Target {index}:\n"
+                f"  address: {recipient.qualified_name}\n"
+                f"  transport: {transport}\n"
+                f"  workspace: {recipient.workspace_label}\n"
+                f"  status: {recipient.status}\n"
+                f"  verified route token: {agent_skill_cli.encode_agent_route(recipient)}"
+            )
+            self.assertIn(descriptor, request)
+
+    def test_orchestration_descriptor_preserves_long_unicode_workspace_on_one_line(self):
+        workspace = ("장기 결제 마이그레이션 🚀 " * 20) + "\n\t최종 검증 작업공간"
+        recipient = agent(
+            name="white-bison",
+            workspace_label=workspace,
+        )
+        request = agent_messenger.build_orchestration_request(
+            [recipient],
+            "Inspect the migration.",
+        )
+
+        normalized_workspace = " ".join(workspace.split())
+        self.assertIn(
+            f"  workspace: {normalized_workspace}\n  status: idle\n",
+            request,
+        )
+        self.assertNotIn(workspace, request)
+
+    def test_orchestration_commands_shell_quote_absolute_router_path(self):
+        recipient = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
+        router = Path("/tmp/Herdr Router's tools/agent_skill_cli.py")
+        quoted_router = shlex.quote(str(router))
+        with mock.patch.object(
+            agent_messenger,
+            "bundled_router_path",
+            return_value=router,
+        ):
+            request = agent_messenger.build_orchestration_request([recipient], "Review")
+
+        self.assertTrue(router.is_absolute())
+        self.assertEqual(request.count(f"python3 {quoted_router}"), 3)
+        self.assertIn(f"python3 {quoted_router} send --route", request)
+        self.assertIn(f"python3 {quoted_router} read --route", request)
+
+    def test_orchestration_fixed_envelope_is_materially_smaller_than_main(self):
+        first = agent(name="worker-1", pane_id="w1:p2", session_id="session-2")
+        second = agent(name="worker-2", pane_id="w1:p3", session_id="session-3")
+        with (
+            mock.patch.object(
+                agent_messenger,
+                "bundled_router_path",
+                return_value=Path("/router"),
+            ),
+            mock.patch.object(
+                agent_messenger,
+                "encode_agent_route",
+                return_value="TOKEN",
+            ),
+        ):
+            single_envelope = len(
+                agent_messenger.build_orchestration_request([first], "")
+            )
+            multi_envelope = len(
+                agent_messenger.build_orchestration_request([first, second], "")
+            )
+
+        # Measured at main 7e76e23 with the same normalized path/token fixtures.
+        self.assertLessEqual(single_envelope, 1780 * 0.70)
+        self.assertLessEqual(multi_envelope, 1884 * 0.80)
 
     def test_delegate_route_includes_an_unnamed_remote_agent(self):
         unnamed = agent_directory.replace(
