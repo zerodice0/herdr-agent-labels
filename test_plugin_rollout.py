@@ -2,9 +2,11 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
+from collections.abc import Sequence
 from unittest import mock
 
 import plugin_rollout
@@ -24,26 +26,34 @@ def target_snapshot() -> plugin_rollout.TargetSnapshot:
     )
 
 
-def plugin_list_payload() -> str:
+def plugin_list_payload(
+    *,
+    ref: str = EXACT_REF,
+    enabled: bool = True,
+    present: bool = True,
+) -> str:
+    plugins = []
+    if present:
+        plugins.append(
+            {
+                "plugin_id": plugin_rollout.PLUGIN_ID,
+                "enabled": enabled,
+                "version": "0.7.0",
+                "plugin_root": "/managed/plugin",
+                "source": {
+                    "kind": "github",
+                    "owner": "zerodice0",
+                    "repo": "herdr-agent-labels",
+                    "requested_ref": ref,
+                    "resolved_commit": ref,
+                    "managed_path": "/managed/plugin",
+                },
+            }
+        )
     return json.dumps(
         {
             "result": {
-                "plugins": [
-                    {
-                        "plugin_id": plugin_rollout.PLUGIN_ID,
-                        "enabled": True,
-                        "version": "0.7.0",
-                        "plugin_root": "/managed/plugin",
-                        "source": {
-                            "kind": "github",
-                            "owner": "zerodice0",
-                            "repo": "herdr-agent-labels",
-                            "requested_ref": EXACT_REF,
-                            "resolved_commit": EXACT_REF,
-                            "managed_path": "/managed/plugin",
-                        },
-                    }
-                ]
+                "plugins": plugins,
             }
         }
     )
@@ -63,10 +73,25 @@ def action_list_payload() -> str:
 
 
 class FakeRemoteRunner:
-    def __init__(self, *, failing_host: str | None = None, bad_hashes: bool = False):
+    def __init__(
+        self,
+        *,
+        failing_host: str | None = None,
+        bad_hashes: bool = False,
+        previous_ref: str | None = EXACT_REF,
+        previous_enabled: bool = True,
+        failing_fragments: Sequence[str] = (),
+        install_applies_then_fails: bool = False,
+        uninstall_noop: bool = False,
+    ):
         self.failing_host = failing_host
         self.bad_hashes = bad_hashes
         self.calls: list[tuple[list[str], float]] = []
+        self.installed_ref = previous_ref
+        self.enabled = previous_enabled
+        self.failing_fragments = tuple(failing_fragments)
+        self.install_applies_then_fails = install_applies_then_fails
+        self.uninstall_noop = uninstall_noop
 
     def __call__(
         self,
@@ -77,10 +102,40 @@ class FakeRemoteRunner:
         self.calls.append((argv, timeout))
         host = argv[-2]
         remote = argv[-1]
-        if host == self.failing_host and "plugin install" in remote:
-            return subprocess.CompletedProcess(argv, 1, "", "install refused")
+        if any(fragment in remote for fragment in self.failing_fragments):
+            return subprocess.CompletedProcess(argv, 1, "", "forced failure")
+        if "plugin install" in remote:
+            match = re.search(r"--ref ([0-9a-f]{40})", remote)
+            ref = match.group(1) if match else ""
+            if host == self.failing_host and ref == EXACT_REF:
+                return subprocess.CompletedProcess(argv, 1, "", "install refused")
+            self.installed_ref = ref
+            self.enabled = True
+            if self.install_applies_then_fails and ref == EXACT_REF:
+                return subprocess.CompletedProcess(argv, 1, "", "connection lost")
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        if "plugin uninstall" in remote:
+            if not self.uninstall_noop:
+                self.installed_ref = None
+                self.enabled = False
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        if "plugin enable" in remote:
+            self.enabled = True
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        if "plugin disable" in remote:
+            self.enabled = False
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
         if "plugin list" in remote:
-            return subprocess.CompletedProcess(argv, 0, plugin_list_payload(), "")
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                plugin_list_payload(
+                    ref=self.installed_ref or EXACT_REF,
+                    enabled=self.enabled,
+                    present=self.installed_ref is not None,
+                ),
+                "",
+            )
         if "plugin action list" in remote:
             return subprocess.CompletedProcess(argv, 0, action_list_payload(), "")
         if "hashlib.sha256" in remote:
@@ -153,7 +208,19 @@ class PluginRolloutTest(unittest.TestCase):
         self.assertTrue(all(check.status == "planned" for check in results[0].checks))
         self.assertEqual(
             [command["step"] for command in results[0].commands],
-            ["install", "metadata", "config", "reload", "actions", "hashes", "unittest"],
+            [
+                "preflight",
+                "install",
+                "stage",
+                "metadata",
+                "hashes",
+                "unittest",
+                "enable",
+                "enabled-metadata",
+                "config",
+                "reload",
+                "actions",
+            ],
         )
 
     def test_cli_requires_explicit_confirmation_before_preflight(self):
@@ -240,8 +307,10 @@ class PluginRolloutTest(unittest.TestCase):
 
         self.assertFalse(results[0].success)
         self.assertTrue(results[1].success)
-        self.assertEqual(results[0].checks[0].status, "fail")
-        self.assertEqual(results[0].checks[1].status, "skipped")
+        broken_checks = {check.name: check.status for check in results[0].checks}
+        self.assertEqual(broken_checks["preflight"], "pass")
+        self.assertEqual(broken_checks["install"], "fail")
+        self.assertEqual(broken_checks["enabled"], "skipped")
         self.assertEqual(
             {call[0][-2] for call in runner.calls},
             {"broken", "healthy"},
@@ -271,10 +340,13 @@ class PluginRolloutTest(unittest.TestCase):
         self.assertNotIn("hashes", [check.name for check in smoke.checks])
         self.assertNotIn("unittest", [check.name for check in smoke.checks])
         self.assertTrue(full.success)
-        self.assertEqual(full.checks[-2].name, "hashes")
-        self.assertEqual(full.checks[-1].name, "unittest")
-        self.assertIn("hashlib.sha256", full_runner.calls[-2][0][-1])
-        self.assertIn("PYTHONDONTWRITEBYTECODE=1", full_runner.calls[-1][0][-1])
+        self.assertEqual(
+            [check.name for check in full.checks],
+            list(plugin_rollout.FULL_CHECKS),
+        )
+        steps = [command["step"] for command in full.commands]
+        self.assertLess(steps.index("hashes"), steps.index("reload"))
+        self.assertLess(steps.index("unittest"), steps.index("reload"))
 
     def test_hash_mismatch_prevents_execution_of_plugin_tests(self):
         runner = FakeRemoteRunner(bad_hashes=True)
@@ -289,11 +361,136 @@ class PluginRolloutTest(unittest.TestCase):
         )[0]
 
         self.assertFalse(result.success)
-        self.assertEqual(result.checks[-2].status, "fail")
-        self.assertEqual(result.checks[-1].status, "skipped")
+        checks = {check.name: check.status for check in result.checks}
+        self.assertEqual(checks["hashes"], "fail")
+        self.assertEqual(checks["unittest"], "skipped")
+        self.assertEqual(checks["reload"], "skipped")
+        self.assertEqual(checks["actions"], "skipped")
+        self.assertEqual(checks["rollback"], "pass")
         self.assertFalse(
             any("PYTHONDONTWRITEBYTECODE=1" in call[0][-1] for call in runner.calls)
         )
+        self.assertNotIn("reload", [command["step"] for command in result.commands])
+        self.assertNotIn("actions", [command["step"] for command in result.commands])
+
+    def test_validation_failure_restores_previous_ref_and_enabled_state(self):
+        previous_ref = "2" * 40
+        runner = FakeRemoteRunner(
+            bad_hashes=True,
+            previous_ref=previous_ref,
+            previous_enabled=False,
+        )
+
+        result = plugin_rollout.rollout_hosts(
+            ["desktop"],
+            "full",
+            target_snapshot(),
+            config_path=Path("/tmp/ssh-config"),
+            dry_run=False,
+            runner=runner,
+        )[0]
+
+        self.assertFalse(result.success)
+        self.assertEqual(runner.installed_ref, previous_ref)
+        self.assertFalse(runner.enabled)
+        rollback = next(check for check in result.checks if check.name == "rollback")
+        self.assertEqual(rollback.status, "pass")
+        self.assertIn(previous_ref, rollback.detail)
+
+    def test_failed_rollback_restore_disables_target_without_reload(self):
+        previous_ref = "2" * 40
+        runner = FakeRemoteRunner(
+            bad_hashes=True,
+            previous_ref=previous_ref,
+            failing_fragments=(f"--ref {previous_ref}",),
+        )
+
+        result = plugin_rollout.rollout_hosts(
+            ["desktop"],
+            "full",
+            target_snapshot(),
+            config_path=Path("/tmp/ssh-config"),
+            dry_run=False,
+            runner=runner,
+        )[0]
+
+        self.assertEqual(runner.installed_ref, EXACT_REF)
+        self.assertFalse(runner.enabled)
+        steps = [command["step"] for command in result.commands]
+        self.assertIn("rollback-disable", steps)
+        self.assertNotIn("rollback-config", steps)
+        self.assertNotIn("rollback-reload", steps)
+        rollback = next(check for check in result.checks if check.name == "rollback")
+        self.assertEqual(rollback.status, "fail")
+
+    def test_failed_rollback_config_disables_plugin_without_reload(self):
+        previous_ref = "2" * 40
+        runner = FakeRemoteRunner(
+            bad_hashes=True,
+            previous_ref=previous_ref,
+            failing_fragments=("config check",),
+        )
+
+        result = plugin_rollout.rollout_hosts(
+            ["desktop"],
+            "full",
+            target_snapshot(),
+            config_path=Path("/tmp/ssh-config"),
+            dry_run=False,
+            runner=runner,
+        )[0]
+
+        self.assertEqual(runner.installed_ref, previous_ref)
+        self.assertFalse(runner.enabled)
+        steps = [command["step"] for command in result.commands]
+        self.assertIn("rollback-disable", steps)
+        self.assertNotIn("rollback-reload", steps)
+        rollback = next(check for check in result.checks if check.name == "rollback")
+        self.assertEqual(rollback.status, "fail")
+
+    def test_failed_new_install_is_removed_when_plugin_was_absent(self):
+        runner = FakeRemoteRunner(bad_hashes=True, previous_ref=None)
+
+        result = plugin_rollout.rollout_hosts(
+            ["desktop"],
+            "full",
+            target_snapshot(),
+            config_path=Path("/tmp/ssh-config"),
+            dry_run=False,
+            runner=runner,
+        )[0]
+
+        self.assertFalse(result.success)
+        self.assertIsNone(runner.installed_ref)
+        self.assertIn(
+            "rollback-uninstall",
+            [command["step"] for command in result.commands],
+        )
+
+    def test_absent_rollback_disables_target_when_uninstall_lies(self):
+        runner = FakeRemoteRunner(
+            previous_ref=None,
+            install_applies_then_fails=True,
+            uninstall_noop=True,
+        )
+
+        result = plugin_rollout.rollout_hosts(
+            ["desktop"],
+            "smoke",
+            target_snapshot(),
+            config_path=Path("/tmp/ssh-config"),
+            dry_run=False,
+            runner=runner,
+        )[0]
+
+        self.assertFalse(result.success)
+        self.assertEqual(runner.installed_ref, EXACT_REF)
+        self.assertFalse(runner.enabled)
+        steps = [command["step"] for command in result.commands]
+        self.assertIn("rollback-verify-absent", steps)
+        self.assertIn("rollback-disable", steps)
+        self.assertNotIn("rollback-config", steps)
+        self.assertNotIn("rollback-reload", steps)
 
 
 if __name__ == "__main__":

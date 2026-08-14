@@ -123,6 +123,11 @@ python3 scripts/herdr_agent_messenger.py batch \
    remain in input order and report each target as `succeeded`, `submitted`,
    `failed`, `timeout`, or `cancelled`. A `submitted` result means delivery was
    accepted but this invocation did not verify the matching request's completion.
+   With `--wait`, every delivered result includes its lifecycle `request_id` and
+   bounded response; advance a submitted item with `request-status` instead of
+   resending it. `submitted` requires confirmed prompt acceptance; an unconfirmed
+   submission timeout remains `timeout`. Existing work is treated as a boundary
+   before the requested turn.
 5. Wait for every requested worker or a clear terminal failure.
 6. Read each response, verify it against the relevant workspace, and follow up on missing or inconsistent work.
 7. Synthesize the results for the user, identifying unavailable hosts, timed-out agents, unverified claims, and remaining risks.

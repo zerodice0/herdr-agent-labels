@@ -263,26 +263,50 @@ def _submission_failure_is_uncertain(result: subprocess.CompletedProcess[str]) -
 
 
 class AgentRequestTransport(RequestTransport[AgentRecord]):
-    """Current v1 route adapter for the route-independent state machine."""
+    """Route-aware adapter for the transport-independent request state machine."""
 
     def __init__(
         self,
         *,
-        resolver: Callable[[], AgentRecord],
+        resolver: Callable[[], AgentRecord | RouteResolution],
         sender_identity: str,
         environment: Mapping[str, str] | None,
         command_runner: Callable[..., subprocess.CompletedProcess[str]],
+        cancel_event: threading.Event | None = None,
     ) -> None:
         self._resolver = resolver
         self._sender_identity = sender_identity
         self._environment = environment
         self._command_runner = command_runner
+        self._cancel_event = cancel_event
+        self._resolution: RouteResolution | None = None
 
     def resolve(self) -> AgentRecord:
-        return self._resolver()
+        resolved = self._resolver()
+        if isinstance(resolved, RouteResolution):
+            self._resolution = resolved
+        else:
+            self._resolution = RouteResolution(
+                resolved,
+                route_refreshed=False,
+                route=encode_agent_route(resolved),
+            )
+        return self._resolution.agent
 
     def describe(self, target: AgentRecord) -> Mapping[str, Any]:
-        return _record_payload(target)
+        payload = compact_agent_payload(target)
+        if self._resolution is not None:
+            payload.update(
+                {
+                    "route_refreshed": self._resolution.route_refreshed,
+                    "route": self._resolution.route,
+                }
+            )
+        return payload
+
+    @property
+    def resolution(self) -> RouteResolution | None:
+        return self._resolution
 
     def submit(self, target: AgentRecord, prompt: str) -> SubmissionResult:
         if target.identity == self._sender_identity:
@@ -295,10 +319,12 @@ class AgentRequestTransport(RequestTransport[AgentRecord]):
             self._environment,
         )
         try:
-            result = self._command_runner(
-                command,
-                timeout=REMOTE_DISCOVERY_TIMEOUT_SECONDS,
-            )
+            options: dict[str, Any] = {
+                "timeout": REMOTE_DISCOVERY_TIMEOUT_SECONDS,
+            }
+            if self._cancel_event is not None:
+                options["cancel_event"] = self._cancel_event
+            result = self._command_runner(command, **options)
         except subprocess.TimeoutExpired:
             return SubmissionResult.unknown(
                 "Prompt submission timed out before acceptance could be confirmed.",
@@ -378,18 +404,21 @@ def status_command(
     verbose: bool = False,
     environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    recipient = resolve_recipient(
+    resolution = resolve_or_refresh_recipient(
         host=host,
         label=label,
         route=route,
         environment=environment,
     )
+    recipient = resolution.agent
     return {
         "agent": (
             _record_payload(recipient)
             if verbose
             else compact_agent_payload(recipient)
-        )
+        ),
+        "route_refreshed": resolution.route_refreshed,
+        "route": resolution.route,
     }
 
 
@@ -475,8 +504,41 @@ def _batch_outcome_from_payload(
 ) -> DispatchOutcome:
     """Normalize current and future single-send lifecycle payloads."""
 
+    route = payload.get("route")
+    request_id = payload.get("request_id")
+    response = payload.get("response")
+    response_payload = response if isinstance(response, Mapping) else {}
+
+    def outcome(
+        status: str,
+        error: str = "",
+        detail: str = "",
+    ) -> DispatchOutcome:
+        return DispatchOutcome(
+            status,
+            error,
+            detail,
+            route if isinstance(route, str) else "",
+            request_id if isinstance(request_id, str) else "",
+            str(response_payload.get("output") or ""),
+            bool(response_payload.get("truncated")),
+            bool(response_payload.get("correlated")),
+        )
+
+    if payload.get("cancelled") is True:
+        if payload.get("submitted") is True:
+            return outcome(SUBMITTED, detail="wait_cancelled")
+        return outcome(CANCELLED, "prompt_cancelled")
     if payload.get("timed_out") is True:
-        return DispatchOutcome(TIMED_OUT, "prompt_timeout")
+        lifecycle_status = payload.get("state")
+        if (
+            lifecycle_status in {"submitted_working", "submitted_unknown"}
+            and payload.get("submitted") is True
+        ):
+            return outcome(SUBMITTED)
+        if payload.get("submitted") is None:
+            return outcome(TIMED_OUT, "prompt_acceptance_unknown")
+        return outcome(TIMED_OUT, "prompt_timeout")
     lifecycle_status = payload.get("status") or payload.get("state")
     if isinstance(lifecycle_status, str):
         normalized = lifecycle_status.lower().replace("-", "_")
@@ -487,7 +549,7 @@ def _batch_outcome_from_payload(
             "done",
             "submitted_settled",
         }:
-            return DispatchOutcome(SUCCEEDED)
+            return outcome(SUCCEEDED)
         if normalized in {
             "submitted",
             "submitted_in_progress",
@@ -496,14 +558,14 @@ def _batch_outcome_from_payload(
             "in_progress",
             "working",
         }:
-            return DispatchOutcome(SUBMITTED)
+            return outcome(SUBMITTED)
         if normalized in {"timeout", "timed_out"}:
-            return DispatchOutcome(TIMED_OUT, "prompt_timeout")
+            return outcome(TIMED_OUT, "prompt_timeout")
         if normalized in {"cancelled", "canceled"}:
-            return DispatchOutcome(CANCELLED, "prompt_cancelled")
+            return outcome(CANCELLED, "prompt_cancelled")
         if normalized in {"failed", "failure", "blocked", "submission_failed"}:
             error = payload.get("error")
-            return DispatchOutcome(
+            return outcome(
                 FAILED,
                 error if isinstance(error, str) else "prompt_failed",
             )
@@ -512,8 +574,8 @@ def _batch_outcome_from_payload(
         or payload.get("wait_can_track_submitted_turn") is False
         or payload.get("wait_trackable") is False
     ):
-        return DispatchOutcome(SUBMITTED)
-    return DispatchOutcome(SUCCEEDED)
+        return outcome(SUBMITTED)
+    return outcome(SUCCEEDED)
 
 
 def batch_command(
@@ -536,15 +598,27 @@ def batch_command(
 
     def send_one(request: BatchRequest) -> DispatchOutcome:
         try:
-            payload = send_command(
-                host="local",
-                route=request.route,
-                message=request.message,
-                wait=wait,
-                timeout_ms=timeout_ms,
-                environment=environment,
-                cancel_event=cancel_event,
-            )
+            if wait:
+                payload = request_command(
+                    host="local",
+                    route=request.route,
+                    message=request.message,
+                    timeout_ms=timeout_ms,
+                    output_lines=DEFAULT_READ_LINES,
+                    output_chars=DEFAULT_REQUEST_OUTPUT_CHARS,
+                    environment=environment,
+                    cancel_event=cancel_event,
+                )
+            else:
+                payload = send_command(
+                    host="local",
+                    route=request.route,
+                    message=request.message,
+                    wait=False,
+                    timeout_ms=timeout_ms,
+                    environment=environment,
+                    cancel_event=cancel_event,
+                )
         except SkillCommandError as error:
             if error.code == "prompt_timeout":
                 return DispatchOutcome(TIMED_OUT, error.code, error.message)
@@ -552,14 +626,6 @@ def batch_command(
                 return DispatchOutcome(CANCELLED, error.code, error.message)
             return DispatchOutcome(FAILED, error.code, error.message)
         outcome = _batch_outcome_from_payload(payload, waited=wait)
-        refreshed_route = payload.get("route")
-        if isinstance(refreshed_route, str) and refreshed_route:
-            return DispatchOutcome(
-                outcome.status,
-                outcome.error,
-                outcome.detail,
-                refreshed_route,
-            )
         return outcome
 
     return dispatch_batch(
@@ -646,12 +712,13 @@ def request_command(
     output_lines: int,
     output_chars: int,
     environment: Mapping[str, str] | None = None,
-    resolver: Callable[[], AgentRecord] | None = None,
+    resolver: Callable[[], AgentRecord | RouteResolution] | None = None,
     state_store: RequestStateStore | None = None,
     command_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     request_id: str | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Run one prompt through submission, observation, and bounded output read."""
 
@@ -672,10 +739,12 @@ def request_command(
             "invalid_output_chars",
             "--output-chars must be greater than zero.",
         )
+    if cancel_event is not None and cancel_event.is_set():
+        raise SkillCommandError("prompt_cancelled", "Request was cancelled.")
 
     sender = current_sender(environment)
     recipient_resolver = resolver or (
-        lambda: resolve_recipient(
+        lambda: resolve_or_refresh_recipient(
             host=host,
             label=label,
             route=route,
@@ -687,11 +756,13 @@ def request_command(
         sender_identity=sender.identity,
         environment=environment,
         command_runner=command_runner or run_bounded_command,
+        cancel_event=cancel_event,
     )
     resolved_request_id = request_id or uuid.uuid4().hex
+    store = state_store or _request_state_store(environment)
     machine = RequestLifecycleMachine(
         transport,
-        state_store or _request_state_store(environment),
+        store,
         monotonic=monotonic,
         sleep=sleep,
     )
@@ -712,7 +783,9 @@ def request_command(
                     "route": route,
                 },
             },
+            cancelled=cancel_event.is_set if cancel_event is not None else None,
         )
+        _record_request_route(payload, transport, store)
         return _public_request_payload(payload)
     except (OSError, ValueError) as error:
         raise SkillCommandError(
@@ -726,7 +799,7 @@ def request_status_command(
     request_id: str,
     environment: Mapping[str, str] | None = None,
     state_store: RequestStateStore | None = None,
-    resolver: Callable[[], AgentRecord] | None = None,
+    resolver: Callable[[], AgentRecord | RouteResolution] | None = None,
     command_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> dict[str, Any]:
     store = state_store or _request_state_store(environment)
@@ -758,7 +831,7 @@ def request_status_command(
             "The stored request address is invalid.",
         )
     recipient_resolver = resolver or (
-        lambda: resolve_recipient(
+        lambda: resolve_or_refresh_recipient(
             host=host,
             label=label if isinstance(label, str) else None,
             route=route if isinstance(route, str) else None,
@@ -775,9 +848,34 @@ def request_status_command(
         refreshed = RequestLifecycleMachine(transport, store).refresh(
             request_id=request_id
         )
+        _record_request_route(refreshed, transport, store)
     except (OSError, ValueError) as error:
         raise SkillCommandError("request_state_unavailable", str(error)) from error
     return _public_request_payload(refreshed)
+
+
+def _record_request_route(
+    payload: dict[str, Any],
+    transport: AgentRequestTransport,
+    store: RequestStateStore,
+) -> None:
+    """Persist the current safe route alongside one request lifecycle record."""
+
+    resolution = transport.resolution
+    if resolution is None:
+        return
+    payload["route_refreshed"] = resolution.route_refreshed
+    payload["route"] = resolution.route
+    recipient = payload.get("recipient")
+    if isinstance(recipient, dict):
+        recipient["route_refreshed"] = resolution.route_refreshed
+        recipient["route"] = resolution.route
+    context = payload.get("_context")
+    if isinstance(context, dict):
+        context["route"] = resolution.route
+    request_id = payload.get("request_id")
+    if isinstance(request_id, str):
+        store.save(request_id, payload)
 
 
 def _public_request_payload(payload: Mapping[str, Any]) -> dict[str, Any]:

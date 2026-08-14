@@ -165,6 +165,35 @@ class RequestLifecycleMachineTest(unittest.TestCase):
         self.assertTrue(result["requested_turn_observed"])
         self.assertFalse(result["terminal"])
 
+    def test_cancel_stops_waiting_without_forgetting_accepted_submission(self):
+        store = MemoryStore()
+        clock = FakeClock()
+        working = FakeTarget("agent-1", "working", "before\npartial\n")
+        transport = FakeTransport(
+            [FakeTarget("agent-1", "idle", "before\n"), working, working],
+            SubmissionResult.submitted(),
+        )
+        result = RequestLifecycleMachine(
+            transport,
+            store,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        ).run(
+            request_id="f" * 32,
+            prompt="do it",
+            timeout_seconds=30,
+            poll_interval_seconds=1,
+            max_output_lines=20,
+            max_output_chars=500,
+            cancelled=lambda: clock.value >= 1,
+        )
+
+        self.assertTrue(result["cancelled"])
+        self.assertTrue(result["submitted"])
+        self.assertEqual(result["state"], "submitted_working")
+        self.assertEqual(result["phase"], "wait_cancelled")
+        self.assertFalse(result["terminal"])
+
     def test_refresh_advances_a_timed_out_working_request_to_settled(self):
         working = FakeTarget("agent-1", "working", "before\npartial\n")
         result, store, _transport = run_machine(
@@ -402,6 +431,89 @@ class AgentRequestCliIntegrationTest(unittest.TestCase):
                 state_store=store,
             ),
             result,
+        )
+
+    def test_request_persists_a_safely_refreshed_v2_route(self):
+        sender = agent_skill_cli.AgentRecord(
+            host="local",
+            name="sender",
+            pane_id="w1:p1",
+            workspace_id="w1",
+            workspace_label="one",
+            status="idle",
+            session_id="sender-session",
+            cwd="/work/one",
+            local=True,
+        )
+        original = agent_skill_cli.AgentRecord(
+            host="local",
+            name="worker",
+            pane_id="w1:p2",
+            workspace_id="w1",
+            workspace_label="one",
+            status="idle",
+            session_id="old-session",
+            cwd="/work/one",
+            local=True,
+            revision=1,
+            agent_kind="codex",
+            terminal_id="worker-terminal",
+        )
+        replacement = replace(
+            original,
+            session_id="new-session",
+            revision=2,
+        )
+        snapshots = iter(
+            [
+                [replacement],
+                [replace(replacement, status="working")],
+                [replace(replacement, status="done")],
+            ]
+        )
+        outputs = iter(["before\n", "before\nanswer\n"])
+
+        def runner(command, *, timeout):
+            if command[1:3] == ["agent", "read"]:
+                return subprocess.CompletedProcess(command, 0, next(outputs), "")
+            return subprocess.CompletedProcess(command, 0, "{}\n", "")
+
+        store = MemoryStore()
+        clock = FakeClock()
+        token = agent_skill_cli.encode_agent_route(original)
+        with (
+            mock.patch.object(agent_skill_cli, "current_sender", return_value=sender),
+            mock.patch.object(
+                agent_skill_cli,
+                "discover_agents",
+                side_effect=lambda *_arguments: next(snapshots),
+            ),
+        ):
+            result = agent_skill_cli.request_command(
+                host="local",
+                route=token,
+                message="inspect",
+                timeout_ms=3_000,
+                output_lines=10,
+                output_chars=500,
+                environment={},
+                state_store=store,
+                command_runner=runner,
+                request_id="e" * 32,
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+            )
+
+        refreshed_route = agent_skill_cli.encode_agent_route(replacement)
+        self.assertTrue(result["route_refreshed"])
+        self.assertEqual(result["route"], refreshed_route)
+        self.assertEqual(result["recipient"]["route"], refreshed_route)
+        self.assertEqual(
+            agent_skill_cli.request_status_command(
+                request_id="e" * 32,
+                state_store=store,
+            )["route"],
+            refreshed_route,
         )
 
     def test_transport_classifies_bounded_runner_timeout_as_unknown(self):

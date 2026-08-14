@@ -52,6 +52,10 @@ class DispatchOutcome:
     error: str = ""
     detail: str = ""
     route: str = ""
+    request_id: str = ""
+    output: str = ""
+    truncated: bool = False
+    correlated: bool = False
 
 
 class BatchSender(Protocol):
@@ -65,13 +69,24 @@ class BatchResult:
     status: str
     error: str = ""
     detail: str = ""
+    request_id: str = ""
+    output: str = ""
+    truncated: bool = False
+    correlated: bool = False
 
-    def payload(self) -> dict[str, str]:
-        value = {"route": self.route, "status": self.status}
+    def payload(self) -> dict[str, Any]:
+        value: dict[str, Any] = {"route": self.route, "status": self.status}
         if self.error:
             value["error"] = self.error
         if self.detail:
             value["detail"] = self.detail
+        if self.request_id:
+            value["request_id"] = self.request_id
+            value["response"] = {
+                "output": self.output,
+                "truncated": self.truncated,
+                "correlated": self.correlated,
+            }
         return value
 
 
@@ -119,6 +134,10 @@ def _normalize_sender_outcome(
         outcome.status,
         outcome.error,
         outcome.detail,
+        outcome.request_id,
+        outcome.output,
+        outcome.truncated,
+        outcome.correlated,
     )
 
 

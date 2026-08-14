@@ -39,15 +39,29 @@ CHECK_TIMEOUT_SECONDS = 15.0
 FULL_TEST_TIMEOUT_SECONDS = 300.0
 
 SMOKE_CHECKS = (
+    "preflight",
     "install",
-    "enabled",
+    "staged",
     "source",
     "version",
+    "enabled",
     "config",
     "reload",
     "actions",
 )
-FULL_CHECKS = (*SMOKE_CHECKS, "hashes", "unittest")
+FULL_CHECKS = (
+    "preflight",
+    "install",
+    "staged",
+    "source",
+    "version",
+    "hashes",
+    "unittest",
+    "enabled",
+    "config",
+    "reload",
+    "actions",
+)
 
 _HASH_SCRIPT = """\
 import hashlib
@@ -98,6 +112,12 @@ class TargetSnapshot:
     ref: str
     version: str
     files: Mapping[str, FileFingerprint]
+
+
+@dataclass(frozen=True)
+class PreviousInstallation:
+    ref: str | None
+    enabled: bool
 
 
 @dataclass(frozen=True)
@@ -281,6 +301,27 @@ def install_command(host: str, ref: str, *, config_path: Path) -> list[str]:
     )
 
 
+def uninstall_command(host: str, *, config_path: Path) -> list[str]:
+    return ssh_command(
+        host,
+        ["plugin", "uninstall", PLUGIN_ID],
+        config_path=config_path,
+    )
+
+
+def enabled_command(
+    host: str,
+    *,
+    enabled: bool,
+    config_path: Path,
+) -> list[str]:
+    return ssh_command(
+        host,
+        ["plugin", "enable" if enabled else "disable", PLUGIN_ID],
+        config_path=config_path,
+    )
+
+
 def plugin_list_command(host: str, *, config_path: Path) -> list[str]:
     return ssh_command(
         host,
@@ -366,6 +407,31 @@ def _installed_plugin(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _previous_installation(
+    payload: Mapping[str, Any],
+) -> PreviousInstallation:
+    result = payload.get("result")
+    plugins = result.get("plugins") if isinstance(result, dict) else None
+    if not isinstance(plugins, list):
+        raise RolloutError("preflight plugin metadata is invalid")
+    plugin = _installed_plugin(payload)
+    if plugin is None:
+        return PreviousInstallation(None, False)
+    source = plugin.get("source")
+    if not isinstance(source, dict):
+        raise RolloutError("the existing plugin has no restorable source metadata")
+    if (
+        source.get("kind") != "github"
+        or source.get("owner") != SOURCE_OWNER
+        or source.get("repo") != SOURCE_REPO
+    ):
+        raise RolloutError("the existing plugin source cannot be safely restored")
+    ref = source.get("resolved_commit")
+    if not isinstance(ref, str) or EXACT_COMMIT_PATTERN.fullmatch(ref) is None:
+        raise RolloutError("the existing plugin commit cannot be safely restored")
+    return PreviousInstallation(ref.lower(), plugin.get("enabled") is True)
+
+
 def _active_action_ids(payload: Mapping[str, Any]) -> set[str] | None:
     result = payload.get("result")
     actions = result.get("actions") if isinstance(result, dict) else None
@@ -445,11 +511,13 @@ def _planned_result(
 ) -> HostResult:
     result = HostResult(host, profile)
     commands = [
+        ("preflight", plugin_list_command(host, config_path=config_path)),
         ("install", install_command(host, target.ref, config_path=config_path)),
+        (
+            "stage",
+            enabled_command(host, enabled=False, config_path=config_path),
+        ),
         ("metadata", plugin_list_command(host, config_path=config_path)),
-        ("config", config_check_command(host, config_path=config_path)),
-        ("reload", reload_command(host, config_path=config_path)),
-        ("actions", action_list_command(host, config_path=config_path)),
     ]
     if profile == "full":
         commands.extend(
@@ -473,11 +541,170 @@ def _planned_result(
                 ),
             ]
         )
+    commands.extend(
+        [
+            (
+                "enable",
+                enabled_command(host, enabled=True, config_path=config_path),
+            ),
+            ("enabled-metadata", plugin_list_command(host, config_path=config_path)),
+            ("config", config_check_command(host, config_path=config_path)),
+            ("reload", reload_command(host, config_path=config_path)),
+            ("actions", action_list_command(host, config_path=config_path)),
+        ]
+    )
     for step, command in commands:
         result.record_command(step, command)
     for check in FULL_CHECKS if profile == "full" else SMOKE_CHECKS:
         result.add(check, "planned", "no remote command executed")
     return result
+
+
+def _rollback_installation(
+    host_result: HostResult,
+    host: str,
+    previous: PreviousInstallation,
+    *,
+    config_path: Path,
+    runner: CommandRunner,
+) -> None:
+    def invoke(step: str, command: Sequence[str], timeout: float) -> str:
+        completed = _invoke(host_result, step, command, timeout, runner)
+        return "" if completed.returncode == 0 else _command_failure(completed)
+
+    def disable_fallback(reason: str) -> None:
+        fallback_error = invoke(
+            "rollback-disable",
+            enabled_command(host, enabled=False, config_path=config_path),
+            CHECK_TIMEOUT_SECONDS,
+        )
+        detail = reason
+        if fallback_error:
+            detail += f"; rollback-disable: {fallback_error}"
+        host_result.add("rollback", "fail", detail)
+
+    if previous.ref is None:
+        error = invoke(
+            "rollback-uninstall",
+            uninstall_command(host, config_path=config_path),
+            INSTALL_TIMEOUT_SECONDS,
+        )
+        if error:
+            disable_fallback(f"rollback-uninstall: {error}")
+            return
+        absence = _invoke(
+            host_result,
+            "rollback-verify-absent",
+            plugin_list_command(host, config_path=config_path),
+            CHECK_TIMEOUT_SECONDS,
+            runner,
+        )
+        try:
+            absent_state = (
+                _previous_installation(_json_object(absence.stdout))
+                if absence.returncode == 0
+                else None
+            )
+        except RolloutError:
+            absent_state = None
+        if absent_state != previous:
+            detail = (
+                f"rollback-verify-absent: {_command_failure(absence)}"
+                if absence.returncode != 0
+                else "rollback-verify-absent: plugin is still installed"
+            )
+            disable_fallback(detail)
+            return
+    else:
+        error = invoke(
+            "rollback-install",
+            install_command(host, previous.ref, config_path=config_path),
+            INSTALL_TIMEOUT_SECONDS,
+        )
+        if error:
+            disable_fallback(f"rollback-install: {error}")
+            return
+        error = invoke(
+            "rollback-enabled",
+            enabled_command(
+                host,
+                enabled=previous.enabled,
+                config_path=config_path,
+            ),
+            CHECK_TIMEOUT_SECONDS,
+        )
+        if error:
+            disable_fallback(f"rollback-enabled: {error}")
+            return
+
+    error = invoke(
+        "rollback-config",
+        config_check_command(host, config_path=config_path),
+        CHECK_TIMEOUT_SECONDS,
+    )
+    if error:
+        disable_fallback(f"rollback-config: {error}")
+        return
+    error = invoke(
+        "rollback-reload",
+        reload_command(host, config_path=config_path),
+        CHECK_TIMEOUT_SECONDS,
+    )
+    if error:
+        disable_fallback(f"rollback-reload: {error}")
+        return
+
+    verified = _invoke(
+        host_result,
+        "rollback-verify",
+        plugin_list_command(host, config_path=config_path),
+        CHECK_TIMEOUT_SECONDS,
+        runner,
+    )
+    if verified.returncode != 0:
+        detail = f"rollback-verify: {_command_failure(verified)}"
+        disable_fallback(detail)
+        return
+    try:
+        restored = _previous_installation(_json_object(verified.stdout))
+    except RolloutError as error:
+        disable_fallback(f"rollback-verify: {error}")
+        return
+    if restored != previous:
+        detail = (
+            "rollback-verify: expected "
+            f"ref={previous.ref}, enabled={previous.enabled}; "
+            f"found ref={restored.ref}, enabled={restored.enabled}"
+        )
+        disable_fallback(detail)
+        return
+    restored_detail = (
+        "plugin absent"
+        if previous.ref is None
+        else f"ref {previous.ref}, enabled={previous.enabled}"
+    )
+    host_result.add("rollback", "pass", f"restored {restored_detail}")
+
+
+def _abort_after_install(
+    host_result: HostResult,
+    host: str,
+    previous: PreviousInstallation,
+    remaining: Sequence[str],
+    reason: str,
+    *,
+    config_path: Path,
+    runner: CommandRunner,
+) -> HostResult:
+    _skip(host_result, remaining, reason)
+    _rollback_installation(
+        host_result,
+        host,
+        previous,
+        config_path=config_path,
+        runner=runner,
+    )
+    return host_result
 
 
 def _rollout_host(
@@ -491,6 +718,30 @@ def _rollout_host(
     host_result = HostResult(host, profile)
     remaining = FULL_CHECKS if profile == "full" else SMOKE_CHECKS
 
+    preflight = _invoke(
+        host_result,
+        "preflight",
+        plugin_list_command(host, config_path=config_path),
+        CHECK_TIMEOUT_SECONDS,
+        runner,
+    )
+    if preflight.returncode != 0:
+        host_result.add("preflight", "fail", _command_failure(preflight))
+        _skip(host_result, remaining, "preflight failed before installation")
+        return host_result
+    try:
+        previous = _previous_installation(_json_object(preflight.stdout))
+    except RolloutError as error:
+        host_result.add("preflight", "fail", str(error))
+        _skip(host_result, remaining, "preflight could not establish rollback state")
+        return host_result
+    previous_detail = (
+        "plugin absent"
+        if previous.ref is None
+        else f"ref {previous.ref}, enabled={previous.enabled}"
+    )
+    host_result.add("preflight", "pass", previous_detail)
+
     command = install_command(host, target.ref, config_path=config_path)
     installed = _invoke(
         host_result,
@@ -501,10 +752,35 @@ def _rollout_host(
     )
     if installed.returncode != 0:
         host_result.add("install", "fail", _command_failure(installed))
-        _skip(host_result, remaining, "install failed")
-        return host_result
+        return _abort_after_install(
+            host_result,
+            host,
+            previous,
+            remaining,
+            "install failed; rollback was attempted",
+            config_path=config_path,
+            runner=runner,
+        )
     host_result.add("install", "pass", f"exact ref {target.ref}")
 
+    staged = _invoke(
+        host_result,
+        "stage",
+        enabled_command(host, enabled=False, config_path=config_path),
+        CHECK_TIMEOUT_SECONDS,
+        runner,
+    )
+    if staged.returncode != 0:
+        host_result.add("staged", "fail", _command_failure(staged))
+        return _abort_after_install(
+            host_result,
+            host,
+            previous,
+            remaining,
+            "could not disable the installed target before validation",
+            config_path=config_path,
+            runner=runner,
+        )
     listed = _invoke(
         host_result,
         "metadata",
@@ -515,12 +791,25 @@ def _rollout_host(
     plugin = _installed_plugin(_json_object(listed.stdout)) if listed.returncode == 0 else None
     if plugin is None:
         detail = _command_failure(listed) if listed.returncode != 0 else "plugin metadata missing"
-        host_result.add("enabled", "fail", detail)
-        _skip(host_result, remaining, "metadata validation failed")
-        return host_result
+        host_result.add("staged", "fail", detail)
+        return _abort_after_install(
+            host_result,
+            host,
+            previous,
+            remaining,
+            "metadata validation failed",
+            config_path=config_path,
+            runner=runner,
+        )
 
-    enabled = plugin.get("enabled") is True
-    host_result.add("enabled", "pass" if enabled else "fail", str(plugin.get("enabled")))
+    staged_disabled = plugin.get("enabled") is False
+    host_result.add(
+        "staged",
+        "pass" if staged_disabled else "fail",
+        "disabled pending validation"
+        if staged_disabled
+        else "plugin remained enabled after staging",
+    )
     source_matches, source_detail = _source_matches(plugin, target.ref)
     plugin_root = _remote_root(plugin)
     if plugin_root is None:
@@ -533,9 +822,130 @@ def _rollout_host(
         "pass" if version_matches else "fail",
         f"actual={plugin.get('version', '?')} expected={target.version}",
     )
-    if not enabled or not source_matches or not version_matches or plugin_root is None:
-        _skip(host_result, remaining, "metadata validation failed")
-        return host_result
+    if not staged_disabled or not source_matches or not version_matches or plugin_root is None:
+        return _abort_after_install(
+            host_result,
+            host,
+            previous,
+            remaining,
+            "metadata validation failed",
+            config_path=config_path,
+            runner=runner,
+        )
+
+    if profile == "full":
+        hashed = _invoke(
+            host_result,
+            "hashes",
+            hash_command(
+                host,
+                target,
+                plugin_root=plugin_root,
+                config_path=config_path,
+            ),
+            CHECK_TIMEOUT_SECONDS,
+            runner,
+        )
+        remote_hashes = _json_object(hashed.stdout) if hashed.returncode == 0 else {}
+        expected_hashes = {
+            path: asdict(fingerprint) for path, fingerprint in target.files.items()
+        }
+        mismatches = sorted(
+            path
+            for path, expected in expected_hashes.items()
+            if remote_hashes.get(path) != expected
+        )
+        if hashed.returncode != 0 or mismatches:
+            detail = (
+                _command_failure(hashed)
+                if hashed.returncode != 0
+                else "mismatch: " + ", ".join(mismatches[:8])
+            )
+            host_result.add("hashes", "fail", detail)
+            return _abort_after_install(
+                host_result,
+                host,
+                previous,
+                remaining,
+                "file hash validation failed; tests and activation were skipped",
+                config_path=config_path,
+                runner=runner,
+            )
+        host_result.add("hashes", "pass", f"{len(expected_hashes)} tracked files")
+
+        tested = _invoke(
+            host_result,
+            "unittest",
+            unittest_command(
+                host,
+                plugin_root=plugin_root,
+                config_path=config_path,
+            ),
+            FULL_TEST_TIMEOUT_SECONDS,
+            runner,
+        )
+        if tested.returncode != 0:
+            host_result.add("unittest", "fail", _command_failure(tested))
+            return _abort_after_install(
+                host_result,
+                host,
+                previous,
+                remaining,
+                "plugin tests failed; activation was skipped",
+                config_path=config_path,
+                runner=runner,
+            )
+        host_result.add("unittest", "pass", "python3 -W error -m unittest -q")
+
+    enabled_result = _invoke(
+        host_result,
+        "enable",
+        enabled_command(host, enabled=True, config_path=config_path),
+        CHECK_TIMEOUT_SECONDS,
+        runner,
+    )
+    if enabled_result.returncode != 0:
+        host_result.add("enabled", "fail", _command_failure(enabled_result))
+        return _abort_after_install(
+            host_result,
+            host,
+            previous,
+            remaining,
+            "validated target could not be enabled",
+            config_path=config_path,
+            runner=runner,
+        )
+    enabled_metadata = _invoke(
+        host_result,
+        "enabled-metadata",
+        plugin_list_command(host, config_path=config_path),
+        CHECK_TIMEOUT_SECONDS,
+        runner,
+    )
+    enabled_plugin = (
+        _installed_plugin(_json_object(enabled_metadata.stdout))
+        if enabled_metadata.returncode == 0
+        else None
+    )
+    enabled = enabled_plugin is not None and enabled_plugin.get("enabled") is True
+    enabled_detail = "True" if enabled else "False"
+    if enabled_metadata.returncode != 0:
+        enabled_detail = _command_failure(enabled_metadata)
+    host_result.add(
+        "enabled",
+        "pass" if enabled else "fail",
+        enabled_detail,
+    )
+    if not enabled:
+        return _abort_after_install(
+            host_result,
+            host,
+            previous,
+            remaining,
+            "enabled state could not be verified",
+            config_path=config_path,
+            runner=runner,
+        )
 
     checked = _invoke(
         host_result,
@@ -546,8 +956,15 @@ def _rollout_host(
     )
     if checked.returncode != 0:
         host_result.add("config", "fail", _command_failure(checked))
-        _skip(host_result, remaining, "config check failed; reload was not attempted")
-        return host_result
+        return _abort_after_install(
+            host_result,
+            host,
+            previous,
+            remaining,
+            "config check failed; reload was not attempted",
+            config_path=config_path,
+            runner=runner,
+        )
     host_result.add("config", "pass", "herdr config check")
 
     reloaded = _invoke(
@@ -559,8 +976,15 @@ def _rollout_host(
     )
     if reloaded.returncode != 0:
         host_result.add("reload", "fail", _command_failure(reloaded))
-        _skip(host_result, remaining, "server reload failed")
-        return host_result
+        return _abort_after_install(
+            host_result,
+            host,
+            previous,
+            remaining,
+            "server reload failed",
+            config_path=config_path,
+            runner=runner,
+        )
     host_result.add("reload", "pass", "herdr server reload-config")
 
     action_result = _invoke(
@@ -583,60 +1007,16 @@ def _rollout_host(
             else "missing: " + ", ".join(missing_actions or sorted(CORE_ACTION_IDS))
         )
         host_result.add("actions", "fail", detail)
-        _skip(host_result, remaining, "core action validation failed")
-        return host_result
-    host_result.add("actions", "pass", ", ".join(sorted(CORE_ACTION_IDS)))
-
-    if profile != "full":
-        return host_result
-
-    hashed = _invoke(
-        host_result,
-        "hashes",
-        hash_command(
+        return _abort_after_install(
+            host_result,
             host,
-            target,
-            plugin_root=plugin_root,
+            previous,
+            remaining,
+            "core action validation failed",
             config_path=config_path,
-        ),
-        CHECK_TIMEOUT_SECONDS,
-        runner,
-    )
-    remote_hashes = _json_object(hashed.stdout) if hashed.returncode == 0 else {}
-    expected_hashes = {
-        path: asdict(fingerprint) for path, fingerprint in target.files.items()
-    }
-    mismatches = sorted(
-        path
-        for path, expected in expected_hashes.items()
-        if remote_hashes.get(path) != expected
-    )
-    if hashed.returncode != 0 or mismatches:
-        detail = (
-            _command_failure(hashed)
-            if hashed.returncode != 0
-            else "mismatch: " + ", ".join(mismatches[:8])
+            runner=runner,
         )
-        host_result.add("hashes", "fail", detail)
-        _skip(host_result, remaining, "file hash validation failed; tests were not run")
-        return host_result
-    host_result.add("hashes", "pass", f"{len(expected_hashes)} tracked files")
-
-    tested = _invoke(
-        host_result,
-        "unittest",
-        unittest_command(
-            host,
-            plugin_root=plugin_root,
-            config_path=config_path,
-        ),
-        FULL_TEST_TIMEOUT_SECONDS,
-        runner,
-    )
-    if tested.returncode != 0:
-        host_result.add("unittest", "fail", _command_failure(tested))
-    else:
-        host_result.add("unittest", "pass", "python3 -W error -m unittest -q")
+    host_result.add("actions", "pass", ", ".join(sorted(CORE_ACTION_IDS)))
     return host_result
 
 

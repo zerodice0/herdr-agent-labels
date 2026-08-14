@@ -256,6 +256,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
         max_output_lines: int,
         max_output_chars: int,
         metadata: Mapping[str, Any] | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         if timeout_seconds <= 0 or poll_interval_seconds <= 0:
             raise ValueError("Timeouts and poll intervals must be greater than zero.")
@@ -376,6 +377,24 @@ class RequestLifecycleMachine(Generic[TargetT]):
         last_resolve_error = ""
 
         while self.monotonic() < deadline:
+            if cancelled is not None and cancelled():
+                record["cancelled"] = True
+                state = (
+                    RequestState.SUBMITTED_WORKING
+                    if last_target.status == "working"
+                    else RequestState.SUBMITTED_UNKNOWN
+                )
+                return self._finish(
+                    record,
+                    target=last_target,
+                    baseline=baseline,
+                    baseline_reliable=not baseline_error,
+                    state=state,
+                    phase="wait_cancelled",
+                    error="Waiting was cancelled after prompt submission.",
+                    max_lines=max_output_lines,
+                    max_chars=max_output_chars,
+                )
             try:
                 current = self.transport.resolve()
             except Exception as error:

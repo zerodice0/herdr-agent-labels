@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from io import StringIO
@@ -171,6 +172,25 @@ class AgentSkillCliTest(unittest.TestCase):
                 "status": "idle",
                 "workspace": "project",
             },
+        )
+        self.assertFalse(payload["route_refreshed"])
+        self.assertEqual(payload["route"], route)
+
+    def test_status_returns_a_safely_refreshed_route(self):
+        original = agent(name="white-bison", pane_id="w7:p9")
+        replacement = replace(original, session_id="replacement-session", revision=2)
+        route = agent_skill_cli.encode_agent_route(original)
+        with mock.patch.object(
+            agent_skill_cli,
+            "discover_agents",
+            return_value=[replacement],
+        ):
+            payload = agent_skill_cli.status_command(host="local", route=route)
+
+        self.assertTrue(payload["route_refreshed"])
+        self.assertEqual(
+            payload["route"],
+            agent_skill_cli.encode_agent_route(replacement),
         )
 
     def test_hostname_alias_is_remote_even_when_it_matches_local_hostname(self):
@@ -540,8 +560,8 @@ class AgentSkillCliTest(unittest.TestCase):
                 )
             self.assertEqual(raised.exception.code, expected_code)
 
-    def test_batch_reuses_send_and_aggregates_per_target_results(self):
-        def send_command(**arguments):
+    def test_batch_reuses_request_lifecycle_and_aggregates_results(self):
+        def request_command(**arguments):
             route = arguments["route"]
             if route == "self":
                 raise agent_skill_cli.SkillCommandError(
@@ -549,21 +569,30 @@ class AgentSkillCliTest(unittest.TestCase):
                     "The current sender cannot also be the recipient.",
                 )
             if route == "slow":
-                raise agent_skill_cli.SkillCommandError(
-                    "prompt_timeout",
-                    "timeout",
-                )
+                return {
+                    "state": "submitted_working",
+                    "submitted": True,
+                    "timed_out": True,
+                    "request_id": "c" * 32,
+                    "route": route,
+                    "response": {"output": "partial\n", "truncated": False},
+                }
             return {
-                "sent": True,
-                "waited": True,
-                "wait_can_track_submitted_turn": True,
+                "state": "submitted_settled",
+                "request_id": "a" * 32,
+                "route": route,
+                "response": {
+                    "output": "answer\n",
+                    "truncated": False,
+                    "correlated": True,
+                },
             }
 
         with mock.patch.object(
             agent_skill_cli,
-            "send_command",
-            side_effect=send_command,
-        ) as send:
+            "request_command",
+            side_effect=request_command,
+        ) as request:
             payload = agent_skill_cli.batch_command(
                 requests_json=(
                     '[{"route":"ok","message":"one"},'
@@ -576,12 +605,14 @@ class AgentSkillCliTest(unittest.TestCase):
                 environment={"HERDR_PANE_ID": "w1:p1"},
             )
 
-        self.assertEqual(send.call_count, 3)
+        self.assertEqual(request.call_count, 3)
         self.assertEqual(
             [result["status"] for result in payload["results"]],
-            ["succeeded", "failed", "timeout"],
+            ["succeeded", "failed", "submitted"],
         )
         self.assertEqual(payload["results"][1]["error"], "recipient_is_sender")
+        self.assertEqual(payload["results"][0]["request_id"], "a" * 32)
+        self.assertEqual(payload["results"][0]["response"]["output"], "answer\n")
         self.assertEqual(payload["status"], "partial")
 
     def test_batch_no_wait_reports_submitted(self):
@@ -606,7 +637,20 @@ class AgentSkillCliTest(unittest.TestCase):
             ({"state": "submitted_settled"}, "succeeded"),
             ({"state": "submitted_working"}, "submitted"),
             (
-                {"state": "submitted_working", "timed_out": True},
+                {
+                    "state": "submitted_working",
+                    "submitted": True,
+                    "timed_out": True,
+                },
+                "submitted",
+            ),
+            (
+                {
+                    "state": "submitted_unknown",
+                    "submitted": None,
+                    "submission_timed_out": True,
+                    "timed_out": True,
+                },
                 "timeout",
             ),
             ({"state": "submission_failed", "error": "rejected"}, "failed"),
@@ -619,14 +663,32 @@ class AgentSkillCliTest(unittest.TestCase):
                 )
                 self.assertEqual(outcome.status, expected)
 
+    def test_waiting_batch_forwards_cancellation_to_request_lifecycle(self):
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with mock.patch.object(agent_skill_cli, "request_command") as request:
+            request.side_effect = agent_skill_cli.SkillCommandError(
+                "prompt_cancelled",
+                "Request was cancelled.",
+            )
+            payload = agent_skill_cli.batch_command(
+                requests_json='[{"route":"one","message":"instruction"}]',
+                wait=True,
+                timeout_ms=90_000,
+                max_workers=1,
+                environment={},
+                cancel_event=cancel_event,
+            )
+
+        request.assert_not_called()
+        self.assertEqual(payload["results"][0]["status"], "cancelled")
+
     def test_batch_returns_a_future_refreshed_route(self):
         with mock.patch.object(
             agent_skill_cli,
-            "send_command",
+            "request_command",
             return_value={
-                "sent": True,
-                "waited": True,
-                "wait_trackable": True,
+                "state": "submitted_settled",
                 "route": "v2-refreshed",
             },
         ):

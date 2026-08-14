@@ -117,7 +117,10 @@ with `cursor_status` set to `expired`. It also supports bounded batch sends of
 already-tailored route/message JSON. Batch dispatch preserves input order and
 reports each target as
 `succeeded`, `submitted`, `failed`, `timeout`, or `cancelled`; it does not perform
-semantic decomposition. The helper reuses the plugin's SSH host allowlist,
+semantic decomposition. Waiting batches use the same correlated request lifecycle
+per target and return request IDs plus bounded responses. `submitted` means prompt
+acceptance was confirmed but settlement was not; a submission timeout whose
+acceptance cannot be confirmed remains `timeout`. The helper reuses the plugin's SSH host allowlist,
 forwarding protections, host-key policy, and current-agent verification.
 
 The skill is optional for the popup workflow. Coordinator delegation embeds the
@@ -130,7 +133,8 @@ refreshed only for a unique registered label with matching pane, workspace, and
 agent kind. Unlabeled and display-only labels additionally require sessionless,
 revision, terminal, target, and working-directory continuity; ambiguous or changed
 occupants remain `route_expired`. V1 tokens remain readable for exact matches.
-Both `send` and `read` return `route_refreshed` and a current `route`; callers should
+`status`, `send`, `read`, and `request` return `route_refreshed` and a current
+`route`; callers should
 use the returned token for later operations. This also makes unlabeled agents
 selected in the GUI addressable without requiring the coordinator to discover
 Herdr CLI syntax or install the skill first.
@@ -291,8 +295,17 @@ The default `smoke` profile checks the enabled state, exact GitHub source and
 resolved commit, manifest version, `herdr config check`, server config reload,
 and the three core plugin actions. Add `--profile full` to also compare SHA-256
 hashes for every file tracked by the target commit and run the complete unittest
-suite. Hashes are checked before tests so a mismatched installed tree is not
-executed. Full tests disable bytecode writes.
+suite. Herdr currently enables a plugin as part of `plugin install`, with no staged
+install option. The helper therefore disables the new install immediately, checks
+hashes and runs tests, and only then re-enables it and reloads the server. This
+minimizes—but cannot eliminate—the brief interval between install and disable.
+Full tests disable bytecode writes.
+
+Before changing a host, the helper records the existing plugin's exact GitHub
+commit and enabled state. Any install or post-install validation failure triggers
+a best-effort rollback to that state; if the plugin was previously absent, the
+failed installation is removed. Rollback success or failure is included in that
+host's result.
 
 Each host is reported independently, and a failure on one host does not stop
 later selected hosts. Exit status is `0` only when every selected host passes,
