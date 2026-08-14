@@ -597,6 +597,9 @@ class AgentRequestCliIntegrationTest(unittest.TestCase):
 
         self.assertEqual(timed_out["state"], "submitted_working")
         self.assertFalse(timed_out["terminal"])
+        stored = store.load("c" * 32)
+        self.assertIsNone(stored["_context"]["label"])
+        self.assertIsInstance(stored["_context"]["route"], str)
         status_runner = mock.Mock(
             return_value=subprocess.CompletedProcess(
                 ["herdr"],
@@ -605,17 +608,32 @@ class AgentRequestCliIntegrationTest(unittest.TestCase):
                 "",
             )
         )
-        settled = agent_skill_cli.request_status_command(
-            request_id="c" * 32,
-            environment={},
-            state_store=store,
-            resolver=lambda: done,
-            command_runner=status_runner,
-        )
+        current_route = agent_skill_cli.encode_agent_route(done)
+        with mock.patch.object(
+            agent_skill_cli,
+            "resolve_or_refresh_recipient",
+            return_value=agent_skill_cli.RouteResolution(
+                done,
+                route_refreshed=False,
+                route=current_route,
+            ),
+        ) as resolve:
+            settled = agent_skill_cli.request_status_command(
+                request_id="c" * 32,
+                environment={},
+                state_store=store,
+                command_runner=status_runner,
+            )
 
         self.assertEqual(settled["state"], "submitted_settled")
         self.assertEqual(settled["response"]["output"], "answer\n")
         self.assertFalse(any(key.startswith("_") for key in settled))
+        resolve.assert_called_once_with(
+            host="local",
+            label=None,
+            route=stored["_context"]["route"],
+            environment={},
+        )
 
 
 if __name__ == "__main__":

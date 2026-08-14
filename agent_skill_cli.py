@@ -873,6 +873,9 @@ def _record_request_route(
     context = payload.get("_context")
     if isinstance(context, dict):
         context["route"] = resolution.route
+        # A verified route supersedes the mutable host/label address. Keeping
+        # both makes request-status reject its own persisted context.
+        context["label"] = None
     request_id = payload.get("request_id")
     if isinstance(request_id, str):
         store.save(request_id, payload)
