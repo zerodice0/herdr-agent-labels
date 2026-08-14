@@ -1258,6 +1258,7 @@ class AgentMessengerTest(unittest.TestCase):
         )
         self.assertIn("agent_skill_cli.py send --route", orchestration_request)
         self.assertIn("agent_skill_cli.py read --route", orchestration_request)
+        self.assertIn("route_refreshed", orchestration_request)
         self.assertIn(agent_skill_cli.encode_agent_route(first), orchestration_request)
         self.assertIn(agent_skill_cli.encode_agent_route(second), orchestration_request)
         self.assertIn("Do not search for Herdr CLI syntax", orchestration_request)

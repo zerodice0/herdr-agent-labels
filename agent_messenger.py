@@ -40,7 +40,7 @@ from agent_directory import (
     ssh_config_path,
     ssh_hosts,
 )
-from agent_skill_cli import encode_agent_route
+from agent_route import encode_agent_route
 from messenger_i18n import detect_language, messages
 
 
@@ -151,10 +151,11 @@ def build_orchestration_request(
         "skill. Use the bundled router above with each worker's verified route token:\n"
         f"   python3 {router} send --route ROUTE_TOKEN --message "
         "'TAILORED INSTRUCTION' --wait --timeout 120000\n"
-        "   The router discovers the recorded host, verifies that the same pane occupant "
-        "is still present, and chooses local or SSH transport. Include only the context "
-        "each worker needs; do not automatically copy the full original request to every "
-        "worker.\n"
+        "   The router discovers the recorded host and resolves the exact occupant first. "
+        "A v2 route is refreshed only when its saved continuity fingerprints safely match "
+        "one current occupant. When route_refreshed is true, use the returned route value "
+        "for later reads or follow-ups. Include only the context each worker needs; do not "
+        "automatically copy the full original request to every worker.\n"
         "3. Wait for the workers' responses or settled states. Follow up when work is "
         "missing, blocked, duplicated, or inconsistent. Read recent output when needed:\n"
         f"   python3 {router} read --route ROUTE_TOKEN --lines 160\n"

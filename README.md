@@ -103,12 +103,18 @@ protections, host-key policy, and current-agent verification.
 
 The skill is optional for the popup workflow. Coordinator delegation embeds the
 installed plugin's executable router path and an opaque route token for every
-selected worker in the coordinator request. The token contains a hash of the
-observed pane occupant rather than its session metadata. Before sending or
-reading, the router discovers the recorded local or SSH host again and rejects
-the route if that occupant has changed. This also makes unlabeled agents selected
-in the GUI addressable without requiring the coordinator to discover Herdr CLI
-syntax or install the skill first.
+selected worker in the coordinator request. V2 tokens contain the host, an
+occupant fingerprint, and hashed continuity fields rather than raw session IDs or
+working directories. Before sending or reading, the router discovers the recorded
+local or SSH host again and resolves the exact occupant first. A stale v2 route is
+refreshed only for a unique registered label with matching pane, workspace, and
+agent kind. Unlabeled and display-only labels additionally require sessionless,
+revision, terminal, target, and working-directory continuity; ambiguous or changed
+occupants remain `route_expired`. V1 tokens remain readable for exact matches.
+Both `send` and `read` return `route_refreshed` and a current `route`; callers should
+use the returned token for later operations. This also makes unlabeled agents
+selected in the GUI addressable without requiring the coordinator to discover
+Herdr CLI syntax or install the skill first.
 
 After SSH discovery, choose a delivery mode:
 
