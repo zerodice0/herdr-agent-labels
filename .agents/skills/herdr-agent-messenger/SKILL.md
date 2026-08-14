@@ -37,17 +37,36 @@ Use each list result's `address` field for subsequent operations.
 Run from the coordinator's active Herdr pane so `HERDR_PANE_ID` identifies the sender:
 
 ```bash
-python3 scripts/herdr_agent_messenger.py send \
+python3 scripts/herdr_agent_messenger.py request \
   --host macbook-pro \
   --label purple-koala \
   --message 'Inspect the current task and report blockers.' \
-  --wait \
   --timeout 120000
 ```
 
-`send` waits by default. Use `--no-wait` only when the user does not need a result in the current turn. If the recipient was already `working`, Herdr's wait may match completion of its previous active turn; always read and verify the requested response instead of treating that wait as proof. If waiting times out, the prompt may already have been delivered; inspect the agent before retrying to avoid duplicate work.
+`request` resolves the recipient, submits without Herdr's ambiguous `--wait`,
+observes a fresh working-to-settled cycle, and returns only bounded output added
+after its baseline. Inspect `state`, `response.truncated`, and
+`response.correlated` before using the result. The reported states are
+`submission_failed`, `submitted_working`, `submitted_settled`, and
+`submitted_unknown`. A timeout after prompt submission is not proof of delivery
+failure, so do not retry `submitted_working` or `submitted_unknown` requests
+without checking their stored state and the recipient first.
 
-Read recent output after the agent settles:
+When the recipient was already working, the first settlement belongs to the old
+turn and is used only as a boundary. The request is settled only after another
+working-to-settled cycle is observed. This is intentionally conservative.
+
+Every result contains a `request_id`. Re-read and advance a nonterminal request's
+latest atomic state with:
+
+```bash
+python3 scripts/herdr_agent_messenger.py status \
+  --request-id REQUEST_ID
+```
+
+The lower-level `send` and `read` commands remain available for compatibility.
+Read recent output manually only when investigating an unknown result:
 
 ```bash
 python3 scripts/herdr_agent_messenger.py read \
