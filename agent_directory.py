@@ -472,12 +472,14 @@ def _remote_herdr_command(arguments: Sequence[str]) -> str:
     return f"sh -c {shlex.quote(script)}"
 
 
-def ssh_command(
+def _ssh_transport_command(
     host: str,
-    arguments: Sequence[str],
+    remote_command: str,
     *,
     config_path: Path,
 ) -> list[str]:
+    """Build the shared hardened SSH transport without changing trust policy."""
+
     return [
         "ssh",
         "-F",
@@ -498,8 +500,42 @@ def ssh_command(
         "PermitLocalCommand=no",
         "-T",
         host,
-        _remote_herdr_command(arguments),
+        remote_command,
     ]
+
+
+def ssh_command(
+    host: str,
+    arguments: Sequence[str],
+    *,
+    config_path: Path,
+) -> list[str]:
+    return _ssh_transport_command(
+        host,
+        _remote_herdr_command(arguments),
+        config_path=config_path,
+    )
+
+
+def ssh_program_command(
+    host: str,
+    arguments: Sequence[str],
+    *,
+    config_path: Path,
+    cwd: str | None = None,
+) -> list[str]:
+    """Run an argv-style program over the same hardened SSH transport."""
+
+    if not arguments:
+        raise ValueError("remote program arguments must not be empty")
+    command = "exec " + shlex.join(arguments)
+    if cwd is not None:
+        command = f"cd -- {shlex.quote(cwd)} && {command}"
+    return _ssh_transport_command(
+        host,
+        f"sh -c {shlex.quote(command)}",
+        config_path=config_path,
+    )
 
 
 def query_remote_agents(

@@ -332,6 +332,23 @@ class AgentDirectoryTest(unittest.TestCase):
         self.assertIn("ForwardX11=no", command)
         self.assertIn("PermitLocalCommand=no", command)
 
+    def test_ssh_program_command_reuses_transport_and_quotes_cwd(self):
+        command = agent_directory.ssh_program_command(
+            "macbook",
+            ["python3", "-m", "unittest", "-q"],
+            config_path=Path("/tmp/ssh-config"),
+            cwd="/tmp/plugin checkout",
+        )
+
+        self.assertEqual(command[-2], "macbook")
+        self.assertIn("ClearAllForwardings=yes", command)
+        self.assertIn("ForwardAgent=no", command)
+        self.assertNotIn("StrictHostKeyChecking=accept-new", command)
+        shell, login_flag, script = shlex.split(command[-1])
+        self.assertEqual((shell, login_flag), ("sh", "-c"))
+        self.assertIn("cd -- '/tmp/plugin checkout'", script)
+        self.assertIn("exec python3 -m unittest -q", script)
+
     def test_dispatch_revalidates_agent_before_local_prompt(self):
         sender = agent_directory.AgentRecord(
             "local", "blue-raven", "w1:p1", "w1", "project", "idle", "s1", "/work", True
