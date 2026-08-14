@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -419,6 +420,144 @@ class AgentSkillCliTest(unittest.TestCase):
             agent_directory.REMOTE_DISCOVERY_TIMEOUT_SECONDS,
         )
 
+    def test_send_classifies_timeout_and_cancellation(self):
+        recipient = agent(name="white-bison", pane_id="w1:p2")
+        sender = agent(name="blue-raven")
+        failures = (
+            ("timeout", "prompt_timeout"),
+            ("cancelled", "prompt_cancelled"),
+        )
+        for detail, expected_code in failures:
+            completed = subprocess.CompletedProcess(["herdr"], 1, "", detail)
+            with (
+                self.subTest(detail=detail),
+                mock.patch.object(
+                    agent_skill_cli,
+                    "resolve_routed_agent",
+                    return_value=recipient,
+                ),
+                mock.patch.object(
+                    agent_skill_cli,
+                    "current_sender",
+                    return_value=sender,
+                ),
+                mock.patch.object(
+                    agent_skill_cli,
+                    "run_bounded_command",
+                    return_value=completed,
+                ),
+                self.assertRaises(agent_skill_cli.SkillCommandError) as raised,
+            ):
+                agent_skill_cli.send_command(
+                    host="local",
+                    route="opaque",
+                    message="Review this change.",
+                    wait=True,
+                    timeout_ms=90_000,
+                    environment={},
+                )
+            self.assertEqual(raised.exception.code, expected_code)
+
+    def test_batch_reuses_send_and_aggregates_per_target_results(self):
+        def send_command(**arguments):
+            route = arguments["route"]
+            if route == "self":
+                raise agent_skill_cli.SkillCommandError(
+                    "recipient_is_sender",
+                    "The current sender cannot also be the recipient.",
+                )
+            if route == "slow":
+                raise agent_skill_cli.SkillCommandError(
+                    "prompt_timeout",
+                    "timeout",
+                )
+            return {
+                "sent": True,
+                "waited": True,
+                "wait_can_track_submitted_turn": True,
+            }
+
+        with mock.patch.object(
+            agent_skill_cli,
+            "send_command",
+            side_effect=send_command,
+        ) as send:
+            payload = agent_skill_cli.batch_command(
+                requests_json=(
+                    '[{"route":"ok","message":"one"},'
+                    '{"route":"self","message":"two"},'
+                    '{"route":"slow","message":"three"}]'
+                ),
+                wait=True,
+                timeout_ms=90_000,
+                max_workers=1,
+                environment={"HERDR_PANE_ID": "w1:p1"},
+            )
+
+        self.assertEqual(send.call_count, 3)
+        self.assertEqual(
+            [result["status"] for result in payload["results"]],
+            ["succeeded", "failed", "timeout"],
+        )
+        self.assertEqual(payload["results"][1]["error"], "recipient_is_sender")
+        self.assertEqual(payload["status"], "partial")
+
+    def test_batch_no_wait_reports_submitted(self):
+        with mock.patch.object(
+            agent_skill_cli,
+            "send_command",
+            return_value={"sent": True, "waited": False},
+        ):
+            payload = agent_skill_cli.batch_command(
+                requests_json='[{"route":"one","message":"instruction"}]',
+                wait=False,
+                timeout_ms=90_000,
+                max_workers=1,
+                environment={},
+            )
+
+        self.assertEqual(payload["status"], "succeeded")
+        self.assertEqual(payload["results"][0]["status"], "submitted")
+
+    def test_batch_normalizes_future_request_lifecycle_payloads(self):
+        cases = (
+            ({"state": "submitted_settled"}, "succeeded"),
+            ({"state": "submitted_working"}, "submitted"),
+            (
+                {"state": "submitted_working", "timed_out": True},
+                "timeout",
+            ),
+            ({"state": "submission_failed", "error": "rejected"}, "failed"),
+        )
+        for lifecycle_payload, expected in cases:
+            with self.subTest(payload=lifecycle_payload):
+                outcome = agent_skill_cli._batch_outcome_from_payload(
+                    lifecycle_payload,
+                    waited=True,
+                )
+                self.assertEqual(outcome.status, expected)
+
+    def test_batch_returns_a_future_refreshed_route(self):
+        with mock.patch.object(
+            agent_skill_cli,
+            "send_command",
+            return_value={
+                "sent": True,
+                "waited": True,
+                "wait_trackable": True,
+                "route": "v2-refreshed",
+            },
+        ):
+            payload = agent_skill_cli.batch_command(
+                requests_json='[{"route":"v1-stale","message":"instruction"}]',
+                wait=True,
+                timeout_ms=90_000,
+                max_workers=1,
+                environment={},
+            )
+
+        self.assertEqual(payload["results"][0]["route"], "v2-refreshed")
+
     def test_read_resolves_label_before_fetching_output(self):
         recipient = agent(name="white-bison")
         completed = subprocess.CompletedProcess(["herdr"], 0, "final report\n", "")
@@ -517,6 +656,51 @@ class AgentSkillCliTest(unittest.TestCase):
         )
         self.assertEqual(arguments.route, "opaque-token")
         self.assertIsNone(arguments.label)
+
+    def test_batch_parser_accepts_json_and_worker_limit(self):
+        arguments = agent_skill_cli.parse_cli_arguments(
+            [
+                "batch",
+                "--requests-json",
+                '[{"route":"one","message":"hello"}]',
+                "--max-workers",
+                "3",
+                "--no-wait",
+            ]
+        )
+        self.assertEqual(arguments.command, "batch")
+        self.assertEqual(arguments.max_workers, 3)
+        self.assertFalse(arguments.wait)
+
+    def test_batch_main_returns_nonzero_partial_result_as_compact_json(self):
+        result = {
+            "status": "partial",
+            "results": [
+                {"route": "one", "status": "succeeded"},
+                {"route": "two", "status": "failed", "error": "route_expired"},
+            ],
+        }
+        output = StringIO()
+        with (
+            mock.patch.object(agent_skill_cli, "batch_command", return_value=result),
+            mock.patch("sys.stdout", output),
+        ):
+            exit_code = agent_skill_cli.main(
+                [
+                    "batch",
+                    "--requests-json",
+                    '[{"route":"one","message":"hello"}]',
+                ],
+                {},
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            output.getvalue(),
+            '{"status":"partial","results":['
+            '{"route":"one","status":"succeeded"},'
+            '{"route":"two","status":"failed","error":"route_expired"}]}\n',
+        )
 
 
 class AgentSkillWrapperTest(unittest.TestCase):

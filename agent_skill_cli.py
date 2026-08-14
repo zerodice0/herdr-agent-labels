@@ -9,10 +9,24 @@ import hashlib
 import json
 import os
 import sys
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from typing import Any
 
+from agent_batch_dispatch import (
+    CANCELLED,
+    DEFAULT_BATCH_WORKERS,
+    FAILED,
+    SUBMITTED,
+    SUCCEEDED,
+    TIMED_OUT,
+    BatchDispatchError,
+    BatchRequest,
+    DispatchOutcome,
+    dispatch_batch,
+    parse_batch_json,
+)
 from agent_directory import (
     REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     AgentRecord,
@@ -38,8 +52,13 @@ class SkillCommandError(Exception):
         self.message = message
 
 
-def _write_json(payload: Mapping[str, Any]) -> None:
-    json.dump(payload, sys.stdout, ensure_ascii=False)
+def _write_json(payload: Mapping[str, Any], *, compact: bool = False) -> None:
+    json.dump(
+        payload,
+        sys.stdout,
+        ensure_ascii=False,
+        separators=(",", ":") if compact else None,
+    )
     sys.stdout.write("\n")
 
 
@@ -251,6 +270,7 @@ def send_command(
     wait: bool,
     timeout_ms: int,
     environment: Mapping[str, str] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     if not message.strip():
         raise SkillCommandError("empty_message", "The message must not be empty.")
@@ -276,17 +296,28 @@ def send_command(
     arguments = ["agent", "prompt", recipient.target, prompt]
     if wait:
         arguments.extend(["--wait", "--timeout", str(timeout_ms)])
+    command_timeout = (
+        (timeout_ms / 1000) + REMOTE_DISCOVERY_TIMEOUT_SECONDS
+        if wait
+        else REMOTE_DISCOVERY_TIMEOUT_SECONDS
+    )
+    run_options: dict[str, Any] = {"timeout": command_timeout}
+    if cancel_event is not None:
+        run_options["cancel_event"] = cancel_event
     result = run_bounded_command(
         _agent_command(recipient, arguments, environment),
-        timeout=(
-            (timeout_ms / 1000) + REMOTE_DISCOVERY_TIMEOUT_SECONDS
-            if wait
-            else REMOTE_DISCOVERY_TIMEOUT_SECONDS
-        ),
+        **run_options,
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "prompt failed"
-        raise SkillCommandError("prompt_failed", detail)
+        lowered_detail = detail.lower()
+        if lowered_detail == "cancelled":
+            error_code = "prompt_cancelled"
+        elif lowered_detail == "timeout" or "timed out after" in lowered_detail:
+            error_code = "prompt_timeout"
+        else:
+            error_code = "prompt_failed"
+        raise SkillCommandError(error_code, detail)
     return {
         "sent": True,
         "waited": wait,
@@ -308,6 +339,108 @@ def send_command(
         "recipient": _record_payload(recipient),
         "result": result.stdout.strip(),
     }
+
+
+def _batch_outcome_from_payload(
+    payload: Mapping[str, Any],
+    *,
+    waited: bool,
+) -> DispatchOutcome:
+    """Normalize current and future single-send lifecycle payloads."""
+
+    if payload.get("timed_out") is True:
+        return DispatchOutcome(TIMED_OUT, "prompt_timeout")
+    lifecycle_status = payload.get("status") or payload.get("state")
+    if isinstance(lifecycle_status, str):
+        normalized = lifecycle_status.lower().replace("-", "_")
+        if normalized in {
+            "success",
+            "succeeded",
+            "completed",
+            "done",
+            "submitted_settled",
+        }:
+            return DispatchOutcome(SUCCEEDED)
+        if normalized in {
+            "submitted",
+            "submitted_in_progress",
+            "submitted_working",
+            "submitted_unknown",
+            "in_progress",
+            "working",
+        }:
+            return DispatchOutcome(SUBMITTED)
+        if normalized in {"timeout", "timed_out"}:
+            return DispatchOutcome(TIMED_OUT, "prompt_timeout")
+        if normalized in {"cancelled", "canceled"}:
+            return DispatchOutcome(CANCELLED, "prompt_cancelled")
+        if normalized in {"failed", "failure", "blocked", "submission_failed"}:
+            error = payload.get("error")
+            return DispatchOutcome(
+                FAILED,
+                error if isinstance(error, str) else "prompt_failed",
+            )
+    if (
+        not waited
+        or payload.get("wait_can_track_submitted_turn") is False
+        or payload.get("wait_trackable") is False
+    ):
+        return DispatchOutcome(SUBMITTED)
+    return DispatchOutcome(SUCCEEDED)
+
+
+def batch_command(
+    *,
+    requests_json: str,
+    wait: bool,
+    timeout_ms: int,
+    max_workers: int,
+    environment: Mapping[str, str] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    """Mechanically dispatch pre-tailored route/message pairs."""
+
+    if timeout_ms <= 0:
+        raise SkillCommandError(
+            "invalid_timeout",
+            "--timeout must be greater than zero.",
+        )
+    items = parse_batch_json(requests_json)
+
+    def send_one(request: BatchRequest) -> DispatchOutcome:
+        try:
+            payload = send_command(
+                host="local",
+                route=request.route,
+                message=request.message,
+                wait=wait,
+                timeout_ms=timeout_ms,
+                environment=environment,
+                cancel_event=cancel_event,
+            )
+        except SkillCommandError as error:
+            if error.code == "prompt_timeout":
+                return DispatchOutcome(TIMED_OUT, error.code, error.message)
+            if error.code == "prompt_cancelled":
+                return DispatchOutcome(CANCELLED, error.code, error.message)
+            return DispatchOutcome(FAILED, error.code, error.message)
+        outcome = _batch_outcome_from_payload(payload, waited=wait)
+        refreshed_route = payload.get("route")
+        if isinstance(refreshed_route, str) and refreshed_route:
+            return DispatchOutcome(
+                outcome.status,
+                outcome.error,
+                outcome.detail,
+                refreshed_route,
+            )
+        return outcome
+
+    return dispatch_batch(
+        items,
+        send_one,
+        max_workers=max_workers,
+        cancel_event=cancel_event,
+    )
 
 
 def read_command(
@@ -376,6 +509,30 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     wait_group.add_argument("--no-wait", dest="wait", action="store_false")
     send_parser.add_argument("--timeout", type=int, default=DEFAULT_WAIT_TIMEOUT_MS)
 
+    batch_parser = subparsers.add_parser(
+        "batch",
+        help="Send pre-tailored route/message JSON with bounded concurrency.",
+    )
+    batch_parser.add_argument(
+        "--requests-json",
+        required=True,
+        help="JSON request array, or '-' to read it from stdin.",
+    )
+    batch_wait_group = batch_parser.add_mutually_exclusive_group()
+    batch_wait_group.add_argument(
+        "--wait",
+        dest="wait",
+        action="store_true",
+        default=True,
+    )
+    batch_wait_group.add_argument("--no-wait", dest="wait", action="store_false")
+    batch_parser.add_argument("--timeout", type=int, default=DEFAULT_WAIT_TIMEOUT_MS)
+    batch_parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=DEFAULT_BATCH_WORKERS,
+    )
+
     read_parser = subparsers.add_parser(
         "read",
         help="Read one resolved agent's recent output.",
@@ -393,6 +550,7 @@ def main(
     environment: Mapping[str, str] | None = None,
 ) -> int:
     arguments = parse_cli_arguments(argv)
+    exit_code = 0
     try:
         if arguments.command == "list":
             payload = list_command(arguments.host, environment)
@@ -406,6 +564,21 @@ def main(
                 timeout_ms=arguments.timeout,
                 environment=environment,
             )
+        elif arguments.command == "batch":
+            requests_json = (
+                sys.stdin.read()
+                if arguments.requests_json == "-"
+                else arguments.requests_json
+            )
+            payload = batch_command(
+                requests_json=requests_json,
+                wait=arguments.wait,
+                timeout_ms=arguments.timeout,
+                max_workers=arguments.max_workers,
+                environment=environment,
+            )
+            if payload["status"] != SUCCEEDED:
+                exit_code = 1
         else:
             payload = read_command(
                 host=arguments.host,
@@ -414,11 +587,14 @@ def main(
                 lines=arguments.lines,
                 environment=environment,
             )
-    except SkillCommandError as error:
-        _write_json({"error": {"code": error.code, "message": error.message}})
+    except (BatchDispatchError, SkillCommandError) as error:
+        _write_json(
+            {"error": {"code": error.code, "message": error.message}},
+            compact=arguments.command == "batch",
+        )
         return 1
-    _write_json(payload)
-    return 0
+    _write_json(payload, compact=arguments.command == "batch")
+    return exit_code
 
 
 if __name__ == "__main__":

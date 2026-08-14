@@ -1256,7 +1256,12 @@ class AgentMessengerTest(unittest.TestCase):
             "works even when the Agent Messenger skill is not installed",
             orchestration_request,
         )
-        self.assertIn("agent_skill_cli.py send --route", orchestration_request)
+        self.assertIn(
+            "agent_skill_cli.py batch --requests-json",
+            orchestration_request,
+        )
+        self.assertIn("bounded concurrency", orchestration_request)
+        self.assertIn("does not decompose or rewrite", orchestration_request)
         self.assertIn("agent_skill_cli.py read --route", orchestration_request)
         self.assertIn(agent_skill_cli.encode_agent_route(first), orchestration_request)
         self.assertIn(agent_skill_cli.encode_agent_route(second), orchestration_request)
