@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import shlex
 import subprocess
 import sys
 
@@ -39,6 +40,7 @@ from agent_directory import (
     ssh_config_path,
     ssh_hosts,
 )
+from agent_skill_cli import encode_agent_route
 from messenger_i18n import detect_language, messages
 
 
@@ -106,19 +108,26 @@ def _single_line(value: str) -> str:
     return " ".join(value.split())
 
 
+def bundled_router_path() -> Path:
+    return Path(__file__).resolve().with_name("agent_skill_cli.py")
+
+
 def build_orchestration_request(
     recipients: Sequence[AgentRecord],
     original_request: str,
 ) -> str:
     """Ask the coordinator to do semantic decomposition and worker orchestration."""
 
+    router = shlex.quote(os.fspath(bundled_router_path()))
     worker_lines = []
     for index, recipient in enumerate(recipients, start=1):
         transport = "local Herdr" if recipient.local else f"SSH host {recipient.host}"
         workspace = _single_line(recipient.workspace_label) or "unknown workspace"
+        route = encode_agent_route(recipient)
         worker_lines.append(
             f"{index}. {recipient.qualified_name} "
-            f"(route: {transport}; workspace: {workspace}; status: {recipient.status})"
+            f"(route: {transport}; workspace: {workspace}; status: {recipient.status})\n"
+            f"   verified route token: {route}"
         )
     workers = "\n".join(worker_lines)
     return (
@@ -128,6 +137,8 @@ def build_orchestration_request(
         "not dispatch the user's request to the selected workers.\n\n"
         "Selected workers:\n"
         f"{workers}\n\n"
+        "Bundled router (works even when the Agent Messenger skill is not installed):\n"
+        f"python3 {router}\n\n"
         "User's original request (verbatim):\n"
         "--- BEGIN ORIGINAL REQUEST ---\n"
         f"{original_request}\n"
@@ -136,11 +147,17 @@ def build_orchestration_request(
         "1. Analyze the complete original request and create a specific, tailored, "
         "non-overlapping assignment for every selected worker listed above. Keep "
         "dependencies and each worker's route/workspace in mind.\n"
-        "2. Use Herdr to send each worker its individual instruction. Use SSH transport "
-        "for remote routes when needed. Include only the context each worker needs; do "
-        "not automatically copy the full original request to every worker.\n"
+        "2. Do not search for Herdr CLI syntax and do not require or install an agent "
+        "skill. Use the bundled router above with each worker's verified route token:\n"
+        f"   python3 {router} send --route ROUTE_TOKEN --message "
+        "'TAILORED INSTRUCTION' --wait --timeout 120000\n"
+        "   The router discovers the recorded host, verifies that the same pane occupant "
+        "is still present, and chooses local or SSH transport. Include only the context "
+        "each worker needs; do not automatically copy the full original request to every "
+        "worker.\n"
         "3. Wait for the workers' responses or settled states. Follow up when work is "
-        "missing, blocked, duplicated, or inconsistent.\n"
+        "missing, blocked, duplicated, or inconsistent. Read recent output when needed:\n"
+        f"   python3 {router} read --route ROUTE_TOKEN --lines 160\n"
         "4. Verify every result against the original request and the relevant workspace. "
         "Run or request appropriate checks before accepting the work.\n"
         "5. Integrate and synthesize the verified results, then report the final outcome "

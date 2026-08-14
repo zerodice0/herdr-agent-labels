@@ -7,6 +7,8 @@ description: Routes prompts to current Herdr agents by SSH host and Agent Labels
 
 Use the bundled CLI instead of reconstructing SSH commands. It validates the current sender, restricts remote hosts to concrete aliases in the configured SSH config, resolves the label again immediately before each operation, and reuses the plugin's hardened SSH transport.
 
+Agent Messenger's GUI may send the coordinator a self-contained orchestration request containing an absolute bundled CLI path and opaque `--route` tokens. Follow those commands directly. They work without this skill being installed, support unlabeled GUI selections, and revalidate the exact pane occupant before every operation. Do not replace them with guessed `herdr` commands or try to decode or modify the tokens.
+
 The executable is `scripts/herdr_agent_messenger.py` relative to this file. Invoke it with an absolute path when the working directory differs from the skill directory.
 
 ## Address agents

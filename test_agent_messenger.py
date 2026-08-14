@@ -9,6 +9,7 @@ from unittest import mock
 
 import agent_directory
 import agent_messenger
+import agent_skill_cli
 import messenger_i18n
 
 
@@ -1251,10 +1252,34 @@ class AgentMessengerTest(unittest.TestCase):
             orchestration_request,
         )
         self.assertIn("tailored", orchestration_request)
-        self.assertIn("Use Herdr", orchestration_request)
+        self.assertIn(
+            "works even when the Agent Messenger skill is not installed",
+            orchestration_request,
+        )
+        self.assertIn("agent_skill_cli.py send --route", orchestration_request)
+        self.assertIn("agent_skill_cli.py read --route", orchestration_request)
+        self.assertIn(agent_skill_cli.encode_agent_route(first), orchestration_request)
+        self.assertIn(agent_skill_cli.encode_agent_route(second), orchestration_request)
+        self.assertIn("Do not search for Herdr CLI syntax", orchestration_request)
         self.assertIn("Wait for the workers", orchestration_request)
         self.assertIn("Verify every result", orchestration_request)
         self.assertIn("report the final outcome", orchestration_request)
+
+    def test_delegate_route_includes_an_unnamed_remote_agent(self):
+        unnamed = agent_directory.replace(
+            agent(name="", pane_id="w8:p4", session_id="remote-session"),
+            host="macbook-pro",
+            local=False,
+            route_target="w8:p4",
+        )
+        request = agent_messenger.build_orchestration_request(
+            [unnamed],
+            "Ask this worker for a status report.",
+        )
+
+        self.assertIn("macbook-pro/w8:p4", request)
+        self.assertIn("SSH host macbook-pro", request)
+        self.assertIn(agent_skill_cli.encode_agent_route(unnamed), request)
 
     def test_direct_mode_dispatches_to_multiple_selected_recipients(self):
         sender = agent()

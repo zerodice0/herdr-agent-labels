@@ -1,5 +1,9 @@
 import importlib.util
+import json
+import os
 import subprocess
+import sys
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -49,6 +53,56 @@ def agent(
 
 
 class AgentSkillCliTest(unittest.TestCase):
+    def test_route_token_resolves_exact_current_occupant(self):
+        recipient = agent(name="", pane_id="w7:p9")
+        token = agent_skill_cli.encode_agent_route(recipient)
+        with mock.patch.object(
+            agent_skill_cli,
+            "discover_agents",
+            return_value=[recipient],
+        ) as discover:
+            self.assertEqual(agent_skill_cli.resolve_routed_agent(token), recipient)
+
+        discover.assert_called_once_with("local", None)
+
+    def test_route_token_preserves_the_ssh_alias(self):
+        recipient = agent(
+            host="macbook-pro",
+            name="",
+            pane_id="w7:p9",
+            local=False,
+        )
+        token = agent_skill_cli.encode_agent_route(recipient)
+        with mock.patch.object(
+            agent_skill_cli,
+            "discover_agents",
+            return_value=[recipient],
+        ) as discover:
+            self.assertEqual(agent_skill_cli.resolve_routed_agent(token), recipient)
+
+        discover.assert_called_once_with("macbook-pro", None)
+
+    def test_route_token_expires_when_the_pane_occupant_changes(self):
+        original = agent(name="", pane_id="w7:p9")
+        replacement = replace(original, session_id="replacement-session")
+        token = agent_skill_cli.encode_agent_route(original)
+        with (
+            mock.patch.object(
+                agent_skill_cli,
+                "discover_agents",
+                return_value=[replacement],
+            ),
+            self.assertRaises(agent_skill_cli.SkillCommandError) as raised,
+        ):
+            agent_skill_cli.resolve_routed_agent(token)
+
+        self.assertEqual(raised.exception.code, "route_expired")
+
+    def test_route_token_rejects_invalid_payload(self):
+        with self.assertRaises(agent_skill_cli.SkillCommandError) as raised:
+            agent_skill_cli.resolve_routed_agent("not-a-route")
+        self.assertEqual(raised.exception.code, "invalid_route")
+
     def test_display_only_label_is_listed_with_pane_routing_target(self):
         recipient = agent(
             host="macbook-pro",
@@ -161,6 +215,127 @@ class AgentSkillCliTest(unittest.TestCase):
         self.assertTrue(payload["waited"])
         self.assertTrue(payload["wait_can_track_submitted_turn"])
         self.assertEqual(payload["warnings"], [])
+
+    def test_send_accepts_gui_route_without_a_label_or_installed_skill(self):
+        recipient = agent(name="", pane_id="w7:p9")
+        sender = agent(name="blue-raven")
+        token = agent_skill_cli.encode_agent_route(recipient)
+        completed = subprocess.CompletedProcess(["herdr"], 0, "{}\n", "")
+        with (
+            mock.patch.object(
+                agent_skill_cli,
+                "discover_agents",
+                return_value=[recipient],
+            ),
+            mock.patch.object(agent_skill_cli, "current_sender", return_value=sender),
+            mock.patch.object(
+                agent_skill_cli,
+                "run_bounded_command",
+                return_value=completed,
+            ) as run,
+        ):
+            payload = agent_skill_cli.send_command(
+                host="local",
+                route=token,
+                message="Inspect this session.",
+                wait=True,
+                timeout_ms=90_000,
+                environment={},
+            )
+
+        self.assertEqual(run.call_args.args[0][3], "w7:p9")
+        self.assertEqual(payload["recipient"]["pane_id"], "w7:p9")
+
+    def test_cli_route_runs_with_an_empty_skill_home(self):
+        with tempfile.TemporaryDirectory() as empty_home:
+            root = Path(empty_home)
+            log_path = root / "prompt.json"
+            snapshot = {
+                "result": {
+                    "snapshot": {
+                        "agents": [
+                            {
+                                "agent": "codex",
+                                "agent_session": {"value": "sender-session"},
+                                "agent_status": "idle",
+                                "cwd": "/work/coordinator",
+                                "name": "blue-raven",
+                                "pane_id": "w1:p1",
+                                "revision": 1,
+                                "terminal_id": "sender-terminal",
+                                "workspace_id": "w1",
+                            },
+                            {
+                                "agent": "codex",
+                                "agent_session": {"value": "recipient-session"},
+                                "agent_status": "idle",
+                                "cwd": "/work/worker",
+                                "pane_id": "w7:p9",
+                                "revision": 1,
+                                "terminal_id": "recipient-terminal",
+                                "workspace_id": "w7",
+                            },
+                        ],
+                        "workspaces": [],
+                    }
+                }
+            }
+            records = agent_directory.parse_agent_payload(
+                snapshot,
+                host=agent_directory.local_host_name(),
+                local=True,
+            )
+            recipient = next(record for record in records if record.pane_id == "w7:p9")
+            token = agent_skill_cli.encode_agent_route(recipient)
+            fake_herdr = root / "herdr"
+            fake_herdr.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                f"snapshot = {snapshot!r}\n"
+                f"log_path = pathlib.Path({os.fspath(log_path)!r})\n"
+                "if sys.argv[1:3] == ['api', 'snapshot']:\n"
+                "    print(json.dumps(snapshot))\n"
+                "elif sys.argv[1:3] == ['agent', 'prompt']:\n"
+                "    log_path.write_text(json.dumps(sys.argv[1:4]))\n"
+                "    print('{}')\n"
+                "else:\n"
+                "    raise SystemExit(2)\n",
+                encoding="utf-8",
+            )
+            fake_herdr.chmod(0o700)
+            environment = {
+                **os.environ,
+                "HOME": empty_home,
+                "HERDR_BIN_PATH": os.fspath(fake_herdr),
+                "HERDR_PANE_ID": "w1:p1",
+            }
+            self.assertFalse(root.joinpath(".agents", "skills").exists())
+            self.assertFalse(root.joinpath(".claude", "skills").exists())
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    os.fspath(Path(agent_skill_cli.__file__).resolve()),
+                    "send",
+                    "--route",
+                    token,
+                    "--message",
+                    "Inspect this session.",
+                    "--no-wait",
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=10,
+                env=environment,
+                cwd=empty_home,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(json.loads(completed.stdout)["sent"])
+            self.assertEqual(
+                json.loads(log_path.read_text(encoding="utf-8")),
+                ["agent", "prompt", "w7:p9"],
+            )
 
     def test_send_warns_when_waiting_on_an_already_working_agent(self):
         recipient = agent(name="white-bison", pane_id="w1:p2")
@@ -329,6 +504,19 @@ class AgentSkillCliTest(unittest.TestCase):
                     "w2:p2",
                 ]
             )
+
+    def test_send_parser_accepts_a_verified_route_instead_of_a_label(self):
+        arguments = agent_skill_cli.parse_cli_arguments(
+            [
+                "send",
+                "--route",
+                "opaque-token",
+                "--message",
+                "hello",
+            ]
+        )
+        self.assertEqual(arguments.route, "opaque-token")
+        self.assertIsNone(arguments.label)
 
 
 class AgentSkillWrapperTest(unittest.TestCase):

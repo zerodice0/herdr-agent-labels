@@ -101,16 +101,27 @@ The bundled helper supports listing, sending with an optional settled-state wait
 and reading recent output. It reuses the plugin's SSH host allowlist, forwarding
 protections, host-key policy, and current-agent verification.
 
+The skill is optional for the popup workflow. Coordinator delegation embeds the
+installed plugin's executable router path and an opaque route token for every
+selected worker in the coordinator request. The token contains a hash of the
+observed pane occupant rather than its session metadata. Before sending or
+reading, the router discovers the recorded local or SSH host again and rejects
+the route if that occupant has changed. This also makes unlabeled agents selected
+in the GUI addressable without requiring the coordinator to discover Herdr CLI
+syntax or install the skill first.
+
 After SSH discovery, choose a delivery mode:
 
 - **Delegate through coordinator (default and recommended):** the focused agent
   that opened the popup is the coordinator. The plugin sends that coordinator one
-  orchestration request containing the selected worker list and the user's
-  original request. It does not send the original request to the selected workers.
+  self-contained orchestration request containing the selected worker list,
+  verified route tokens, bundled router commands, and the user's original request.
+  It does not send the original request to the selected workers.
   The coordinator performs the semantic task breakdown, sends each worker a
   tailored instruction with Herdr, waits for and verifies their responses, then
-  synthesizes the result for the user. The Python plugin deliberately does not try
-  to interpret or split the work.
+  synthesizes the result for the user. This route does not depend on a globally or
+  project-installed Agent Messenger skill. The Python plugin deliberately does
+  not try to interpret or split the work.
 - **Send directly (advanced):** preserves the original behavior. The plugin copies
   the same complete message to every selected agent immediately.
 
