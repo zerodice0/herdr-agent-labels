@@ -257,6 +257,50 @@ colors remain reserved for working, done, blocked, and warning states.
 The UI follows `LC_ALL`, `LC_MESSAGES`, or `LANG` and supports English, Japanese,
 and Korean. Unsupported locales fall back to English.
 
+## Safe SSH Rollout
+
+`rollout_plugin.py` is a standalone operator helper for installing or updating
+this plugin on explicitly selected remote Herdr hosts. It accepts only full
+40-character commit SHAs and only concrete SSH aliases authorized by the same
+SSH config and optional `ssh-hosts` allowlist used by Agent Messenger. It never
+discovers or adds rollout targets on its own.
+
+Preview the exact commands without opening an SSH connection:
+
+```bash
+python3 rollout_plugin.py \
+  --host macbook-pro \
+  --ref 0123456789abcdef0123456789abcdef01234567 \
+  --dry-run \
+  --format json
+```
+
+After reviewing the plan, `--confirm` explicitly authorizes the selected hosts'
+plugin install/update and server reload:
+
+```bash
+python3 rollout_plugin.py \
+  --host macbook-pro \
+  --host desktop \
+  --ref 0123456789abcdef0123456789abcdef01234567 \
+  --confirm \
+  --format json
+```
+
+The default `smoke` profile checks the enabled state, exact GitHub source and
+resolved commit, manifest version, `herdr config check`, server config reload,
+and the three core plugin actions. Add `--profile full` to also compare SHA-256
+hashes for every file tracked by the target commit and run the complete unittest
+suite. Hashes are checked before tests so a mismatched installed tree is not
+executed. Full tests disable bytecode writes.
+
+Each host is reported independently, and a failure on one host does not stop
+later selected hosts. Exit status is `0` only when every selected host passes,
+`1` for host-level rollout or validation failures, and `2` for missing approval
+or invalid preflight input. The helper reuses the plugin's non-interactive,
+forwarding-disabled SSH transport and does not set or replace SSH host-key trust
+options.
+
 ## Test
 
 ```bash
