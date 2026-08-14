@@ -325,12 +325,13 @@ class AgentRequestCliIntegrationTest(unittest.TestCase):
             ]
         )
         status = agent_skill_cli.parse_cli_arguments(
-            ["status", "--request-id", "d" * 32]
+            ["request-status", "--request-id", "d" * 32]
         )
 
         self.assertEqual(request.command, "request")
         self.assertEqual(request.route, "opaque-route")
         self.assertEqual(request.output_lines, 40)
+        self.assertEqual(status.command, "request-status")
         self.assertEqual(status.request_id, "d" * 32)
 
     def test_request_command_uses_injected_resolver_without_herdr_wait(self):

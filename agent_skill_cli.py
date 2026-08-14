@@ -34,6 +34,13 @@ from agent_route import (
     resolve_agent_route,
     route_host,
 )
+from agent_output import (
+    InvalidOutputCursor,
+    agent_address,
+    compact_agent_payload,
+    compact_output,
+    output_stream_id,
+)
 from request_lifecycle import (
     JsonRequestStateStore,
     OutputSnapshot,
@@ -48,6 +55,7 @@ DEFAULT_WAIT_TIMEOUT_MS = 120_000
 DEFAULT_READ_LINES = 120
 DEFAULT_REQUEST_OUTPUT_CHARS = 12_000
 DEFAULT_REQUEST_POLL_INTERVAL_SECONDS = 0.5
+DEFAULT_READ_MAX_BYTES = 64 * 1024
 
 
 class SkillCommandError(Exception):
@@ -66,8 +74,7 @@ def _record_payload(agent: AgentRecord) -> dict[str, Any]:
     payload = asdict(agent)
     payload["label"] = agent.name
     payload["qualified_name"] = agent.qualified_name
-    route_host = "local" if agent.local else agent.host
-    payload["address"] = f"{route_host}/{agent.name}"
+    payload["address"] = agent_address(agent)
     return payload
 
 
@@ -331,11 +338,39 @@ class AgentRequestTransport(RequestTransport[AgentRecord]):
 def list_command(
     host: str,
     environment: Mapping[str, str] | None = None,
+    *,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     agents = [agent for agent in discover_agents(host, environment) if agent.name]
     return {
         "host": host,
-        "agents": [_record_payload(agent) for agent in agents],
+        "agents": [
+            _record_payload(agent) if verbose else compact_agent_payload(agent)
+            for agent in agents
+        ],
+    }
+
+
+def status_command(
+    *,
+    host: str,
+    label: str | None = None,
+    route: str | None = None,
+    verbose: bool = False,
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    recipient = resolve_recipient(
+        host=host,
+        label=label,
+        route=route,
+        environment=environment,
+    )
+    return {
+        "agent": (
+            _record_payload(recipient)
+            if verbose
+            else compact_agent_payload(recipient)
+        )
     }
 
 
@@ -385,29 +420,21 @@ def send_command(
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "prompt failed"
         raise SkillCommandError("prompt_failed", detail)
-    return {
+    payload: dict[str, Any] = {
         "sent": True,
+        "recipient": agent_address(recipient),
         "waited": wait,
-        "wait_can_track_submitted_turn": (
-            recipient.status != "working" if wait else None
-        ),
-        "warnings": (
-            [
-                (
-                    "The recipient was already working, so Herdr --wait may match the "
-                    "previous active turn. Read and verify the requested response "
-                    "before reporting completion."
-                )
-            ]
-            if wait and recipient.status == "working"
-            else []
-        ),
-        "sender": _record_payload(sender),
-        "recipient": _record_payload(recipient),
         "route_refreshed": resolution.route_refreshed,
         "route": resolution.route,
-        "result": result.stdout.strip(),
     }
+    if wait:
+        payload["wait_can_track_submitted_turn"] = recipient.status != "working"
+    payload["warnings"] = (
+        ["recipient_already_working"]
+        if wait and recipient.status == "working"
+        else []
+    )
+    return payload
 
 
 def read_command(
@@ -416,10 +443,17 @@ def read_command(
     label: str | None = None,
     route: str | None = None,
     lines: int,
+    max_bytes: int = DEFAULT_READ_MAX_BYTES,
+    cursor: str | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     if lines <= 0:
         raise SkillCommandError("invalid_lines", "--lines must be greater than zero.")
+    if max_bytes <= 0:
+        raise SkillCommandError(
+            "invalid_max_bytes",
+            "--max-bytes must be greater than zero.",
+        )
     resolution = resolve_or_refresh_recipient(
         host=host,
         label=label,
@@ -448,11 +482,24 @@ def read_command(
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "read failed"
         raise SkillCommandError("read_failed", detail)
+    try:
+        delta = compact_output(
+            result.stdout,
+            stream=output_stream_id(recipient.identity),
+            max_bytes=max_bytes,
+            cursor=cursor,
+        )
+    except InvalidOutputCursor as error:
+        raise SkillCommandError("invalid_cursor", str(error)) from None
     return {
-        "recipient": _record_payload(recipient),
+        "address": agent_address(recipient),
+        "output": delta.output,
+        "truncated": delta.truncated,
+        "delta": delta.delta,
+        "cursor_status": delta.cursor_status,
+        "cursor": delta.cursor,
         "route_refreshed": resolution.route_refreshed,
         "route": resolution.route,
-        "output": result.stdout,
     }
 
 
@@ -618,6 +665,31 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
 
     list_parser = subparsers.add_parser("list", help="List current labeled agents.")
     list_parser.add_argument("--host", default="local")
+    list_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Include the full AgentRecord-compatible payload.",
+    )
+    list_parser.add_argument(
+        "--legacy",
+        dest="verbose",
+        action="store_true",
+        help="Alias for --verbose for legacy consumers.",
+    )
+
+    status_parser = subparsers.add_parser(
+        "status",
+        help="Read one resolved agent's current status.",
+    )
+    status_parser.add_argument("--host", default="local")
+    status_address = status_parser.add_mutually_exclusive_group(required=True)
+    status_address.add_argument("--label")
+    status_address.add_argument("--route")
+    status_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Include the full AgentRecord-compatible payload.",
+    )
 
     send_parser = subparsers.add_parser(
         "send",
@@ -642,6 +714,17 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     read_address.add_argument("--label")
     read_address.add_argument("--route")
     read_parser.add_argument("--lines", type=int, default=DEFAULT_READ_LINES)
+    read_parser.add_argument(
+        "--max-bytes",
+        type=int,
+        default=DEFAULT_READ_MAX_BYTES,
+    )
+    read_parser.add_argument(
+        "--cursor",
+        "--watermark",
+        dest="cursor",
+        help="Return only output after this prior read cursor when safe.",
+    )
 
     request_parser = subparsers.add_parser(
         "request",
@@ -664,11 +747,11 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
         default=DEFAULT_REQUEST_OUTPUT_CHARS,
     )
 
-    status_parser = subparsers.add_parser(
-        "status",
+    request_status_parser = subparsers.add_parser(
+        "request-status",
         help="Read the latest stored state for a request ID.",
     )
-    status_parser.add_argument("--request-id", required=True)
+    request_status_parser.add_argument("--request-id", required=True)
     return parser.parse_args(argv)
 
 
@@ -679,7 +762,19 @@ def main(
     arguments = parse_cli_arguments(argv)
     try:
         if arguments.command == "list":
-            payload = list_command(arguments.host, environment)
+            payload = list_command(
+                arguments.host,
+                environment,
+                verbose=arguments.verbose,
+            )
+        elif arguments.command == "status":
+            payload = status_command(
+                host=arguments.host,
+                label=arguments.label,
+                route=arguments.route,
+                verbose=arguments.verbose,
+                environment=environment,
+            )
         elif arguments.command == "send":
             payload = send_command(
                 host=arguments.host,
@@ -696,6 +791,8 @@ def main(
                 label=arguments.label,
                 route=arguments.route,
                 lines=arguments.lines,
+                max_bytes=arguments.max_bytes,
+                cursor=arguments.cursor,
                 environment=environment,
             )
         elif arguments.command == "request":
@@ -709,11 +806,13 @@ def main(
                 output_chars=arguments.output_chars,
                 environment=environment,
             )
-        else:
+        elif arguments.command == "request-status":
             payload = request_status_command(
                 request_id=arguments.request_id,
                 environment=environment,
             )
+        else:  # pragma: no cover - argparse rejects unknown commands
+            raise SkillCommandError("invalid_command", "Unsupported command.")
     except SkillCommandError as error:
         _write_json({"error": {"code": error.code, "message": error.message}})
         return 1

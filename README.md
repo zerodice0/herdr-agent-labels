@@ -103,8 +103,18 @@ new output. Its persisted request ID can be queried later to advance a timed-out
 nonterminal observation. Submission failures,
 working or settled submissions, and unknown outcomes are kept distinct, so a
 timeout is not automatically reported as delivery failure. Lower-level send and
-read commands remain available for diagnostics. The helper reuses the plugin's
-SSH host allowlist, forwarding protections, host-key policy, and current-agent
+read commands remain available for diagnostics. Use `request-status --request-id`
+to advance a saved nonterminal request. The helper also supports compact agent
+lists, a single-recipient `status`
+lookup, sending with an optional settled-state wait, and bounded incremental
+output reads. `list` returns only `address`, `status`, and `workspace` by default;
+use `--verbose` (or the compatibility alias `--legacy`) for the complete agent
+record. `read --max-bytes` caps UTF-8 output without splitting a character, and
+its returned cursor can be supplied to the next `read --cursor` call. Cursors
+use snapshot hashes and terminal-tail overlap; if a terminal screen was rewritten
+or the overlap is no longer safe, the helper returns a bounded current snapshot
+with `cursor_status` set to `expired`. The helper reuses the plugin's SSH host
+allowlist, forwarding protections, host-key policy, and current-agent
 verification.
 
 The skill is optional for the popup workflow. Coordinator delegation embeds the

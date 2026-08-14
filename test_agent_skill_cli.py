@@ -103,7 +103,7 @@ class AgentSkillCliTest(unittest.TestCase):
             agent_skill_cli.resolve_routed_agent("not-a-route")
         self.assertEqual(raised.exception.code, "invalid_route")
 
-    def test_display_only_label_is_listed_with_pane_routing_target(self):
+    def test_list_is_compact_and_verbose_preserves_full_record(self):
         recipient = agent(
             host="macbook-pro",
             name="purple-koala",
@@ -117,9 +117,23 @@ class AgentSkillCliTest(unittest.TestCase):
             return_value=[recipient],
         ):
             payload = agent_skill_cli.list_command("macbook-pro")
+            verbose_payload = agent_skill_cli.list_command(
+                "macbook-pro",
+                verbose=True,
+            )
 
-        self.assertEqual(payload["agents"][0]["address"], "macbook-pro/purple-koala")
-        self.assertEqual(payload["agents"][0]["route_target"], "w1:p4")
+        self.assertEqual(
+            payload["agents"],
+            [
+                {
+                    "address": "macbook-pro/purple-koala",
+                    "status": "idle",
+                    "workspace": "project",
+                }
+            ],
+        )
+        self.assertEqual(verbose_payload["agents"][0]["route_target"], "w1:p4")
+        self.assertEqual(verbose_payload["agents"][0]["label"], "purple-koala")
 
     def test_list_returns_only_addressable_labeled_agents(self):
         labeled = agent(name="white-bison")
@@ -130,8 +144,33 @@ class AgentSkillCliTest(unittest.TestCase):
             return_value=[labeled, unnamed],
         ):
             payload = agent_skill_cli.list_command("local")
-        self.assertEqual([item["label"] for item in payload["agents"]], ["white-bison"])
+        self.assertEqual(len(payload["agents"]), 1)
         self.assertEqual(payload["agents"][0]["address"], "local/white-bison")
+
+    def test_list_legacy_parser_alias_enables_verbose_output(self):
+        arguments = agent_skill_cli.parse_cli_arguments(["list", "--legacy"])
+
+        self.assertTrue(arguments.verbose)
+
+    def test_status_resolves_one_verified_route(self):
+        recipient = agent(name="", pane_id="w7:p9")
+        route = agent_skill_cli.encode_agent_route(recipient)
+        with mock.patch.object(
+            agent_skill_cli,
+            "discover_agents",
+            return_value=[recipient],
+        ) as discover:
+            payload = agent_skill_cli.status_command(host="local", route=route)
+
+        discover.assert_called_once_with("local", None)
+        self.assertEqual(
+            payload["agent"],
+            {
+                "address": "local/w7:p9",
+                "status": "idle",
+                "workspace": "project",
+            },
+        )
 
     def test_hostname_alias_is_remote_even_when_it_matches_local_hostname(self):
         remote = agent(host="shared", local=False)
@@ -211,10 +250,13 @@ class AgentSkillCliTest(unittest.TestCase):
         self.assertIn("Message from local/blue-raven:\n\nReview this change.", command)
         self.assertEqual(command[-3:], ["--wait", "--timeout", "90000"])
         self.assertEqual(run.call_args.kwargs["timeout"], 95)
-        self.assertTrue(payload["sent"])
-        self.assertTrue(payload["waited"])
-        self.assertTrue(payload["wait_can_track_submitted_turn"])
+        self.assertEqual(payload["sent"], True)
+        self.assertEqual(payload["recipient"], "local/white-bison")
+        self.assertEqual(payload["waited"], True)
+        self.assertEqual(payload["wait_can_track_submitted_turn"], True)
         self.assertEqual(payload["warnings"], [])
+        self.assertFalse(payload["route_refreshed"])
+        self.assertEqual(payload["route"], agent_skill_cli.encode_agent_route(recipient))
 
     def test_send_accepts_gui_route_without_a_label_or_installed_skill(self):
         recipient = agent(name="", pane_id="w7:p9")
@@ -241,10 +283,10 @@ class AgentSkillCliTest(unittest.TestCase):
                 wait=True,
                 timeout_ms=90_000,
                 environment={},
-            )
+        )
 
         self.assertEqual(run.call_args.args[0][3], "w7:p9")
-        self.assertEqual(payload["recipient"]["pane_id"], "w7:p9")
+        self.assertEqual(payload["recipient"], "local/w7:p9")
         self.assertFalse(payload["route_refreshed"])
         self.assertEqual(payload["route"], token)
 
@@ -399,7 +441,7 @@ class AgentSkillCliTest(unittest.TestCase):
                 environment={},
             )
         self.assertFalse(payload["wait_can_track_submitted_turn"])
-        self.assertEqual(len(payload["warnings"]), 1)
+        self.assertEqual(payload["warnings"], ["recipient_already_working"])
 
     def test_send_rejects_the_current_sender_as_recipient(self):
         sender = agent(name="white-bison")
@@ -448,7 +490,8 @@ class AgentSkillCliTest(unittest.TestCase):
                 environment={},
             )
         self.assertNotIn("--wait", run.call_args.args[0])
-        self.assertIsNone(payload["wait_can_track_submitted_turn"])
+        self.assertNotIn("wait_can_track_submitted_turn", payload)
+        self.assertEqual(payload["warnings"], [])
         self.assertEqual(
             run.call_args.kwargs["timeout"],
             agent_directory.REMOTE_DISCOVERY_TIMEOUT_SECONDS,
@@ -494,6 +537,11 @@ class AgentSkillCliTest(unittest.TestCase):
         self.assertEqual(payload["output"], "final report\n")
         self.assertFalse(payload["route_refreshed"])
         self.assertEqual(payload["route"], agent_skill_cli.encode_agent_route(recipient))
+        self.assertEqual(payload["address"], "local/white-bison")
+        self.assertFalse(payload["delta"])
+        self.assertFalse(payload["truncated"])
+        self.assertEqual(payload["cursor_status"], "initial")
+        self.assertTrue(payload["cursor"])
 
     def test_read_refreshes_the_same_stale_route_path_as_send(self):
         original = agent(name="white-bison")
@@ -523,6 +571,66 @@ class AgentSkillCliTest(unittest.TestCase):
         self.assertEqual(
             payload["route"], agent_skill_cli.encode_agent_route(replacement)
         )
+
+    def test_read_uses_cursor_for_incremental_output(self):
+        recipient = agent(name="white-bison")
+        first = subprocess.CompletedProcess(["herdr"], 0, "first\n", "")
+        second = subprocess.CompletedProcess(["herdr"], 0, "first\nsecond\n", "")
+        with (
+            mock.patch.object(
+                agent_skill_cli,
+                "resolve_labeled_agent",
+                return_value=recipient,
+            ),
+            mock.patch.object(
+                agent_skill_cli,
+                "run_bounded_command",
+                side_effect=[first, second],
+            ),
+        ):
+            initial = agent_skill_cli.read_command(
+                host="local",
+                label="white-bison",
+                lines=80,
+                environment={},
+            )
+            delta = agent_skill_cli.read_command(
+                host="local",
+                label="white-bison",
+                lines=80,
+                cursor=initial["cursor"],
+                environment={},
+            )
+
+        self.assertEqual(delta["output"], "second\n")
+        self.assertTrue(delta["delta"])
+        self.assertEqual(delta["cursor_status"], "current")
+
+    def test_read_rejects_an_invalid_cursor(self):
+        recipient = agent(name="white-bison")
+        completed = subprocess.CompletedProcess(["herdr"], 0, "output\n", "")
+        with (
+            mock.patch.object(
+                agent_skill_cli,
+                "resolve_labeled_agent",
+                return_value=recipient,
+            ),
+            mock.patch.object(
+                agent_skill_cli,
+                "run_bounded_command",
+                return_value=completed,
+            ),
+            self.assertRaises(agent_skill_cli.SkillCommandError) as raised,
+        ):
+            agent_skill_cli.read_command(
+                host="local",
+                label="white-bison",
+                lines=80,
+                cursor="not-a-cursor",
+                environment={},
+            )
+
+        self.assertEqual(raised.exception.code, "invalid_cursor")
 
     def test_sender_must_be_a_current_agent(self):
         with (
@@ -583,6 +691,26 @@ class AgentSkillCliTest(unittest.TestCase):
         )
         self.assertEqual(arguments.route, "opaque-token")
         self.assertIsNone(arguments.label)
+
+    def test_status_and_read_parsers_accept_routes_and_watermarks(self):
+        status = agent_skill_cli.parse_cli_arguments(
+            ["status", "--route", "route-token"]
+        )
+        read = agent_skill_cli.parse_cli_arguments(
+            [
+                "read",
+                "--route",
+                "route-token",
+                "--max-bytes",
+                "512",
+                "--watermark",
+                "output-cursor",
+            ]
+        )
+
+        self.assertEqual(status.route, "route-token")
+        self.assertEqual(read.max_bytes, 512)
+        self.assertEqual(read.cursor, "output-cursor")
 
 
 class AgentSkillWrapperTest(unittest.TestCase):
