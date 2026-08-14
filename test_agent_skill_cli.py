@@ -245,6 +245,41 @@ class AgentSkillCliTest(unittest.TestCase):
 
         self.assertEqual(run.call_args.args[0][3], "w7:p9")
         self.assertEqual(payload["recipient"]["pane_id"], "w7:p9")
+        self.assertFalse(payload["route_refreshed"])
+        self.assertEqual(payload["route"], token)
+
+    def test_send_refreshes_a_stale_registered_route(self):
+        original = agent(name="white-bison", pane_id="w7:p9")
+        replacement = replace(original, session_id="replacement-session", revision=2)
+        sender = agent(name="blue-raven")
+        token = agent_skill_cli.encode_agent_route(original)
+        completed = subprocess.CompletedProcess(["herdr"], 0, "{}\n", "")
+        with (
+            mock.patch.object(
+                agent_skill_cli,
+                "discover_agents",
+                return_value=[replacement],
+            ),
+            mock.patch.object(agent_skill_cli, "current_sender", return_value=sender),
+            mock.patch.object(
+                agent_skill_cli,
+                "run_bounded_command",
+                return_value=completed,
+            ),
+        ):
+            payload = agent_skill_cli.send_command(
+                host="local",
+                route=token,
+                message="Inspect this session.",
+                wait=False,
+                timeout_ms=90_000,
+                environment={},
+            )
+
+        self.assertTrue(payload["route_refreshed"])
+        self.assertEqual(
+            payload["route"], agent_skill_cli.encode_agent_route(replacement)
+        )
 
     def test_cli_route_runs_with_an_empty_skill_home(self):
         with tempfile.TemporaryDirectory() as empty_home:
@@ -457,6 +492,37 @@ class AgentSkillCliTest(unittest.TestCase):
             ],
         )
         self.assertEqual(payload["output"], "final report\n")
+        self.assertFalse(payload["route_refreshed"])
+        self.assertEqual(payload["route"], agent_skill_cli.encode_agent_route(recipient))
+
+    def test_read_refreshes_the_same_stale_route_path_as_send(self):
+        original = agent(name="white-bison")
+        replacement = replace(original, session_id="replacement-session", revision=2)
+        token = agent_skill_cli.encode_agent_route(original)
+        completed = subprocess.CompletedProcess(["herdr"], 0, "final report\n", "")
+        with (
+            mock.patch.object(
+                agent_skill_cli,
+                "discover_agents",
+                return_value=[replacement],
+            ),
+            mock.patch.object(
+                agent_skill_cli,
+                "run_bounded_command",
+                return_value=completed,
+            ),
+        ):
+            payload = agent_skill_cli.read_command(
+                host="local",
+                route=token,
+                lines=80,
+                environment={},
+            )
+
+        self.assertTrue(payload["route_refreshed"])
+        self.assertEqual(
+            payload["route"], agent_skill_cli.encode_agent_route(replacement)
+        )
 
     def test_sender_must_be_a_current_agent(self):
         with (

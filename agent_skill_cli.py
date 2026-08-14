@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
-import binascii
-import hashlib
 import json
 import os
 import sys
@@ -25,10 +22,17 @@ from agent_directory import (
     ssh_config_path,
     ssh_hosts,
 )
+from agent_route import (
+    AgentRouteError,
+    ROUTE_TOKEN_VERSION,
+    RouteResolution,
+    encode_agent_route,
+    resolve_agent_route,
+    route_host,
+)
 
 DEFAULT_WAIT_TIMEOUT_MS = 120_000
 DEFAULT_READ_LINES = 120
-ROUTE_TOKEN_VERSION = 1
 
 
 class SkillCommandError(Exception):
@@ -54,61 +58,6 @@ def _record_payload(agent: AgentRecord) -> dict[str, Any]:
 
 def _is_local_host(host: str) -> bool:
     return host == "local"
-
-
-def _route_fingerprint(agent: AgentRecord) -> str:
-    """Return a non-reversible fingerprint for one observed pane occupant."""
-
-    return hashlib.sha256(agent.identity.encode("utf-8")).hexdigest()
-
-
-def encode_agent_route(agent: AgentRecord) -> str:
-    """Encode a GUI-selected agent without exposing its session metadata."""
-
-    payload = {
-        "host": "local" if agent.local else agent.host,
-        "occupant": _route_fingerprint(agent),
-        "version": ROUTE_TOKEN_VERSION,
-    }
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
-
-
-def _decode_agent_route(route: str) -> tuple[str, str]:
-    if not route or len(route) > 4096:
-        raise SkillCommandError("invalid_route", "The agent route token is invalid.")
-    try:
-        padding = "=" * (-len(route) % 4)
-        decoded = base64.b64decode(
-            route + padding,
-            altchars=b"-_",
-            validate=True,
-        )
-        payload = json.loads(decoded)
-    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        raise SkillCommandError(
-            "invalid_route",
-            "The agent route token is invalid.",
-        ) from None
-    if not isinstance(payload, dict):
-        raise SkillCommandError("invalid_route", "The agent route token is invalid.")
-    host = payload.get("host")
-    occupant = payload.get("occupant")
-    if (
-        payload.get("version") != ROUTE_TOKEN_VERSION
-        or not isinstance(host, str)
-        or not host
-        or not isinstance(occupant, str)
-        or len(occupant) != 64
-        or any(character not in "0123456789abcdef" for character in occupant)
-    ):
-        raise SkillCommandError("invalid_route", "The agent route token is invalid.")
-    return host, occupant
 
 
 def discover_agents(
@@ -160,25 +109,20 @@ def resolve_routed_agent(
     route: str,
     environment: Mapping[str, str] | None = None,
 ) -> AgentRecord:
-    """Resolve the exact current occupant selected by Agent Messenger."""
+    """Resolve or safely refresh the occupant selected by Agent Messenger."""
 
-    host, expected_occupant = _decode_agent_route(route)
-    matches = [
-        agent
-        for agent in discover_agents(host, environment)
-        if _route_fingerprint(agent) == expected_occupant
-    ]
-    if not matches:
-        raise SkillCommandError(
-            "route_expired",
-            "The selected agent is no longer the current pane occupant.",
-        )
-    if len(matches) > 1:
-        raise SkillCommandError(
-            "route_ambiguous",
-            "The selected agent route matches more than one current occupant.",
-        )
-    return matches[0]
+    return resolve_or_refresh_routed_agent(route, environment).agent
+
+
+def resolve_or_refresh_routed_agent(
+    route: str,
+    environment: Mapping[str, str] | None = None,
+) -> RouteResolution:
+    try:
+        host = route_host(route)
+        return resolve_agent_route(route, discover_agents(host, environment))
+    except AgentRouteError as error:
+        raise SkillCommandError(error.code, error.message) from None
 
 
 def resolve_recipient(
@@ -188,19 +132,39 @@ def resolve_recipient(
     route: str | None,
     environment: Mapping[str, str] | None = None,
 ) -> AgentRecord:
+    return resolve_or_refresh_recipient(
+        host=host,
+        label=label,
+        route=route,
+        environment=environment,
+    ).agent
+
+
+def resolve_or_refresh_recipient(
+    *,
+    host: str,
+    label: str | None,
+    route: str | None,
+    environment: Mapping[str, str] | None = None,
+) -> RouteResolution:
     if route:
         if label:
             raise SkillCommandError(
                 "conflicting_address",
                 "Use either an agent route token or a host/label address, not both.",
             )
-        return resolve_routed_agent(route, environment)
+        return resolve_or_refresh_routed_agent(route, environment)
     if not label:
         raise SkillCommandError(
             "missing_address",
             "An agent route token or label is required.",
         )
-    return resolve_labeled_agent(host, label, environment)
+    recipient = resolve_labeled_agent(host, label, environment)
+    return RouteResolution(
+        recipient,
+        route_refreshed=False,
+        route=encode_agent_route(recipient),
+    )
 
 
 def current_sender(
@@ -260,12 +224,13 @@ def send_command(
             "--timeout must be greater than zero.",
         )
 
-    recipient = resolve_recipient(
+    resolution = resolve_or_refresh_recipient(
         host=host,
         label=label,
         route=route,
         environment=environment,
     )
+    recipient = resolution.agent
     sender = current_sender(environment)
     if recipient.identity == sender.identity:
         raise SkillCommandError(
@@ -306,6 +271,8 @@ def send_command(
         ),
         "sender": _record_payload(sender),
         "recipient": _record_payload(recipient),
+        "route_refreshed": resolution.route_refreshed,
+        "route": resolution.route,
         "result": result.stdout.strip(),
     }
 
@@ -320,12 +287,13 @@ def read_command(
 ) -> dict[str, Any]:
     if lines <= 0:
         raise SkillCommandError("invalid_lines", "--lines must be greater than zero.")
-    recipient = resolve_recipient(
+    resolution = resolve_or_refresh_recipient(
         host=host,
         label=label,
         route=route,
         environment=environment,
     )
+    recipient = resolution.agent
     result = run_bounded_command(
         _agent_command(
             recipient,
@@ -349,6 +317,8 @@ def read_command(
         raise SkillCommandError("read_failed", detail)
     return {
         "recipient": _record_payload(recipient),
+        "route_refreshed": resolution.route_refreshed,
+        "route": resolution.route,
         "output": result.stdout,
     }
 
