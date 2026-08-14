@@ -31,6 +31,14 @@ python3 scripts/herdr_agent_messenger.py list --host macbook-pro
 
 If the requested host or label is missing or ambiguous, report that and do not guess.
 Use each list result's `address` field for subsequent operations.
+The default list payload is compact. Use `list --verbose` only when a complete
+agent record is required; `list --legacy` is its compatibility alias.
+
+Check one already-selected recipient without listing its host:
+
+```bash
+python3 scripts/herdr_agent_messenger.py status --route ROUTE_TOKEN
+```
 
 ## Send one request
 
@@ -53,8 +61,27 @@ Read recent output after the agent settles:
 python3 scripts/herdr_agent_messenger.py read \
   --host macbook-pro \
   --label purple-koala \
-  --lines 160
+  --lines 160 \
+  --max-bytes 65536
 ```
+
+The response contains `truncated`, `cursor_status`, and an opaque `cursor`.
+Pass that cursor to the next read to suppress unchanged output and return only a
+safe delta:
+
+```bash
+python3 scripts/herdr_agent_messenger.py read \
+  --host macbook-pro \
+  --label purple-koala \
+  --lines 160 \
+  --max-bytes 65536 \
+  --cursor PREVIOUS_CURSOR
+```
+
+Do not infer progress from terminal line numbers. Herdr output can be a rewritten
+screen rather than an append-only log. When `cursor_status` is `expired`, treat
+the returned output as a fresh bounded snapshot; `delta` will be false. When
+`truncated` is true, report that older bytes were omitted.
 
 ## Coordinate multiple agents
 

@@ -97,9 +97,17 @@ printed path:
 Use $herdr-agent-messenger to ask macbook-pro/purple-koala for a status report.
 ```
 
-The bundled helper supports listing, sending with an optional settled-state wait,
-and reading recent output. It reuses the plugin's SSH host allowlist, forwarding
-protections, host-key policy, and current-agent verification.
+The bundled helper supports compact agent lists, a single-recipient `status`
+lookup, sending with an optional settled-state wait, and bounded incremental
+output reads. `list` returns only `address`, `status`, and `workspace` by default;
+use `--verbose` (or the compatibility alias `--legacy`) for the complete agent
+record. `read --max-bytes` caps UTF-8 output without splitting a character, and
+its returned cursor can be supplied to the next `read --cursor` call. Cursors
+use snapshot hashes and terminal-tail overlap; if a terminal screen was rewritten
+or the overlap is no longer safe, the helper returns a bounded current snapshot
+with `cursor_status` set to `expired`. The helper reuses the plugin's SSH host
+allowlist, forwarding protections, host-key policy, and current-agent
+verification.
 
 The skill is optional for the popup workflow. Coordinator delegation embeds the
 installed plugin's executable router path and an opaque route token for every
