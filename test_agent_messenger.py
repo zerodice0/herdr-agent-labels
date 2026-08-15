@@ -50,6 +50,21 @@ class ImmediateThread:
 
 
 class AgentMessengerTest(unittest.TestCase):
+    def test_extracted_symbols_remain_available_from_agent_messenger(self):
+        self.assertEqual(
+            agent_messenger.STATUS_ORDER,
+            {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 4},
+        )
+        for name in (
+            "RecipientViewRow",
+            "ShortcutHelpSpan",
+            "WrappedMessageLine",
+            "display_width",
+            "scrollbar_thumb",
+            "wrap_message_lines",
+        ):
+            self.assertTrue(hasattr(agent_messenger, name), name)
+
     def test_agents_sort_by_workspace_before_status_and_label(self):
         sender = agent()
         zeta = agent(
