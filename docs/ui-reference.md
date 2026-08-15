@@ -10,7 +10,10 @@ an error notification instead of opening the popup.
 
 Local agents appear immediately, sorted by Herdr workspace label. Unicode labels
 are preserved and worktree-backed workspaces use a `WT:` prefix. Remote agents
-are grouped under their SSH host alias.
+are grouped under their SSH host alias. Within each host, agents are grouped
+again under their workspace. Workspace identity uses Herdr's `workspace_id`, so
+different workspaces with the same visible label are kept separate and display
+their IDs for disambiguation.
 
 ## Recipient rows
 
@@ -24,13 +27,18 @@ Interaction and lifecycle indicators are separate:
 - `!` blocked
 - `~` stale
 
-Color is only a redundant cue, so state remains readable in monochrome. Each row
-prioritizes the Agent Labels name, workspace, Herdr pane ID, and lifecycle state.
-The full session ID remains searchable without taking the main row width.
+Color is only a redundant cue, so state remains readable in monochrome. Workspace
+labels appear once in group headings instead of repeating on every agent row.
+Each agent row prioritizes the Agent Labels name, Herdr pane ID, and lifecycle
+state. The full session ID and workspace fields remain searchable without taking
+the main row width. Host headings always show their agent count as `(n)`;
+workspace headings use the same suffix only when they contain multiple agents.
 
-Long groups keep the host heading visible while scrolling. The recipient heading
-shows the visible range when needed. Unavailable remote hosts are summarized;
-open the details view to see each alias and its latest error.
+Long groups keep both the host and workspace headings visible while scrolling.
+When a compact viewport has room for only one sticky heading, the more specific
+workspace heading takes priority. The recipient heading shows the visible range
+when needed. Unavailable remote hosts are summarized; open the details view to
+see each alias and its latest error.
 
 ## Message editor and layout
 

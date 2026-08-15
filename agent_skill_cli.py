@@ -35,7 +35,7 @@ from agent_directory import (
     AgentRecord,
     fetch_local_agent,
     herdr_executable,
-    query_local_agents,
+    probe_local_agents,
     query_remote_agents,
     run_bounded_command,
     ssh_command,
@@ -108,7 +108,13 @@ def discover_agents(
     environment: Mapping[str, str] | None = None,
 ) -> list[AgentRecord]:
     if _is_local_host(host):
-        return query_local_agents(environment)
+        result = probe_local_agents(environment)
+        if not result.success:
+            raise SkillCommandError(
+                "host_unavailable",
+                result.error or "The local Herdr server is unavailable.",
+            )
+        return list(result.agents)
 
     configured_hosts = ssh_hosts(environment)
     if host not in configured_hosts:

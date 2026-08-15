@@ -323,14 +323,36 @@ def query_local_agents(
     *,
     cancel_event: threading.Event | None = None,
 ) -> list[AgentRecord]:
+    """Return local agents, preserving the GUI's empty-on-failure behavior."""
+
+    return list(
+        probe_local_agents(
+            environment,
+            cancel_event=cancel_event,
+        ).agents
+    )
+
+
+def probe_local_agents(
+    environment: Mapping[str, str] | None = None,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> ProbeResult:
+    """Query the local snapshot without conflating failure with no agents."""
+
+    host = local_host_name()
     command = [herdr_executable(environment), "api", "snapshot"]
     result = _run_command(command, cancel_event=cancel_event)
     if result.returncode != 0:
-        return []
-    return parse_agent_payload(
-        decode_json_object(result.stdout),
-        host=local_host_name(),
-        local=True,
+        detail = result.stderr.strip() or result.stdout.strip() or "unavailable"
+        return ProbeResult(host, (), False, detail)
+    payload = decode_json_object(result.stdout)
+    if not is_agent_list_payload(payload):
+        return ProbeResult(host, (), False, "invalid_response")
+    return ProbeResult(
+        host,
+        tuple(parse_agent_payload(payload, host=host, local=True)),
+        True,
     )
 
 

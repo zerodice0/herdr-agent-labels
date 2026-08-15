@@ -19,6 +19,7 @@ def agent(
     name: str = "blue-raven",
     pane_id: str = "w1:p1",
     session_id: str = "session-1",
+    workspace_id: str | None = None,
     workspace_label: str = "project",
     workspace_is_worktree: bool = False,
 ) -> agent_directory.AgentRecord:
@@ -26,7 +27,7 @@ def agent(
         host="local",
         name=name,
         pane_id=pane_id,
-        workspace_id="w1",
+        workspace_id=workspace_id or pane_id.split(":", 1)[0],
         workspace_label=workspace_label,
         status="idle",
         session_id=session_id,
@@ -86,7 +87,7 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertEqual(agent_messenger.workspace_display(alpha), "WT:alpha-worktree")
         self.assertEqual(agent_messenger.workspace_display(zeta), "한글 작업공간")
 
-    def test_narrow_recipient_line_preserves_unicode_workspace_and_target(self):
+    def test_narrow_recipient_hierarchy_preserves_unicode_workspace_and_target(self):
         record = agent(
             name="white-bison",
             workspace_label="결제 기능 작업트리",
@@ -110,10 +111,17 @@ class AgentMessengerTest(unittest.TestCase):
             ):
                 app = agent_messenger.MessengerApp(screen, sender, environment)
 
-        line = app._recipient_line(record, " ", "idle")
+        rows = app._recipient_view_rows([record])
+        self.assertEqual(
+            [row.kind for row in rows],
+            ["workspace_header", "agent"],
+        )
+        header = app._group_header(rows[0])
+        line = app._recipient_line(record, " ", "idle", indent=rows[1].indent)
         self.assertLessEqual(agent_messenger.display_width(line), 58)
-        self.assertIn("WT:결제 기능", line)
+        self.assertIn("WT:결제 기능", header)
         self.assertIn("white-bison", line)
+        self.assertIn("w1:p1", line)
 
     def test_recipient_cursor_selection_and_status_use_independent_styles(self):
         sender = agent()
@@ -165,6 +173,8 @@ class AgentMessengerTest(unittest.TestCase):
             style(agent_messenger.PAIR_ACCENT, agent_messenger.curses.A_BOLD),
         )
         self.assertEqual(checkbox[3], cursor[3])
+        self.assertEqual(cursor[1], 2)
+        self.assertEqual(checkbox[1], 4)
         self.assertEqual(
             status[3],
             style(agent_messenger.PAIR_WARNING, agent_messenger.curses.A_BOLD),
@@ -229,7 +239,7 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertEqual(agent_messenger.scrollbar_thumb(8, 4, 2), (1, 2))
         self.assertEqual(agent_messenger.scrollbar_thumb(8, 4, 4), (2, 2))
 
-    def test_remote_recipients_are_grouped_and_show_label_workspace_and_pane(self):
+    def test_remote_recipients_are_grouped_by_host_and_workspace(self):
         sender = agent()
         first = agent_directory.replace(
             agent(name="purple-koala", pane_id="w3:pQ", session_id="remote-1"),
@@ -261,18 +271,123 @@ class AgentMessengerTest(unittest.TestCase):
                 app = agent_messenger.MessengerApp(screen, sender, environment)
 
         app.agents = [first, second]
-        rows = app._recipient_view_rows(app.filtered_agents())
-        self.assertEqual([row.kind for row in rows], ["header", "agent", "agent"])
-        self.assertEqual(rows[0].group_count, 2)
-        self.assertEqual(app._group_header(rows[0]), "▾ macbook-pro · 2 agents")
+        single_rows = app._recipient_view_rows([first])
+        self.assertEqual(app._group_header(single_rows[0]), "▾ macbook-pro (1)")
+        self.assertEqual(app._group_header(single_rows[1]), "  ▾ aibridge")
 
-        line = app._recipient_line(first, " ", "○ idle")
+        rows = app._recipient_view_rows(app.filtered_agents())
+        self.assertEqual(
+            [row.kind for row in rows],
+            [
+                "host_header",
+                "workspace_header",
+                "agent",
+                "workspace_header",
+                "agent",
+            ],
+        )
+        self.assertEqual(rows[0].group_count, 2)
+        self.assertEqual(app._group_header(rows[0]), "▾ macbook-pro (2)")
+        self.assertEqual(
+            app._group_header(rows[1]),
+            "  ▾ aibridge",
+        )
+        self.assertEqual(
+            app._group_header(rows[3]),
+            "  ▾ edgedx_mobile",
+        )
+
+        line = app._recipient_line(first, " ", "○ idle", indent=rows[2].indent)
         self.assertIn("purple-koala", line)
-        self.assertIn("aibridge", line)
+        self.assertNotIn("aibridge", line)
         self.assertIn("w3:pQ", line)
         self.assertNotIn("macbook-pro", line)
 
-    def test_long_host_group_keeps_sticky_header_while_scrolling(self):
+    def test_duplicate_workspace_labels_are_disambiguated_by_workspace_id(self):
+        sender = agent()
+        first = agent(
+            name="purple-koala",
+            pane_id="w1:p2",
+            session_id="workspace-1",
+            workspace_id="w1",
+            workspace_label="recipelabo_flutter",
+        )
+        second = agent(
+            name="brown-fox",
+            pane_id="w2:p1",
+            session_id="workspace-2",
+            workspace_id="w2",
+            workspace_label="recipelabo_flutter",
+        )
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[sender],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+
+        rows = app._recipient_view_rows([first, second])
+        headers = [
+            app._group_header(row)
+            for row in rows
+            if row.kind == "workspace_header"
+        ]
+        self.assertEqual(
+            headers,
+            [
+                "▾ recipelabo_flutter [w1]",
+                "▾ recipelabo_flutter [w2]",
+            ],
+        )
+
+    def test_unknown_workspace_header_uses_current_locale(self):
+        sender = agent()
+        recipient = agent_directory.replace(
+            agent(name="white-bison", pane_id="w1:p2", session_id="session-2"),
+            workspace_id="",
+            workspace_label="",
+            cwd="",
+        )
+        expected = {
+            "en_US.UTF-8": "unknown workspace",
+            "ko_KR.UTF-8": "알 수 없는 작업공간",
+            "ja_JP.UTF-8": "不明なワークスペース",
+        }
+        for locale_name, label in expected.items():
+            with self.subTest(locale=locale_name):
+                with tempfile.TemporaryDirectory() as state_directory:
+                    environment = {
+                        "LANG": locale_name,
+                        "HERDR_PLUGIN_STATE_DIR": state_directory,
+                    }
+                    with (
+                        mock.patch.object(
+                            agent_messenger,
+                            "query_local_agents",
+                            return_value=[sender],
+                        ),
+                        mock.patch.object(
+                            agent_messenger,
+                            "ssh_hosts",
+                            return_value=[],
+                        ),
+                    ):
+                        app = agent_messenger.MessengerApp(
+                            mock.Mock(), sender, environment
+                        )
+
+                rows = app._recipient_view_rows([recipient])
+                self.assertEqual(app._group_header(rows[0]), f"▾ {label}")
+
+    def test_long_workspace_group_keeps_nested_sticky_headers_while_scrolling(self):
         sender = agent()
         recipients = [
             agent_directory.replace(
@@ -302,13 +417,26 @@ class AgentMessengerTest(unittest.TestCase):
 
         app.agents = recipients
         app.cursor = 3
-        visible, has_more = app._visible_recipient_rows(app.filtered_agents(), 3)
-        self.assertEqual(visible[0].kind, "header")
+        visible, has_more = app._visible_recipient_rows(app.filtered_agents(), 4)
+        self.assertEqual(visible[0].kind, "host_header")
         self.assertEqual(visible[0].group_count, 5)
+        self.assertEqual(visible[1].kind, "workspace_header")
+        self.assertEqual(visible[1].group_count, 5)
         self.assertEqual(
             [row.agent_index for row in visible if row.kind == "agent"],
             [2, 3],
         )
+        self.assertTrue(has_more)
+
+        visible, has_more = app._visible_recipient_rows(
+            app.filtered_agents(),
+            2,
+        )
+        self.assertEqual(
+            [row.kind for row in visible],
+            ["workspace_header", "agent"],
+        )
+        self.assertEqual(visible[-1].agent_index, 3)
         self.assertTrue(has_more)
 
     def test_search_matches_label_pane_and_full_session_id(self):
@@ -338,10 +466,43 @@ class AgentMessengerTest(unittest.TestCase):
         sender = agent()
         local = agent(name="white-bison", pane_id="w1:p2", session_id="local-2")
         cache = mock.Mock()
-        cache.agents.side_effect = lambda host: [mock.Mock()] * {
-            "macbook-pro": 2,
-            "winmini": 1,
-        }[host]
+        remote = {
+            "macbook-pro": [
+                agent_directory.replace(
+                    agent(
+                        name="purple-koala",
+                        pane_id="w2:p1",
+                        session_id="remote-1",
+                        workspace_id="w2",
+                    ),
+                    host="macbook-pro",
+                    local=False,
+                ),
+                agent_directory.replace(
+                    agent(
+                        name="brown-fox",
+                        pane_id="w2:p2",
+                        session_id="remote-2",
+                        workspace_id="w2",
+                    ),
+                    host="macbook-pro",
+                    local=False,
+                ),
+            ],
+            "winmini": [
+                agent_directory.replace(
+                    agent(
+                        name="orange-lemur",
+                        pane_id="w3:p1",
+                        session_id="remote-3",
+                        workspace_id="w3",
+                    ),
+                    host="winmini",
+                    local=False,
+                )
+            ],
+        }
+        cache.agents.side_effect = remote.get
         with (
             mock.patch.object(
                 agent_messenger.AgentCache,
@@ -359,7 +520,7 @@ class AgentMessengerTest(unittest.TestCase):
                 sender,
                 {},
             )
-        self.assertEqual(counts, (4, 3))
+        self.assertEqual(counts, (4, 6))
 
     def test_focused_pane_id_prefers_plugin_context(self):
         environment = {

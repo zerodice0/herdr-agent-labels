@@ -180,6 +180,38 @@ class MessengerCursesSnapshotTest(SnapshotTestCase):
         self.assertTrue(snapshot.draw_calls[1].clipped)
         self.assert_capture_in_bounds(snapshot)
 
+    def test_long_group_header_reserves_space_for_count(self):
+        target = record(
+            "blue-moose",
+            "w1:p1",
+            "long-host",
+            host="very-long-remote-host-name-that-overflows",
+            local=False,
+        )
+        window = FakeCursesWindow(8, 32)
+        with tempfile.TemporaryDirectory() as state_directory:
+            environment = {
+                "LANG": "en_US.UTF-8",
+                "HERDR_PLUGIN_STATE_DIR": state_directory,
+            }
+            with (
+                mock.patch.object(
+                    agent_messenger,
+                    "query_local_agents",
+                    return_value=[SENDER],
+                ),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(window, SENDER, environment)
+
+        app.agents = [target]
+        app._render_recipients(0, 6)
+        snapshot = window.snapshot()
+        host_heading = snapshot.line(2)
+        self.assertIn("…", host_heading)
+        self.assertTrue(host_heading.endswith("(1)"), snapshot.formatted())
+        self.assert_capture_in_bounds(snapshot)
+
     def test_semantic_layout_snapshots_cover_supported_terminal_sizes(self):
         for language, width, height in self.CASES:
             with self.subTest(language=language, size=f"{width}x{height}"):
@@ -298,18 +330,37 @@ class MessengerCursesSnapshotTest(SnapshotTestCase):
                     attributes=curses.A_BOLD,
                 )
 
-            unicode_row = self.assert_text_visible(
+            workspace_row = self.assert_text_visible(
                 snapshot,
                 "WT:決済-결제-Workspace",
                 unclipped=True,
             ).row
-            self.assertIn("amber-crane", snapshot.line(unicode_row))
-            self.assertIn("w1:p1", snapshot.line(unicode_row))
+            self.assertNotIn("(1)", snapshot.line(workspace_row))
+            self.assert_text_role(
+                snapshot,
+                "(1)",
+                pair=agent_messenger.PAIR_ACCENT,
+                attributes=curses.A_DIM,
+            )
+            agent_row = self.assert_text_visible(
+                snapshot,
+                "amber-crane",
+                unclipped=True,
+            ).row
+            self.assertEqual(agent_row, workspace_row + 1)
+            self.assertIn("w1:p1", snapshot.line(agent_row))
+            self.assertEqual(snapshot.line(agent_row).count("[x]"), 1)
             self.assert_text_role(
                 snapshot,
                 "amber-crane",
                 attributes=curses.A_BOLD,
             )
+            focused_row = self.assert_text_visible(
+                snapshot,
+                "red-fox",
+                unclipped=True,
+            ).row
+            self.assertEqual(snapshot.line(focused_row).count("›"), 1)
 
             self.assert_text_role(
                 snapshot,

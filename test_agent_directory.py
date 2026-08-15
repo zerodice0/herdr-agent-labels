@@ -15,6 +15,55 @@ import agent_directory
 
 
 class AgentDirectoryTest(unittest.TestCase):
+    def test_local_probe_preserves_snapshot_failure_details(self):
+        completed = subprocess.CompletedProcess(
+            ["herdr", "api", "snapshot"],
+            1,
+            "",
+            "Operation not permitted",
+        )
+        with mock.patch.object(
+            agent_directory,
+            "_run_command",
+            return_value=completed,
+        ):
+            result = agent_directory.probe_local_agents({})
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.agents, ())
+        self.assertEqual(result.error, "Operation not permitted")
+
+    def test_local_probe_rejects_invalid_snapshot_without_hiding_failure(self):
+        completed = subprocess.CompletedProcess(
+            ["herdr", "api", "snapshot"],
+            0,
+            '{"result": {}}',
+            "",
+        )
+        with mock.patch.object(
+            agent_directory,
+            "_run_command",
+            return_value=completed,
+        ):
+            result = agent_directory.probe_local_agents({})
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "invalid_response")
+
+    def test_local_agent_query_keeps_empty_on_failure_compatibility(self):
+        failed = agent_directory.ProbeResult(
+            "local",
+            (),
+            False,
+            "Operation not permitted",
+        )
+        with mock.patch.object(
+            agent_directory,
+            "probe_local_agents",
+            return_value=failed,
+        ):
+            self.assertEqual(agent_directory.query_local_agents({}), [])
+
     def test_parse_ssh_hosts_keeps_only_concrete_aliases(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "config"

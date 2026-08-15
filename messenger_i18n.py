@@ -23,8 +23,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "message": "Message",
         "message_placeholder": "Type a message...",
         "selected": "selected",
-        "group_agent": "1 agent",
-        "group_agents": "{count} agents",
+        "unknown_workspace": "unknown workspace",
         "local": "LOCAL",
         "remote": "REMOTE AGENTS",
         "discover_question": "Discover agents on SSH hosts?",
@@ -115,13 +114,12 @@ MESSAGES: dict[str, dict[str, str]] = {
         "send_prompt": "프롬프트 보내기",
         "from": "보내는 에이전트",
         "coordinator": "코디네이터",
-        "recipients": "받는 에이전트",
+        "recipients": "수신자",
         "search": "검색",
         "message": "메시지",
         "message_placeholder": "메시지를 입력하세요...",
         "selected": "선택됨",
-        "group_agent": "에이전트 1명",
-        "group_agents": "에이전트 {count}명",
+        "unknown_workspace": "알 수 없는 작업공간",
         "local": "현재 시스템",
         "remote": "원격 에이전트",
         "discover_question": "SSH 호스트의 에이전트를 탐색할까요?",
@@ -159,7 +157,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "no_focused_agent": "현재 포커스된 창에서 실행 중인 에이전트가 없습니다.",
         "popup_open_failed": "에이전트 메신저를 열 수 없습니다.",
         "sender_unavailable": "메시지를 보내는 에이전트를 더 이상 사용할 수 없습니다.",
-        "no_recipients": "받는 에이전트를 한 명 이상 선택하세요.",
+        "no_recipients": "수신자를 한 명 이상 선택하세요.",
         "empty_message": "전송할 메시지를 입력하세요.",
         "sending": "프롬프트를 전송하는 중...",
         "delegating": "코디네이터에게 오케스트레이션 요청을 전송하는 중...",
@@ -191,7 +189,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "Ctrl+O 모드  Ctrl+R 새로고침  Ctrl+G 스킬  Esc 닫기"
         ),
         "help_message": (
-            "Enter 줄바꿈  Tab 받는 에이전트  Ctrl+O 모드  Ctrl+S 전송  Ctrl+G 스킬  Esc 닫기"
+            "Enter 줄바꿈  Tab 수신자  Ctrl+O 모드  Ctrl+S 전송  Ctrl+G 스킬  Esc 닫기"
         ),
         "help_sending": "전송 중...  Esc 대기 중인 전송 취소",
         "help_discovery": (
@@ -209,8 +207,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "message": "メッセージ",
         "message_placeholder": "メッセージを入力してください...",
         "selected": "選択済み",
-        "group_agent": "1件",
-        "group_agents": "{count}件",
+        "unknown_workspace": "不明なワークスペース",
         "local": "ローカル",
         "remote": "リモートエージェント",
         "discover_question": "SSH ホストのエージェントを検索しますか？",

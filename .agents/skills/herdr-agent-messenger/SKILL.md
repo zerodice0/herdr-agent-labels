@@ -33,6 +33,9 @@ If the requested host or label is missing or ambiguous, report that and do not g
 Use each list result's `address` field for subsequent operations.
 The default list payload is compact. Use `list --verbose` only when a complete
 agent record is required; `list --legacy` is its compatibility alias.
+If local discovery returns `host_unavailable` with a sandbox or socket permission
+error, rerun the same bundled CLI command with the required local-socket access.
+Do not report the agent as missing unless discovery itself succeeded.
 
 Check one already-selected recipient without listing its host:
 

@@ -55,6 +55,26 @@ def agent(
 
 
 class AgentSkillCliTest(unittest.TestCase):
+    def test_local_discovery_reports_snapshot_permission_failure(self):
+        failed = agent_directory.ProbeResult(
+            "local",
+            (),
+            False,
+            "Operation not permitted",
+        )
+        with (
+            mock.patch.object(
+                agent_skill_cli,
+                "probe_local_agents",
+                return_value=failed,
+            ),
+            self.assertRaises(agent_skill_cli.SkillCommandError) as raised,
+        ):
+            agent_skill_cli.discover_agents("local", {})
+
+        self.assertEqual(raised.exception.code, "host_unavailable")
+        self.assertEqual(raised.exception.message, "Operation not permitted")
+
     def test_request_state_default_falls_back_to_legacy_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -223,7 +243,7 @@ class AgentSkillCliTest(unittest.TestCase):
             mock.patch.object(agent_skill_cli, "ssh_hosts", return_value=["shared"]),
             mock.patch.object(
                 agent_skill_cli,
-                "query_local_agents",
+                "probe_local_agents",
             ) as query_local,
             mock.patch.object(
                 agent_skill_cli,

@@ -96,6 +96,8 @@ class RecipientViewRow:
     agent_index: int
     agent: AgentRecord
     group_count: int = 0
+    group_label: str = ""
+    indent: int = 0
 
 
 @dataclass(frozen=True)
@@ -373,20 +375,28 @@ def estimated_recipient_counts(
     sender: AgentRecord,
     environment: Mapping[str, str],
 ) -> tuple[int, int]:
-    """Estimate popup rows from local agents and the last remote cache."""
+    """Estimate agent and hierarchy-header rows from current and cached records."""
 
-    local_count = sum(record.identity != sender.identity for record in local_agents)
-    remote_counts: list[int] = []
+    records = [
+        record for record in local_agents if record.identity != sender.identity
+    ]
     cache = AgentCache.from_environment(environment)
     for host in ssh_hosts(environment):
-        count = len(cache.agents(host))
-        if count:
-            remote_counts.append(count)
-    remote_count = sum(remote_counts)
-    if not remote_count:
-        return local_count, 0
-    group_count = len(remote_counts) + int(local_count > 0)
-    return local_count + remote_count, group_count
+        records.extend(cache.agents(host))
+    if not records:
+        return 0, 0
+
+    host_keys = {
+        MessengerApp._recipient_host_key(record) for record in records
+    }
+    workspace_keys = {
+        MessengerApp._recipient_workspace_key(record) for record in records
+    }
+    show_host_headers = len(host_keys) > 1 or any(not record.local for record in records)
+    header_count = len(workspace_keys)
+    if show_host_headers:
+        header_count += len(host_keys)
+    return len(records), header_count
 
 
 def launch_skill_guide(environment: Mapping[str, str] | None = None) -> int:
@@ -868,8 +878,20 @@ class MessengerApp:
         return host
 
     @staticmethod
-    def _recipient_group_key(agent: AgentRecord) -> tuple[bool, str]:
+    def _recipient_host_key(agent: AgentRecord) -> tuple[bool, str]:
         return agent.local, agent.host
+
+    @staticmethod
+    def _recipient_workspace_key(
+        agent: AgentRecord,
+    ) -> tuple[bool, str, str]:
+        workspace_key = (
+            agent.workspace_id
+            or agent.workspace_label
+            or agent.cwd
+            or agent.pane_id
+        )
+        return agent.local, agent.host, workspace_key
 
     def _recipient_view_rows(
         self,
@@ -877,25 +899,65 @@ class MessengerApp:
     ) -> list[RecipientViewRow]:
         if not records:
             return []
-        group_count = len(
-            {self._recipient_group_key(record) for record in records}
-        )
-        show_headers = group_count > 1 or any(not record.local for record in records)
-        rows: list[RecipientViewRow] = []
-        previous_key: tuple[bool, str] | None = None
-        counts: dict[tuple[bool, str], int] = {}
+
+        host_counts: dict[tuple[bool, str], int] = {}
+        workspace_counts: dict[tuple[bool, str, str], int] = {}
+        workspace_labels: dict[tuple[bool, str, str], str] = {}
+        label_keys: dict[
+            tuple[tuple[bool, str], str],
+            set[tuple[bool, str, str]],
+        ] = {}
         for record in records:
-            key = self._recipient_group_key(record)
-            counts[key] = counts.get(key, 0) + 1
+            host_key = self._recipient_host_key(record)
+            workspace_key = self._recipient_workspace_key(record)
+            workspace_label = (
+                workspace_display(record) or self.text["unknown_workspace"]
+            )
+            host_counts[host_key] = host_counts.get(host_key, 0) + 1
+            workspace_counts[workspace_key] = (
+                workspace_counts.get(workspace_key, 0) + 1
+            )
+            workspace_labels.setdefault(workspace_key, workspace_label)
+            label_keys.setdefault(
+                (host_key, workspace_label.casefold()),
+                set(),
+            ).add(workspace_key)
+
+        show_host_headers = len(host_counts) > 1 or any(
+            not record.local for record in records
+        )
+        rows: list[RecipientViewRow] = []
+        previous_host_key: tuple[bool, str] | None = None
+        previous_workspace_key: tuple[bool, str, str] | None = None
         for agent_index, record in enumerate(records):
-            key = self._recipient_group_key(record)
-            if show_headers and key != previous_key:
+            host_key = self._recipient_host_key(record)
+            workspace_key = self._recipient_workspace_key(record)
+            if show_host_headers and host_key != previous_host_key:
                 rows.append(
                     RecipientViewRow(
-                        kind="header",
+                        kind="host_header",
                         agent_index=agent_index,
                         agent=record,
-                        group_count=counts[key],
+                        group_count=host_counts[host_key],
+                        group_label=self._display_host(record.host),
+                    )
+                )
+            if workspace_key != previous_workspace_key:
+                workspace_label = workspace_labels[workspace_key]
+                duplicate_label = len(
+                    label_keys[(host_key, workspace_label.casefold())]
+                ) > 1
+                if duplicate_label:
+                    workspace_id = record.workspace_id or workspace_key[-1]
+                    workspace_label = f"{workspace_label} [{workspace_id}]"
+                rows.append(
+                    RecipientViewRow(
+                        kind="workspace_header",
+                        agent_index=agent_index,
+                        agent=record,
+                        group_count=workspace_counts[workspace_key],
+                        group_label=workspace_label,
+                        indent=2 if show_host_headers else 0,
                     )
                 )
             rows.append(
@@ -903,24 +965,51 @@ class MessengerApp:
                     kind="agent",
                     agent_index=agent_index,
                     agent=record,
+                    indent=4 if show_host_headers else 2,
                 )
             )
-            previous_key = key
+            previous_host_key = host_key
+            previous_workspace_key = workspace_key
         return rows
 
     @staticmethod
-    def _header_before(
+    def _sticky_headers_before(
         rows: Sequence[RecipientViewRow],
         offset: int,
-    ) -> RecipientViewRow | None:
-        if not rows or offset <= 0 or rows[offset].kind == "header":
-            return None
-        key = MessengerApp._recipient_group_key(rows[offset].agent)
+        max_headers: int,
+    ) -> list[RecipientViewRow]:
+        if not rows or offset <= 0 or max_headers <= 0:
+            return []
+        target = rows[offset].agent
+        host_key = MessengerApp._recipient_host_key(target)
+        workspace_key = MessengerApp._recipient_workspace_key(target)
+        host_header: RecipientViewRow | None = None
+        workspace_header: RecipientViewRow | None = None
         for index in range(offset - 1, -1, -1):
             row = rows[index]
-            if row.kind == "header":
-                return row if MessengerApp._recipient_group_key(row.agent) == key else None
-        return None
+            if (
+                workspace_header is None
+                and row.kind == "workspace_header"
+                and MessengerApp._recipient_workspace_key(row.agent) == workspace_key
+            ):
+                workspace_header = row
+            if (
+                host_header is None
+                and row.kind == "host_header"
+                and MessengerApp._recipient_host_key(row.agent) == host_key
+            ):
+                host_header = row
+            if workspace_header is not None and (
+                host_header is not None
+                or not any(candidate.kind == "host_header" for candidate in rows)
+            ):
+                break
+        headers = [
+            header
+            for header in (host_header, workspace_header)
+            if header is not None
+        ]
+        return headers[-max_headers:]
 
     def _visible_recipient_rows(
         self,
@@ -943,30 +1032,46 @@ class MessengerApp:
         if cursor_row < self.recipient_offset:
             self.recipient_offset = cursor_row
         while True:
-            sticky = self._header_before(rows, self.recipient_offset)
-            capacity = max(1, list_rows - int(sticky is not None and list_rows > 1))
+            sticky = self._sticky_headers_before(
+                rows,
+                self.recipient_offset,
+                max(0, list_rows - 1),
+            )
+            capacity = max(1, list_rows - len(sticky))
             if cursor_row < self.recipient_offset + capacity:
                 break
             self.recipient_offset = cursor_row - capacity + 1
-        sticky = self._header_before(rows, self.recipient_offset)
-        visible: list[RecipientViewRow] = []
-        if sticky is not None and list_rows > 1:
-            visible.append(sticky)
-        visible.extend(
-            rows[
-                self.recipient_offset : self.recipient_offset
-                + max(1, list_rows - len(visible))
-            ]
+        sticky = self._sticky_headers_before(
+            rows,
+            self.recipient_offset,
+            max(0, list_rows - 1),
         )
-        consumed_rows = max(1, list_rows - int(sticky is not None))
-        has_more = self.recipient_offset + consumed_rows < len(rows)
+        capacity = max(1, list_rows - len(sticky))
+        end = self.recipient_offset + capacity
+        visible = [
+            *sticky,
+            *rows[self.recipient_offset:end],
+        ]
+        has_more = end < len(rows)
         return visible, has_more
 
+    @staticmethod
+    def _group_header_parts(
+        row: RecipientViewRow,
+        max_width: int | None = None,
+    ) -> tuple[str, str]:
+        label = f'{" " * row.indent}▾ {row.group_label}'
+        show_count = row.kind == "host_header" or row.group_count > 1
+        count = f" ({row.group_count})" if show_count else ""
+        if count and max_width is not None:
+            label = truncate_display_text(
+                label,
+                max(0, max_width - display_width(count)),
+            )
+        return label, count
+
     def _group_header(self, row: RecipientViewRow) -> str:
-        host = self._display_host(row.agent.host)
-        key = "group_agent" if row.group_count == 1 else "group_agents"
-        suffix = self.text[key].format(count=row.group_count)
-        return f"▾ {host} · {suffix}"
+        return "".join(self._group_header_parts(row))
 
     def _recipient_line(
         self,
@@ -975,29 +1080,28 @@ class MessengerApp:
         state: str,
         *,
         focused: bool = False,
+        indent: int = 0,
     ) -> str:
         _height, width = self.screen.getmaxyx()
-        workspace = workspace_display(agent)
+        usable_width = max(1, width - indent)
         label = agent.name or agent.agent_kind or agent.pane_id
         pane = agent.pane_id
         cursor_marker = "›" if focused else " "
-        prefix = f"{cursor_marker} [{marker}] "
+        prefix = f'{" " * indent}{cursor_marker} [{marker}] '
         state_width = display_width(state)
-        if width >= 88:
-            label_width = min(20, max(14, width // 5))
+        if usable_width >= 84:
             pane_width = min(12, max(7, display_width(pane)))
-            workspace_width = max(
-                8,
-                width - label_width - pane_width - state_width - 11,
+            label_width = max(
+                14,
+                usable_width - pane_width - state_width - 9,
             )
             return (
                 prefix + f"{pad_display_text(label, label_width)} "
-                f"{pad_display_text(workspace, workspace_width)} "
                 f"{pad_display_text(pane, pane_width)} "
                 f"{state}"
             )
-        available = max(4, width - state_width - 8)
-        identity = f"{label} · {pane} · {workspace}"
+        available = max(4, usable_width - state_width - 8)
+        identity = f"{label} · {pane}"
         return f"{prefix}{truncate_display_text(identity, available)} {state}"
 
     def _status_attribute(self, agent: AgentRecord) -> int:
@@ -1355,6 +1459,7 @@ class MessengerApp:
         return row
 
     def _render_recipients(self, row: int, available_rows: int) -> int:
+        _height, width = self.screen.getmaxyx()
         records = self.filtered_agents()
         selected_count = len(self.selected)
         list_rows = max(1, available_rows - 2)
@@ -1392,7 +1497,11 @@ class MessengerApp:
 
         for visible_index, view_row in enumerate(visible):
             line_row = row + visible_index
-            if view_row.kind == "header":
+            if view_row.kind != "agent":
+                group_label, group_count = self._group_header_parts(
+                    view_row,
+                    max(1, width - 1),
+                )
                 header_attribute = self._style(
                     PAIR_ACCENT,
                     curses.A_BOLD,
@@ -1400,9 +1509,16 @@ class MessengerApp:
                 self._safe_add(
                     line_row,
                     0,
-                    self._group_header(view_row),
+                    group_label,
                     header_attribute,
                 )
+                if group_count:
+                    self._safe_add(
+                        line_row,
+                        display_width(group_label),
+                        group_count,
+                        self._style(PAIR_ACCENT, curses.A_DIM),
+                    )
                 continue
             agent = view_row.agent
             absolute_index = view_row.agent_index
@@ -1421,6 +1537,7 @@ class MessengerApp:
                 marker,
                 state,
                 focused=focused,
+                indent=view_row.indent,
             )
             if disabled:
                 line_attribute = curses.A_DIM
@@ -1432,14 +1549,14 @@ class MessengerApp:
             if focused:
                 self._safe_add(
                     line_row,
-                    0,
+                    view_row.indent,
                     "›",
                     self._style(PAIR_ACCENT, curses.A_BOLD),
                 )
             if agent.identity in self.selected:
                 self._safe_add(
                     line_row,
-                    2,
+                    view_row.indent + 2,
                     "[x]",
                     self._style(PAIR_ACCENT, curses.A_BOLD),
                 )
