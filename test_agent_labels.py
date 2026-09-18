@@ -3,6 +3,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -116,6 +117,25 @@ class AgentLabelsTest(unittest.TestCase):
         arguments = agent_labels.parse_cli_arguments(["label"])
         self.assertEqual(arguments.command, "label")
         self.assertIsNone(arguments.pane_id)
+
+    def test_run_herdr_reaches_the_binary_when_it_is_not_on_path(self):
+        """The herdr server hands plugin commands its own PATH, which may lack the binary."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory, "herdr")
+            binary.write_text('#!/bin/sh\necho "$@"\n', encoding="utf-8")
+            binary.chmod(0o700)
+            environment = {
+                **os.environ,
+                "HERDR_BIN_PATH": os.fspath(binary),
+                "PATH": "/nonexistent",
+            }
+
+            with mock.patch.dict(os.environ, environment, clear=True):
+                result = agent_labels.run_herdr("agent", "get", "w1:p1")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), "agent get w1:p1")
 
 
 if __name__ == "__main__":

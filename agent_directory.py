@@ -20,6 +20,7 @@ import time
 from typing import Any, Callable, Iterable, Mapping, Sequence, TypeVar
 
 
+DELETED_BINARY_SUFFIX = " (deleted)"
 REMOTE_DISCOVERY_TIMEOUT_SECONDS = 5.0
 REMOTE_CONNECT_TIMEOUT_SECONDS = 3
 REMOTE_CACHE_TTL_SECONDS = 10.0
@@ -97,7 +98,13 @@ def decode_json_object(value: str) -> dict[str, Any]:
 
 def herdr_executable(environment: Mapping[str, str] | None = None) -> str:
     values = os.environ if environment is None else environment
-    return values.get("HERDR_BIN_PATH") or "herdr"
+    recorded = values.get("HERDR_BIN_PATH") or ""
+    # A server that outlives a binary upgrade reports its own path with this suffix.
+    if recorded.endswith(DELETED_BINARY_SUFFIX):
+        recorded = recorded[: -len(DELETED_BINARY_SUFFIX)]
+    if recorded and os.path.isfile(recorded) and os.access(recorded, os.X_OK):
+        return recorded
+    return "herdr"
 
 
 def local_host_name() -> str:

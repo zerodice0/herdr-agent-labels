@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -555,6 +556,24 @@ class AgentDirectoryTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started_at, 1)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stderr, "cancelled")
+
+    def test_herdr_executable_trims_deleted_suffix_from_recorded_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory, "herdr")
+            binary.write_text("#!/bin/sh\n", encoding="utf-8")
+            binary.chmod(0o700)
+            environment = {"HERDR_BIN_PATH": f"{os.fspath(binary)} (deleted)"}
+
+            self.assertEqual(
+                agent_directory.herdr_executable(environment),
+                os.fspath(binary),
+            )
+
+    def test_herdr_executable_ignores_a_recorded_path_that_no_longer_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"HERDR_BIN_PATH": os.fspath(Path(directory, "uninstalled", "herdr"))}
+
+            self.assertEqual(agent_directory.herdr_executable(environment), "herdr")
 
 
 if __name__ == "__main__":

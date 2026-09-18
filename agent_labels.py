@@ -10,6 +10,8 @@ import os
 import subprocess
 from typing import Any, Iterator, NamedTuple
 
+from agent_directory import herdr_executable
+
 
 SOURCE = "herdr.agent-messenger"
 LEGACY_SOURCE = "herdr.agent-labels"
@@ -77,7 +79,7 @@ ALIASES = tuple(
 
 def run_herdr(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["herdr", *args],
+        [herdr_executable(), *args],
         capture_output=True,
         check=False,
         text=True,
