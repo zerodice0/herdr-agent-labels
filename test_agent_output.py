@@ -1,9 +1,24 @@
+import base64
+import json
 import unittest
+import zlib
 
 import agent_output
 
 
 class AgentOutputTest(unittest.TestCase):
+    def test_invalid_cursor_versions_and_deep_json_are_rejected(self):
+        cursor = self.read("before").cursor
+        data = zlib.decompress(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+        payload = json.loads(data)
+        invalid_states = [json.dumps({**payload, "v": version}) for version in (True, 1.0)]
+        invalid_states.append("[" * 1100 + "]" * 1100)
+        for state in invalid_states:
+            with self.subTest(state=state[:60]):
+                malformed = base64.urlsafe_b64encode(zlib.compress(state.encode())).decode()
+                with self.assertRaises(agent_output.InvalidOutputCursor):
+                    self.read("after", cursor=malformed)
+
     def read(
         self,
         snapshot: str,

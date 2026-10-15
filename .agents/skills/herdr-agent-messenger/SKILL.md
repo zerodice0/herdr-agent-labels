@@ -37,6 +37,14 @@ If local discovery returns `host_unavailable` with a sandbox or socket permissio
 error, rerun the same bundled CLI command with the required local-socket access.
 Do not report the agent as missing unless discovery itself succeeded.
 
+The same local-socket boundary applies to the other commands. Address discovery
+can return `host_unavailable`; request sender verification can return
+`sender_probe_failed`. If its detail identifies a sandbox or socket permission
+error, verification failed before prompt submission. Obtain local Herdr socket
+access and retry that exact undelivered request. For a batch, retry only items
+failed with this code; never replay delivered, submitted, unknown, or timed-out
+items.
+
 Check one already-selected recipient without listing its host:
 
 ```bash

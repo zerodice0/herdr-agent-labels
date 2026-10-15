@@ -676,6 +676,17 @@ class AgentSkillCliTest(unittest.TestCase):
         self.assertEqual(payload["status"], "succeeded")
         self.assertEqual(payload["results"][0]["status"], "submitted")
 
+    def test_no_wait_batch_does_not_turn_uncertain_submission_into_failure(self):
+        with mock.patch.object(agent_skill_cli, "send_command", side_effect=agent_skill_cli.SkillCommandError(
+            "prompt_acceptance_unknown", "Connection lost after possible delivery.",
+        )):
+            result = agent_skill_cli.batch_command(
+                requests_json='[{"route":"worker","message":"work"}]',
+                wait=False, timeout_ms=1000, max_workers=1, environment={},
+            )
+        self.assertEqual(result["results"][0]["status"], "timeout")
+        self.assertEqual(result["results"][0]["error"], "prompt_acceptance_unknown")
+
     def test_batch_normalizes_future_request_lifecycle_payloads(self):
         cases = (
             ({"state": "submitted_settled"}, "succeeded"),
@@ -698,6 +709,8 @@ class AgentSkillCliTest(unittest.TestCase):
                 "timeout",
             ),
             ({"state": "submission_failed", "error": "rejected"}, "failed"),
+            ({"state": "submitted_unknown", "submitted": None, "terminal": True}, "timeout"),
+            ({"state": "submitted_unknown", "submitted": None, "cancelled": True}, "timeout"),
         )
         for lifecycle_payload, expected in cases:
             with self.subTest(payload=lifecycle_payload):
@@ -881,25 +894,64 @@ class AgentSkillCliTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "invalid_cursor")
 
-    def test_sender_must_be_a_current_agent(self):
+    def test_sender_requires_invoking_pane_context(self):
         with (
-            mock.patch.object(
-                agent_skill_cli,
-                "fetch_local_agent",
-                return_value=None,
-            ),
             self.assertRaises(agent_skill_cli.SkillCommandError) as raised,
         ):
             agent_skill_cli.current_sender({})
         self.assertEqual(raised.exception.code, "sender_unavailable")
+        self.assertIn("HERDR_PANE_ID", raised.exception.message)
+
+    def test_sender_preserves_snapshot_permission_failure(self):
+        failed = agent_directory.ProbeResult(
+            "local",
+            (),
+            False,
+            "Operation not permitted",
+        )
+        with (
+            mock.patch.object(
+                agent_skill_cli,
+                "probe_local_agents",
+                return_value=failed,
+            ),
+            self.assertRaises(agent_skill_cli.SkillCommandError) as raised,
+        ):
+            agent_skill_cli.current_sender({"HERDR_PANE_ID": "w1:p1"})
+
+        self.assertEqual(raised.exception.code, "sender_probe_failed")
+        self.assertIn("Operation not permitted", raised.exception.message)
+        self.assertIn("No prompt was submitted", raised.exception.message)
+
+    def test_sender_reports_current_pane_without_agent(self):
+        other = agent(name="blue-raven", pane_id="w2:p1")
+        available = agent_directory.ProbeResult("local", (other,), True)
+        with (
+            mock.patch.object(
+                agent_skill_cli,
+                "probe_local_agents",
+                return_value=available,
+            ),
+            self.assertRaises(agent_skill_cli.SkillCommandError) as raised,
+        ):
+            agent_skill_cli.current_sender({"HERDR_PANE_ID": "w1:p1"})
+
+        self.assertEqual(raised.exception.code, "sender_unavailable")
+        self.assertIn("w1:p1", raised.exception.message)
+        self.assertIn("No prompt was submitted", raised.exception.message)
 
     def test_sender_uses_only_the_invoking_pane_environment(self):
         sender = agent(name="blue-raven", pane_id="w1:p1")
+        active = agent(name="red-fox", pane_id="w9:p9")
         with mock.patch.object(
             agent_skill_cli,
-            "fetch_local_agent",
-            return_value=sender,
-        ) as fetch:
+            "probe_local_agents",
+            return_value=agent_directory.ProbeResult(
+                "local",
+                (active, sender),
+                True,
+            ),
+        ) as probe:
             self.assertEqual(
                 agent_skill_cli.current_sender(
                     {
@@ -909,7 +961,7 @@ class AgentSkillCliTest(unittest.TestCase):
                 ),
                 sender,
             )
-        self.assertEqual(fetch.call_args.args[0], "w1:p1")
+        self.assertEqual(probe.call_args.args[0]["HERDR_PANE_ID"], "w1:p1")
 
     def test_send_parser_has_no_sender_override(self):
         with (
@@ -976,6 +1028,43 @@ class AgentSkillCliTest(unittest.TestCase):
         self.assertEqual(arguments.max_workers, 3)
         self.assertFalse(arguments.wait)
 
+    def test_request_main_surfaces_sender_probe_failure(self):
+        output = StringIO()
+        failure = agent_skill_cli.SkillCommandError(
+            "sender_probe_failed",
+            "Could not verify the current sender: Operation not permitted. "
+            "No prompt was submitted.",
+        )
+        with (
+            mock.patch.object(
+                agent_skill_cli,
+                "request_command",
+                side_effect=failure,
+            ),
+            mock.patch("sys.stdout", output),
+        ):
+            exit_code = agent_skill_cli.main(
+                [
+                    "request",
+                    "--route",
+                    "route-token",
+                    "--message",
+                    "hello",
+                ],
+                {},
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "error": {
+                    "code": "sender_probe_failed",
+                    "message": failure.message,
+                }
+            },
+        )
+
     def test_batch_main_returns_nonzero_partial_result_as_compact_json(self):
         result = {
             "status": "partial",
@@ -1038,6 +1127,7 @@ class AgentSkillWrapperTest(unittest.TestCase):
             self.wrapper.find_plugin_root(
                 Path("/tmp/copied-skill/scripts/herdr_agent_messenger.py"),
                 runner,
+                {},
             ),
             plugin_root,
         )
@@ -1052,6 +1142,32 @@ class AgentSkillWrapperTest(unittest.TestCase):
                 "herdr.agent-messenger",
             ],
         )
+
+    def test_standalone_wrapper_uses_injected_herdr_binary(self):
+        plugin_root = Path(__file__).resolve().parent
+        completed = subprocess.CompletedProcess(
+            ["/opt/herdr"],
+            0,
+            json.dumps(
+                {
+                    "result": {
+                        "plugins": [{"plugin_root": str(plugin_root)}],
+                    }
+                }
+            ),
+            "",
+        )
+        runner = mock.Mock(return_value=completed)
+
+        self.assertEqual(
+            self.wrapper.find_plugin_root(
+                Path("/tmp/copied-skill/scripts/herdr_agent_messenger.py"),
+                runner,
+                {"HERDR_BIN_PATH": "/opt/herdr"},
+            ),
+            plugin_root,
+        )
+        self.assertEqual(runner.call_args.args[0][0], "/opt/herdr")
 
     def test_standalone_wrapper_falls_back_to_legacy_plugin_id(self):
         plugin_root = Path(__file__).resolve().parent
@@ -1105,6 +1221,33 @@ class AgentSkillWrapperTest(unittest.TestCase):
                     Path("/tmp/copied-skill/scripts/herdr_agent_messenger.py"),
                     mock.Mock(return_value=completed),
                 )
+
+    def test_standalone_wrapper_preserves_plugin_probe_failure(self):
+        failed = subprocess.CompletedProcess(
+            ["herdr"],
+            1,
+            "",
+            "Operation not permitted",
+        )
+        with self.assertRaises(SystemExit) as raised:
+            self.wrapper.find_plugin_root(
+                Path("/tmp/copied-skill/scripts/herdr_agent_messenger.py"),
+                mock.Mock(return_value=failed),
+            )
+
+        self.assertIn("Could not query HAM plugins", str(raised.exception))
+        self.assertIn("Operation not permitted", str(raised.exception))
+        self.assertIn("local Herdr socket access", str(raised.exception))
+
+    def test_standalone_wrapper_preserves_plugin_command_launch_failure(self):
+        with self.assertRaises(SystemExit) as raised:
+            self.wrapper.find_plugin_root(
+                Path("/tmp/copied-skill/scripts/herdr_agent_messenger.py"),
+                mock.Mock(side_effect=OSError("herdr unavailable")),
+            )
+
+        self.assertIn("Could not query HAM plugins", str(raised.exception))
+        self.assertIn("herdr unavailable", str(raised.exception))
 
 
 if __name__ == "__main__":

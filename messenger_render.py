@@ -36,6 +36,10 @@ DELIVERY_DIRECT = "direct"
 class MessengerRenderMixin:
     """Render a controller that provides messenger state and view helpers."""
 
+    def _message_editor_width(self) -> int:
+        _height, width = self.screen.getmaxyx()
+        return max(1, width - 5)
+
     def _initialize_colors(self) -> None:
         if not curses.has_colors():
             return
@@ -110,10 +114,13 @@ class MessengerRenderMixin:
 
     def _safe_add(self, row: int, column: int, value: str, attribute: int = 0) -> None:
         height, width = self.screen.getmaxyx()
-        if row < 0 or row >= height or column >= width - 1:
+        if row < 0 or row >= height or column < 0 or column >= width - 1:
             return
+        available = width - column - 1
         try:
-            self.screen.addnstr(row, column, value, max(0, width - column - 1), attribute)
+            self.screen.addnstr(
+                row, column, truncate_display_text(value, available), available, attribute,
+            )
         except curses.error:
             pass
 
@@ -334,10 +341,9 @@ class MessengerRenderMixin:
         row += 1
         visible_rows = max(2, available_rows - 1)
         _height, width = self.screen.getmaxyx()
-        editor_width = max(1, width - 5)
         wrapped_lines, cursor_row, cursor_column = wrap_message_lines(
             self.message_lines,
-            width=editor_width,
+            width=self._message_editor_width(),
             cursor_row=self.message_row,
             cursor_column=self.message_column,
         )

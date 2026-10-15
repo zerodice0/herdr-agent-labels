@@ -584,14 +584,6 @@ def _planned_result(
     commands.extend(
         [
             (
-                "enable",
-                enabled_command(host, enabled=True, config_path=config_path),
-            ),
-            ("enabled-metadata", plugin_list_command(host, config_path=config_path)),
-            ("config", config_check_command(host, config_path=config_path)),
-            ("reload", reload_command(host, config_path=config_path)),
-            ("actions", action_list_command(host, config_path=config_path)),
-            (
                 "legacy-disable",
                 enabled_command(
                     host,
@@ -601,12 +593,24 @@ def _planned_result(
                 ),
             ),
             (
+                "enable",
+                enabled_command(host, enabled=True, config_path=config_path),
+            ),
+            ("enabled-metadata", plugin_list_command(host, config_path=config_path)),
+            ("config", config_check_command(host, config_path=config_path)),
+            ("reload", reload_command(host, config_path=config_path)),
+            ("actions", action_list_command(host, config_path=config_path)),
+            (
                 "legacy-uninstall",
                 uninstall_command(
                     host,
                     plugin_id=LEGACY_PLUGIN_ID,
                     config_path=config_path,
                 ),
+            ),
+            (
+                "migration-metadata",
+                plugin_list_command(host, plugin_id=None, config_path=config_path),
             ),
         ]
     )
@@ -983,6 +987,7 @@ def _rollout_host(
             runner,
         )
         if legacy_disabled.returncode != 0:
+            host_result.add("migration", "fail", _command_failure(legacy_disabled))
             return _abort_after_install(
                 host_result,
                 host,

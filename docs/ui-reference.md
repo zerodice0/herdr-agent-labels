@@ -54,6 +54,16 @@ blocked, and warning states.
 The UI follows `LC_ALL`, `LC_MESSAGES`, or `LANG` and supports English, Japanese,
 and Korean. Unsupported locales fall back to English.
 
+Vertical cursor movement follows the same wrapping as the message display.
+Long labels and status text are clipped by terminal cell width so Korean and
+Japanese text cannot spill into the next row.
+
+Cancelling a send preserves confirmed deliveries. Recipients that already
+received the prompt, or whose acceptance is uncertain after an interrupted
+connection, are deselected. The popup identifies uncertain delivery so recipients
+can be checked before another send. Pending and definitely failed recipients
+remain selected in direct mode.
+
 ## Keyboard controls
 
 - `Up` / `Down`: move through choices, recipients, or message lines

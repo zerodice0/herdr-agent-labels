@@ -86,12 +86,25 @@ class SendResult:
     agent: AgentRecord
     success: bool
     error: str = ""
+    submission_unknown: bool = False
+
+
+def submission_failure_is_uncertain(
+    result: subprocess.CompletedProcess[str], *, remote: bool = False,
+) -> bool:
+    detail = result.stderr.strip().lower()
+    return (
+        result.returncode < 0
+        or (remote and result.returncode == 255)
+        or detail in {"cancelled", "output_limit_exceeded"}
+        or "timed out after" in detail
+    )
 
 
 def decode_json_object(value: str) -> dict[str, Any]:
     try:
         decoded = json.loads(value)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
         return {}
     return decoded if isinstance(decoded, dict) else {}
 
@@ -130,6 +143,17 @@ def agent_label(raw_agent: Mapping[str, Any]) -> tuple[str, str]:
         # addressable while routing by the pane ID that belongs to this snapshot.
         return alias, pane_id
     return "", pane_id
+
+
+def _agent_revision(value: Any) -> int:
+    if value is None or value == "":
+        return 0
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("invalid agent revision")
+    revision = int(value)
+    if revision < 0:
+        raise ValueError("invalid agent revision")
+    return revision
 
 
 def parse_agent_payload(
@@ -194,7 +218,7 @@ def parse_agent_payload(
                 session_id=session_id,
                 cwd=cwd,
                 local=local,
-                revision=int(raw_agent.get("revision") or 0),
+                revision=_agent_revision(raw_agent.get("revision")),
                 agent_kind=agent_kind,
                 terminal_id=str(raw_agent.get("terminal_id") or ""),
                 workspace_is_worktree=workspace_is_worktree,
@@ -211,6 +235,16 @@ def is_agent_list_payload(payload: Mapping[str, Any]) -> bool:
     snapshot = result_data.get("snapshot")
     container = snapshot if isinstance(snapshot, dict) else result_data
     return isinstance(container.get("agents"), list)
+
+
+def _probe_payload(payload: Mapping[str, Any], *, host: str, local: bool) -> ProbeResult:
+    if not is_agent_list_payload(payload):
+        return ProbeResult(host, (), False, "invalid_response")
+    try:
+        agents = tuple(parse_agent_payload(payload, host=host, local=local))
+    except (TypeError, ValueError, OverflowError):
+        return ProbeResult(host, (), False, "invalid_response")
+    return ProbeResult(host, agents, True)
 
 
 class OutputLimitExceeded(Exception):
@@ -257,10 +291,18 @@ def _communicate_bounded(
                 buffers[key.data].extend(chunk)
                 if sum(len(buffer) for buffer in buffers.values()) > output_limit:
                     raise OutputLimitExceeded
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise subprocess.TimeoutExpired(process.args, timeout)
-        process.wait(timeout=remaining)
+        # Closing both pipes does not mean the child has exited. Continue to
+        # honor cancellation while it finishes without producing more output.
+        while process.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise CommandCancelled
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            try:
+                process.wait(timeout=min(remaining, 0.1))
+            except subprocess.TimeoutExpired:
+                continue
     finally:
         selector.close()
         for stream in streams.values():
@@ -279,6 +321,8 @@ def _run_command(
     timeout: float = REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     cancel_event: threading.Event | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if cancel_event is not None and cancel_event.is_set():
+        return subprocess.CompletedProcess(list(command), 1, "", "cancelled")
     try:
         process = subprocess.Popen(
             list(command),
@@ -354,13 +398,7 @@ def probe_local_agents(
         detail = result.stderr.strip() or result.stdout.strip() or "unavailable"
         return ProbeResult(host, (), False, detail)
     payload = decode_json_object(result.stdout)
-    if not is_agent_list_payload(payload):
-        return ProbeResult(host, (), False, "invalid_response")
-    return ProbeResult(
-        host,
-        tuple(parse_agent_payload(payload, host=host, local=True)),
-        True,
-    )
+    return _probe_payload(payload, host=host, local=True)
 
 
 def fetch_local_agent(
@@ -369,13 +407,11 @@ def fetch_local_agent(
     *,
     cancel_event: threading.Event | None = None,
 ) -> AgentRecord | None:
-    command = [herdr_executable(environment), "api", "snapshot"]
-    result = _run_command(command, cancel_event=cancel_event)
-    if result.returncode != 0:
-        return None
-    payload = decode_json_object(result.stdout)
-    records = parse_agent_payload(payload, host=local_host_name(), local=True)
-    return next((record for record in records if record.pane_id == pane_id), None)
+    probe = probe_local_agents(environment, cancel_event=cancel_event)
+    return next(
+        (record for record in probe.agents if record.pane_id == pane_id),
+        None,
+    )
 
 
 def ssh_config_path(environment: Mapping[str, str] | None = None) -> Path:
@@ -422,7 +458,7 @@ def parse_ssh_hosts_allowlist(path: Path) -> list[str] | None:
         lines = path.expanduser().read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
         return None
-    except OSError:
+    except (OSError, UnicodeError):
         return []
     hosts: list[str] = []
     for line in lines:
@@ -451,7 +487,7 @@ def parse_ssh_hosts(
     visited.add(resolved_path)
     try:
         lines = resolved_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except (OSError, UnicodeError):
         return []
 
     hosts: list[str] = []
@@ -594,10 +630,7 @@ def query_remote_agents(
     if result.returncode != 0:
         return ProbeResult(host, (), False, result.stderr.strip() or "unavailable")
     payload = extract_agent_list_payload(result.stdout)
-    if not is_agent_list_payload(payload):
-        return ProbeResult(host, (), False, "invalid_response")
-    agents = parse_agent_payload(payload, host=host, local=False)
-    return ProbeResult(host, tuple(agents), True)
+    return _probe_payload(payload, host=host, local=False)
 
 
 def extract_agent_list_payload(value: str) -> dict[str, Any]:
@@ -644,7 +677,7 @@ class AgentCache:
     def _load(self) -> dict[str, Any]:
         try:
             decoded = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
             return {"version": 1, "hosts": {}}
         if not isinstance(decoded, dict) or not isinstance(decoded.get("hosts"), dict):
             return {"version": 1, "hosts": {}}
@@ -663,7 +696,8 @@ class AgentCache:
         if not isinstance(updated_at, (int, float)):
             return False
         ttl = REMOTE_CACHE_TTL_SECONDS if entry.get("reachable") else REMOTE_FAILURE_TTL_SECONDS
-        return (time.time() if now is None else now) - float(updated_at) <= ttl
+        age = (time.time() if now is None else now) - float(updated_at)
+        return 0 <= age <= ttl
 
     def agents(self, host: str, *, stale: bool = False) -> list[AgentRecord]:
         entry = self.host_entry(host)
@@ -679,6 +713,21 @@ class AgentCache:
                 values = {key: raw_agent[key] for key in fields if key in raw_agent}
                 record = AgentRecord(**values)
             except (KeyError, TypeError):
+                continue
+            if (
+                any(
+                    not isinstance(getattr(record, field), str)
+                    for field in (
+                        "host", "name", "pane_id", "workspace_id", "workspace_label",
+                        "status", "session_id", "cwd", "agent_kind", "terminal_id", "route_target",
+                    )
+                )
+                or record.host != host
+                or record.local is not False
+                or type(record.revision) is not int
+                or record.revision < 0
+                or type(record.workspace_is_worktree) is not bool
+            ):
                 continue
             records.append(replace(record, stale=stale))
         return records
@@ -820,11 +869,7 @@ class RemoteDiscovery:
                 self.results.put(ProbeResult(host, (), False, stderr.strip() or "unavailable"))
                 return
             payload = extract_agent_list_payload(stdout)
-            if not is_agent_list_payload(payload):
-                self.results.put(ProbeResult(host, (), False, "invalid_response"))
-                return
-            agents = parse_agent_payload(payload, host=host, local=False)
-            self.results.put(ProbeResult(host, tuple(agents), True))
+            self.results.put(_probe_payload(payload, host=host, local=False))
         finally:
             if process is not None:
                 with self._process_lock:
@@ -852,13 +897,12 @@ class RemoteDiscovery:
 
 def _matching_agent(selected: AgentRecord, current: Sequence[AgentRecord]) -> AgentRecord | None:
     if selected.session_id:
-        for candidate in current:
-            if candidate.session_id == selected.session_id:
-                return candidate
-        return None
+        matches = [candidate for candidate in current if candidate.session_id == selected.session_id]
+        return matches[0] if len(matches) == 1 else None
     if selected.revision <= 0:
         return None
-    for candidate in current:
+    matches = [
+        candidate for candidate in current
         if (
             candidate.pane_id == selected.pane_id
             and candidate.target == selected.target
@@ -866,9 +910,9 @@ def _matching_agent(selected: AgentRecord, current: Sequence[AgentRecord]) -> Ag
             and candidate.agent_kind == selected.agent_kind
             and candidate.terminal_id == selected.terminal_id
             and candidate.cwd == selected.cwd
-        ):
-            return candidate
-    return None
+        )
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _run_bounded_tasks(
@@ -926,7 +970,10 @@ def _send_local_prompt(
         [herdr_executable(environment), "agent", "prompt", target.target, prompt],
         cancel_event=cancel_event,
     )
-    return SendResult(target, result.returncode == 0, result.stderr.strip())
+    return SendResult(
+        target, result.returncode == 0, result.stderr.strip(),
+        submission_unknown=result.returncode != 0 and submission_failure_is_uncertain(result),
+    )
 
 
 def _send_remote_prompt(
@@ -944,7 +991,10 @@ def _send_remote_prompt(
         ),
         cancel_event=cancel_event,
     )
-    return SendResult(target, result.returncode == 0, result.stderr.strip())
+    return SendResult(
+        target, result.returncode == 0, result.stderr.strip(),
+        submission_unknown=result.returncode != 0 and submission_failure_is_uncertain(result, remote=True),
+    )
 
 
 def _dispatch_host_group(

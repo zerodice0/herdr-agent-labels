@@ -16,6 +16,68 @@ import agent_directory
 
 
 class AgentDirectoryTest(unittest.TestCase):
+    def test_malformed_revisions_fail_local_and_remote_probes_cleanly(self):
+        for revision in ("bad", [], {}, True, 1.5, -1):
+            payload = {"result": {"agents": [
+                {"pane_id": "w:p1", "agent": "codex", "revision": revision},
+            ]}}
+            result = subprocess.CompletedProcess(["herdr"], 0, json.dumps(payload), "")
+            with self.subTest(revision=revision), mock.patch.object(
+                agent_directory, "_run_command", return_value=result,
+            ):
+                local = agent_directory.probe_local_agents({})
+                remote = agent_directory.query_remote_agents("remote", config_path=Path("/tmp/config"))
+            for probe in (local, remote):
+                self.assertFalse(probe.success)
+                self.assertEqual(probe.error, "invalid_response")
+
+    def test_async_discovery_reports_malformed_agent_data(self):
+        discovery = agent_directory.RemoteDiscovery(["remote"], config_path=Path("/tmp/config"))
+        discovery.deadline = time.monotonic() + 5
+        process = mock.Mock(returncode=0)
+        payload = json.dumps({"result": {"agents": [
+            {"pane_id": "w:p1", "agent": "codex", "revision": "bad"},
+        ]}})
+        with (
+            mock.patch.object(agent_directory.subprocess, "Popen", return_value=process),
+            mock.patch.object(agent_directory, "_communicate_bounded", return_value=(payload, "")),
+        ):
+            discovery._probe_host("remote")
+        self.assertEqual(discovery.poll(), [
+            agent_directory.ProbeResult("remote", (), False, "invalid_response"),
+        ])
+
+    def test_cache_rejects_invalid_fields_and_transport_scope(self):
+        record = agent_directory.AgentRecord(
+            "remote", "worker", "w:p1", "w", "work", "idle", "session", "/work", False,
+        )
+        invalid_fields = (
+            {"name": []}, {"revision": "1"}, {"revision": True},
+            {"host": "another-host"}, {"local": True},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cache = agent_directory.AgentCache(Path(directory) / "cache.json")
+            for changed in invalid_fields:
+                with self.subTest(changed=changed):
+                    cache.update(agent_directory.ProbeResult("remote", (record,), True))
+                    cache.host_entry("remote")["agents"][0].update(changed)
+                    self.assertEqual(cache.agents("remote"), [])
+
+    def test_non_utf8_cache_and_ssh_files_are_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid"
+            path.write_bytes(b"\xff")
+            self.assertEqual(agent_directory.AgentCache(path).agents("remote"), [])
+            self.assertEqual(agent_directory.parse_ssh_hosts(path), [])
+            self.assertEqual(agent_directory.parse_ssh_hosts_allowlist(path), [])
+
+    def test_future_cache_timestamp_requires_a_new_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = agent_directory.AgentCache(Path(directory) / "cache.json")
+            cache.update(agent_directory.ProbeResult("remote", (), True))
+            updated = cache.host_entry("remote")["updated_at"]
+            self.assertFalse(cache.is_fresh("remote", updated - 100))
+
     def test_local_probe_preserves_snapshot_failure_details(self):
         completed = subprocess.CompletedProcess(
             ["herdr", "api", "snapshot"],
@@ -64,6 +126,45 @@ class AgentDirectoryTest(unittest.TestCase):
             return_value=failed,
         ):
             self.assertEqual(agent_directory.query_local_agents({}), [])
+
+    def test_fetch_local_agent_reuses_probe_and_selects_invoking_pane(self):
+        first = agent_directory.AgentRecord(
+            host="local",
+            name="blue-eagle",
+            pane_id="w1:p1",
+            workspace_id="w1",
+            workspace_label="project",
+            status="idle",
+            session_id="session-1",
+            cwd="/work/project",
+            local=True,
+        )
+        second = agent_directory.replace(
+            first,
+            name="red-gecko",
+            pane_id="w1:p2",
+            session_id="session-2",
+        )
+        probe = agent_directory.ProbeResult("local", (first, second), True)
+        cancel = threading.Event()
+        with mock.patch.object(
+            agent_directory,
+            "probe_local_agents",
+            return_value=probe,
+        ) as local_probe:
+            self.assertEqual(
+                agent_directory.fetch_local_agent(
+                    "w1:p2",
+                    {"HERDR_BIN_PATH": "/opt/herdr"},
+                    cancel_event=cancel,
+                ),
+                second,
+            )
+
+        local_probe.assert_called_once_with(
+            {"HERDR_BIN_PATH": "/opt/herdr"},
+            cancel_event=cancel,
+        )
 
     def test_parse_ssh_hosts_keeps_only_concrete_aliases(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -535,6 +636,26 @@ class AgentDirectoryTest(unittest.TestCase):
             selected,
         )
 
+    def test_direct_delivery_rejects_duplicate_occupant_matches(self):
+        for session_id in ("shared-session", ""):
+            selected = agent_directory.AgentRecord(
+                "local", "worker", "w:p1", "w", "work", "idle", session_id, "/work", True,
+                revision=1, agent_kind="codex", terminal_id="term",
+            )
+            with self.subTest(session_id=session_id):
+                self.assertIsNone(agent_directory._matching_agent(selected, [selected, selected]))
+
+    def test_direct_remote_delivery_preserves_unknown_acceptance(self):
+        target = agent_directory.AgentRecord(
+            "remote", "worker", "w:p1", "w", "work", "idle", "session", "/work", False,
+        )
+        with mock.patch.object(agent_directory, "_run_command", return_value=subprocess.CompletedProcess(
+            ["ssh"], 255, "", "Connection lost",
+        )):
+            result = agent_directory._send_remote_prompt(target, "work", config_path=Path("/tmp/config"))
+        self.assertFalse(result.success)
+        self.assertTrue(result.submission_unknown)
+
     def test_remote_discovery_creates_at_most_max_workers_threads(self):
         discovery = agent_directory.RemoteDiscovery(
             [f"host-{index}" for index in range(100)],
@@ -574,6 +695,32 @@ class AgentDirectoryTest(unittest.TestCase):
             environment = {"HERDR_BIN_PATH": os.fspath(Path(directory, "uninstalled", "herdr"))}
 
             self.assertEqual(agent_directory.herdr_executable(environment), "herdr")
+
+    def test_cancelled_command_never_starts_a_process(self):
+        cancelled = threading.Event()
+        cancelled.set()
+        with mock.patch.object(agent_directory.subprocess, "Popen") as launch:
+            result = agent_directory.run_bounded_command(
+                ["herdr", "agent", "prompt", "worker", "do work"],
+                cancel_event=cancelled,
+            )
+        launch.assert_not_called()
+        self.assertEqual(result.stderr, "cancelled")
+
+    def test_cancellation_still_works_after_both_output_pipes_close(self):
+        cancelled = threading.Event()
+        timer = threading.Timer(0.2, cancelled.set)
+        timer.start()
+        try:
+            result = agent_directory.run_bounded_command(
+                [sys.executable, "-c", "import os,time; os.close(1); os.close(2); time.sleep(10)"],
+                timeout=2,
+                cancel_event=cancelled,
+            )
+        finally:
+            timer.cancel()
+            timer.join()
+        self.assertEqual(result.stderr, "cancelled")
 
 
 if __name__ == "__main__":

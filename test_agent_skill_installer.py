@@ -8,6 +8,144 @@ import agent_skill_installer
 
 
 class AgentSkillInstallerTest(unittest.TestCase):
+    @staticmethod
+    def create_skill(directory, marker):
+        (directory / "scripts").mkdir(parents=True)
+        (directory / "SKILL.md").write_text(
+            f"---\nname: herdr-agent-messenger\n---\n{marker}\n", encoding="utf-8",
+        )
+        (directory / "scripts" / "herdr_agent_messenger.py").write_text(marker, encoding="utf-8")
+        return directory
+
+    def test_failed_update_keeps_the_previous_installation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.create_skill(root / "source", "new")
+            destination = self.create_skill(root / "installed", "old")
+            original_copy = agent_skill_installer.shutil.copytree
+
+            def interrupted_copy(src, dst, *args, **kwargs):
+                result = original_copy(src, dst, *args, **kwargs)
+                if Path(src).resolve() == source.resolve():
+                    raise OSError("copy interrupted")
+                return result
+
+            with (
+                mock.patch.object(agent_skill_installer.shutil, "copytree", side_effect=interrupted_copy),
+                self.assertRaisesRegex(OSError, "copy interrupted"),
+            ):
+                agent_skill_installer.install_skill(destination, source)
+            self.assertTrue((destination / "SKILL.md").read_text().endswith("old\n"))
+            self.assertEqual((destination / "scripts/herdr_agent_messenger.py").read_text(), "old")
+
+    def test_activation_failure_restores_previous_installation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.create_skill(root / "source", "new")
+            destination = self.create_skill(root / "installed", "old")
+            original_replace = agent_skill_installer.os.replace
+
+            def interrupted_activation(src, dst):
+                if Path(src).name == "skill":
+                    raise OSError("activation interrupted")
+                return original_replace(src, dst)
+
+            with (
+                mock.patch.object(agent_skill_installer.os, "replace", side_effect=interrupted_activation),
+                self.assertRaisesRegex(OSError, "activation interrupted"),
+            ):
+                agent_skill_installer.install_skill(destination, source)
+            self.assertEqual((destination / "scripts/herdr_agent_messenger.py").read_text(), "old")
+            self.assertEqual(sorted(path.name for path in root.iterdir()), ["installed", "source"])
+
+    def test_keyboard_interrupt_during_activation_restores_previous_installation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.create_skill(root / "source", "new")
+            destination = self.create_skill(root / "installed", "old")
+            original_replace = agent_skill_installer.os.replace
+
+            def interrupted_activation(src, dst):
+                if Path(src).name == "skill":
+                    raise KeyboardInterrupt
+                return original_replace(src, dst)
+
+            with (
+                mock.patch.object(agent_skill_installer.os, "replace", side_effect=interrupted_activation),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                agent_skill_installer.install_skill(destination, source)
+            self.assertEqual((destination / "scripts/herdr_agent_messenger.py").read_text(), "old")
+
+    def test_failed_restoration_retains_a_recoverable_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.create_skill(root / "source", "new")
+            destination = self.create_skill(root / "installed", "old")
+            original_replace = agent_skill_installer.os.replace
+
+            def interrupted_activation(src, dst):
+                if Path(src).name in {"skill", "previous"}:
+                    raise OSError("activation interrupted")
+                return original_replace(src, dst)
+
+            with (
+                mock.patch.object(agent_skill_installer.os, "replace", side_effect=interrupted_activation),
+                self.assertRaisesRegex(OSError, "backup retained at") as error,
+            ):
+                agent_skill_installer.install_skill(destination, source)
+            backups = list(root.glob(".installed.*/previous"))
+            self.assertEqual(len(backups), 1)
+            self.assertIn(str(backups[0]), str(error.exception))
+            self.assertEqual((backups[0] / "scripts/herdr_agent_messenger.py").read_text(), "old")
+
+    def test_non_utf8_skill_is_a_conflict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory)
+            (destination / "SKILL.md").write_bytes(b"\xff")
+            self.assertEqual(
+                agent_skill_installer.installation_status(destination),
+                agent_skill_installer.STATUS_CONFLICT,
+            )
+
+    def test_update_refuses_internal_symlinks_without_touching_their_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.create_skill(root / "source", "new")
+            destination = self.create_skill(root / "installed", "old")
+            outside = root / "unrelated.py"
+            outside.write_text("keep")
+            script = destination / "scripts/herdr_agent_messenger.py"
+            script.unlink()
+            script.symlink_to(outside)
+            with self.assertRaisesRegex(OSError, "symlink"):
+                agent_skill_installer.install_skill(destination, source)
+            self.assertEqual(outside.read_text(), "keep")
+            self.assertTrue(script.is_symlink())
+
+    def test_dangling_destination_symlink_is_a_conflict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "installed"
+            destination.symlink_to(Path(directory) / "missing")
+            self.assertEqual(
+                agent_skill_installer.installation_status(destination),
+                agent_skill_installer.STATUS_CONFLICT,
+            )
+
+    def test_install_omits_generated_files_and_preserves_local_extras(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.create_skill(root / "source", "new")
+            destination = self.create_skill(root / "installed", "old")
+            (destination / "notes.txt").write_text("keep")
+            (source / "__pycache__").mkdir()
+            (source / "__pycache__/cache.pyc").write_bytes(b"cache")
+            (source / ".DS_Store").write_bytes(b"metadata")
+            agent_skill_installer.install_skill(destination, source)
+            self.assertEqual((destination / "notes.txt").read_text(), "keep")
+            self.assertFalse((destination / "__pycache__").exists())
+            self.assertFalse((destination / ".DS_Store").exists())
+
     def test_destinations_use_selected_home(self):
         destinations = agent_skill_installer.install_destinations(
             {"HOME": "/tmp/example-home"}

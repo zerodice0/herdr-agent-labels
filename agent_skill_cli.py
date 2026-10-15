@@ -33,7 +33,6 @@ from agent_directory import (
     PLUGIN_ID,
     REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     AgentRecord,
-    fetch_local_agent,
     herdr_executable,
     probe_local_agents,
     query_remote_agents,
@@ -41,6 +40,7 @@ from agent_directory import (
     ssh_command,
     ssh_config_path,
     ssh_hosts,
+    submission_failure_is_uncertain,
 )
 from agent_route import (
     AgentRouteError,
@@ -221,11 +221,31 @@ def current_sender(
 ) -> AgentRecord:
     values = os.environ if environment is None else environment
     resolved_pane_id = values.get("HERDR_PANE_ID", "")
-    sender = fetch_local_agent(resolved_pane_id, values) if resolved_pane_id else None
+    if not resolved_pane_id:
+        raise SkillCommandError(
+            "sender_unavailable",
+            "HERDR_PANE_ID is unavailable. Run this command from the current "
+            "agent's Herdr pane.",
+        )
+
+    probe = probe_local_agents(values)
+    if not probe.success:
+        detail = probe.error or "The local Herdr server is unavailable."
+        raise SkillCommandError(
+            "sender_probe_failed",
+            "Could not verify the current sender before prompt submission: "
+            f"{detail}. No prompt was submitted.",
+        )
+
+    sender = next(
+        (agent for agent in probe.agents if agent.pane_id == resolved_pane_id),
+        None,
+    )
     if sender is None:
         raise SkillCommandError(
             "sender_unavailable",
-            "Run this command from a Herdr pane containing a current agent.",
+            f"Herdr pane {resolved_pane_id!r} does not contain a current agent. "
+            "No prompt was submitted.",
         )
     return sender
 
@@ -271,14 +291,6 @@ def _request_state_store(
         if not directory.exists() and legacy.exists():
             directory = legacy
     return JsonRequestStateStore(directory)
-
-
-def _submission_failure_is_uncertain(result: subprocess.CompletedProcess[str]) -> bool:
-    detail = result.stderr.strip()
-    return (
-        detail in {"cancelled", "output_limit_exceeded"}
-        or "timed out after" in detail
-    )
 
 
 class AgentRequestTransport(RequestTransport[AgentRecord]):
@@ -352,7 +364,7 @@ class AgentRequestTransport(RequestTransport[AgentRecord]):
         if result.returncode == 0:
             return SubmissionResult.submitted()
         detail = result.stderr.strip() or result.stdout.strip() or "prompt failed"
-        if _submission_failure_is_uncertain(result):
+        if submission_failure_is_uncertain(result, remote=not target.local):
             timed_out = "timed out after" in result.stderr
             return SubmissionResult.unknown(
                 (
@@ -496,6 +508,9 @@ def send_command(
             error_code = "prompt_cancelled"
         elif lowered_detail == "timeout" or "timed out after" in lowered_detail:
             error_code = "prompt_timeout"
+        elif submission_failure_is_uncertain(result, remote=not recipient.local):
+            error_code = "prompt_acceptance_unknown"
+            detail = "Prompt submission was interrupted after it may have run."
         else:
             error_code = "prompt_failed"
         raise SkillCommandError(error_code, detail)
@@ -544,6 +559,12 @@ def _batch_outcome_from_payload(
             bool(response_payload.get("correlated")),
         )
 
+    if (
+        "submitted" in payload
+        and payload["submitted"] is None
+        and payload.get("state") != "submitted_settled"
+    ):
+        return outcome(TIMED_OUT, "prompt_acceptance_unknown")
     if payload.get("cancelled") is True:
         if payload.get("submitted") is True:
             return outcome(SUBMITTED, detail="wait_cancelled")
@@ -640,6 +661,8 @@ def batch_command(
                 )
         except SkillCommandError as error:
             if error.code == "prompt_timeout":
+                return DispatchOutcome(TIMED_OUT, error.code, error.message)
+            if error.code == "prompt_acceptance_unknown":
                 return DispatchOutcome(TIMED_OUT, error.code, error.message)
             if error.code == "prompt_cancelled":
                 return DispatchOutcome(CANCELLED, error.code, error.message)
@@ -883,15 +906,26 @@ def _record_request_route(
     resolution = transport.resolution
     if resolution is None:
         return
-    payload["route_refreshed"] = resolution.route_refreshed
-    payload["route"] = resolution.route
     recipient = payload.get("recipient")
+    if resolution.agent.identity != payload.get("_target_identity"):
+        # A replacement observed during run/refresh is not the request's target.
+        # Keep the route saved with the original recipient, including on the
+        # first run where no top-level route has yet been persisted.
+        if not isinstance(recipient, dict) or not isinstance(recipient.get("route"), str):
+            return
+        route = recipient["route"]
+        route_refreshed = bool(recipient.get("route_refreshed"))
+    else:
+        route = resolution.route
+        route_refreshed = resolution.route_refreshed
+    payload["route_refreshed"] = route_refreshed
+    payload["route"] = route
     if isinstance(recipient, dict):
-        recipient["route_refreshed"] = resolution.route_refreshed
-        recipient["route"] = resolution.route
+        recipient["route_refreshed"] = route_refreshed
+        recipient["route"] = route
     context = payload.get("_context")
     if isinstance(context, dict):
-        context["route"] = resolution.route
+        context["route"] = route
         # A verified route supersedes the mutable host/label address. Keeping
         # both makes request-status reject its own persisted context.
         context["label"] = None

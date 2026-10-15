@@ -290,6 +290,49 @@ class RequestLifecycleMachineTest(unittest.TestCase):
         self.assertEqual(result["state"], "submitted_unknown")
         self.assertEqual(result["phase"], "recipient_changed")
 
+    def test_replacement_stops_output_reads(self):
+        store = MemoryStore()
+        clock = FakeClock()
+        transport = FakeTransport(
+            [FakeTarget("old", "idle"), FakeTarget("replacement", "working")],
+            SubmissionResult.submitted(),
+        )
+        transport.read_output = mock.Mock(side_effect=[
+            OutputSnapshot("before\n"), OutputSnapshot("replacement's unrelated output\n"),
+        ])
+        result = RequestLifecycleMachine(
+            transport, store, monotonic=clock.monotonic, sleep=clock.sleep,
+        ).run(
+            request_id="e" * 32, prompt="work", timeout_seconds=3,
+            poll_interval_seconds=1, max_output_lines=10, max_output_chars=500,
+        )
+        transport.read_output.assert_called_once()
+        self.assertEqual(result["response"]["output"], "")
+        self.assertFalse(result["response"]["correlated"])
+        self.assertTrue(result["terminal"])
+
+    def test_cancellation_during_baseline_prevents_submission(self):
+        store = MemoryStore()
+        target = FakeTarget("worker", "idle")
+        transport = FakeTransport([target], SubmissionResult.submitted())
+        cancelled = False
+
+        def read_output(*args, **kwargs):
+            nonlocal cancelled
+            cancelled = True
+            return OutputSnapshot("before")
+
+        transport.read_output = read_output
+        result = RequestLifecycleMachine(transport, store).run(
+            request_id="e" * 32, prompt="work", timeout_seconds=3,
+            poll_interval_seconds=1, max_output_lines=10, max_output_chars=500,
+            cancelled=lambda: cancelled,
+        )
+        self.assertFalse(transport.prompts)
+        self.assertFalse(result["submitted"])
+        self.assertTrue(result["cancelled"])
+        self.assertTrue(result["terminal"])
+
 
 class RequestOutputTest(unittest.TestCase):
     def test_limit_output_returns_tail_and_truncation_flag(self):
@@ -634,6 +677,62 @@ class AgentRequestCliIntegrationTest(unittest.TestCase):
             route=stored["_context"]["route"],
             environment={},
         )
+
+
+class RequestBoundaryIntegrationTest(unittest.TestCase):
+    @staticmethod
+    def target():
+        return agent_skill_cli.AgentRecord(
+            "local", "worker", "w:p1", "w", "work", "idle", "worker-session", "/work", True,
+        )
+
+    def test_replacement_never_overwrites_the_saved_request_route(self):
+        for replace_during_wait in (True, False):
+            with self.subTest(replace_during_wait=replace_during_wait):
+                worker = self.target()
+                replacement = replace(worker, session_id="new-session", status="working")
+                sender = replace(worker, name="sender", pane_id="w:p2", session_id="sender-session")
+                clock = FakeClock()
+                store = MemoryStore()
+                observations = [worker, replacement] if replace_during_wait else [
+                    worker, replace(worker, status="working"), replace(worker, status="working"),
+                ]
+                runner = mock.Mock(return_value=subprocess.CompletedProcess(["herdr"], 0, "before\n", ""))
+                with mock.patch.object(agent_skill_cli, "current_sender", return_value=sender):
+                    result = agent_skill_cli.request_command(
+                        host="local", label="worker", message="work", timeout_ms=1000,
+                        output_lines=10, output_chars=500, environment={},
+                        resolver=mock.Mock(side_effect=observations), state_store=store,
+                        command_runner=runner, request_id="a" * 32,
+                        monotonic=clock.monotonic, sleep=clock.sleep,
+                    )
+                if not replace_during_wait:
+                    runner.reset_mock()
+                    result = agent_skill_cli.request_status_command(
+                        request_id="a" * 32, environment={}, state_store=store,
+                        resolver=lambda: replacement, command_runner=runner,
+                    )
+                    runner.assert_not_called()
+                else:
+                    reads = [call for call in runner.call_args_list if call.args[0][1:3] == ["agent", "read"]]
+                    self.assertEqual(len(reads), 1)
+                expected_route = agent_skill_cli.encode_agent_route(worker)
+                self.assertEqual(result["phase"], "recipient_changed")
+                self.assertEqual(result["route"], expected_route)
+                self.assertEqual(result["recipient"]["route"], expected_route)
+                self.assertEqual(store.load("a" * 32)["_context"]["route"], expected_route)
+
+    def test_interrupted_transport_does_not_claim_submission_failed(self):
+        for local, returncode in ((False, 255), (False, -15), (True, -15)):
+            with self.subTest(local=local, returncode=returncode):
+                target = replace(self.target(), local=local, host="remote" if not local else "local")
+                transport = agent_skill_cli.AgentRequestTransport(
+                    resolver=lambda: target, sender_identity="sender", environment={},
+                    command_runner=mock.Mock(return_value=subprocess.CompletedProcess(
+                        ["herdr"], returncode, "", "Connection lost",
+                    )),
+                )
+                self.assertIsNone(transport.submit(target, "work").accepted)
 
 
 if __name__ == "__main__":

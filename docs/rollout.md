@@ -11,6 +11,11 @@ used by Agent Messenger. It never discovers or adds rollout targets itself.
 
 Review the exact commands without opening an SSH connection:
 
+The preview includes conditional migration steps. `legacy-disable` runs before
+the new plugin is enabled; legacy removal and its verification run after the new
+plugin passes validation. Those steps execute only when preflight finds the
+legacy installation.
+
 ```bash
 python3 rollout_plugin.py \
   --host macbook-pro \

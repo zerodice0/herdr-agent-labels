@@ -319,6 +319,15 @@ class RequestLifecycleMachine(Generic[TargetT]):
         )
         self._store_baseline(record, baseline, baseline_error)
 
+        if cancelled is not None and cancelled():
+            record["cancelled"] = True
+            return self._finish_without_target(
+                record,
+                state=RequestState.SUBMISSION_FAILED,
+                phase="submission_cancelled",
+                error="Request was cancelled before prompt submission.",
+            )
+
         record["phase"] = "submitting"
         if baseline_error:
             record["baseline_error"] = baseline_error
@@ -402,18 +411,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
                 self._sleep_until(deadline, poll_interval_seconds)
                 continue
             if current.identity != initial.identity:
-                return self._finish(
-                    record,
-                    target=last_target,
-                    baseline=baseline,
-                    baseline_reliable=not baseline_error,
-                    state=RequestState.SUBMITTED_UNKNOWN,
-                    phase="recipient_changed",
-                    error="The resolved recipient occupant changed during the request.",
-                    max_lines=max_output_lines,
-                    max_chars=max_output_chars,
-                    terminal=True,
-                )
+                return self._finish_recipient_changed(record)
 
             last_target = current
             record["recipient_status"] = current.status
@@ -542,18 +540,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
             not isinstance(expected_identity, str)
             or current.identity != expected_identity
         ):
-            record.update(
-                {
-                    "state": RequestState.SUBMITTED_UNKNOWN.value,
-                    "phase": "recipient_changed",
-                    "terminal": True,
-                    "error": (
-                        "The resolved recipient occupant changed during the request."
-                    ),
-                }
-            )
-            self.store.save(request_id, record)
-            return record
+            return self._finish_recipient_changed(record)
 
         record["recipient_status"] = current.status
         if not record.get("wait_safe"):
@@ -717,6 +704,25 @@ class RequestLifecycleMachine(Generic[TargetT]):
         if read_error:
             response["error"] = read_error
         record["response"] = response
+
+    def _finish_recipient_changed(self, record: dict[str, Any]) -> dict[str, Any]:
+        # The old address may now point at another agent. Retain only output
+        # already captured while the requested occupant could still be verified.
+        record.update(
+            {
+                "state": RequestState.SUBMITTED_UNKNOWN.value,
+                "phase": "recipient_changed",
+                "terminal": True,
+                "error": "The resolved recipient occupant changed during the request.",
+                "response": {
+                    **record["response"],
+                    "truncated": True,
+                    "correlated": False,
+                },
+            }
+        )
+        self.store.save(str(record["request_id"]), record)
+        return record
 
     def _finish_without_target(
         self,

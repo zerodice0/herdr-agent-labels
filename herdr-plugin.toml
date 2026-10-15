@@ -26,8 +26,15 @@ description = "Install, update, or learn how to use HAM."
 contexts = ["workspace", "pane"]
 command = ["python3", "agent_skill_installer.py", "launch"]
 
+[[startup]]
+command = ["python3", "agent_labels.py", "reconcile"]
+
 [[events]]
 on = "pane.agent_detected"
+command = ["python3", "agent_labels.py", "event"]
+
+[[events]]
+on = "pane.agent_status_changed"
 command = ["python3", "agent_labels.py", "event"]
 
 [[panes]]

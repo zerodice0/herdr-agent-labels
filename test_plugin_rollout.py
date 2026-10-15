@@ -310,13 +310,14 @@ class PluginRolloutTest(unittest.TestCase):
                 "metadata",
                 "hashes",
                 "unittest",
+                "legacy-disable",
                 "enable",
                 "enabled-metadata",
                 "config",
                 "reload",
                 "actions",
-                "legacy-disable",
                 "legacy-uninstall",
+                "migration-metadata",
             ],
         )
 

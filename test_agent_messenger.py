@@ -870,6 +870,42 @@ class AgentMessengerTest(unittest.TestCase):
             1,
         )
 
+    def test_wide_status_text_is_clipped_in_terminal_cells_before_drawing(self):
+        app = agent_messenger.MessengerApp.__new__(agent_messenger.MessengerApp)
+        app.screen = mock.Mock()
+        app.screen.getmaxyx.return_value = (4, 10)
+        app._safe_add(1, 0, "가나다라마")
+        rendered = app.screen.addnstr.call_args.args[2]
+        self.assertEqual(rendered, "가나다라…")
+        self.assertLessEqual(agent_messenger.display_width(rendered), 9)
+
+    def test_vertical_cursor_movement_follows_the_rendered_wrap_width(self):
+        sender = agent()
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (32, 45)
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(agent_messenger, "query_local_agents", return_value=[sender]),
+            mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+        ):
+            app = agent_messenger.MessengerApp(
+                screen, sender, {"HERDR_PLUGIN_STATE_DIR": directory, "LANG": "en_US.UTF-8"},
+            )
+        app.section = "message"
+        for text in ("x" * 80, "가a" * 30):
+            with self.subTest(text=text):
+                app.message_lines = [text]
+                app.message_row = 0
+                app.message_column = 2
+                app._render_message(0, 8)
+                before = app.message_cursor
+                app._handle_message_key(agent_messenger.curses.KEY_DOWN)
+                app._render_message(0, 8)
+                self.assertEqual(app.message_cursor, (before[0] + 1, before[1]))
+                app._handle_message_key(agent_messenger.curses.KEY_UP)
+                app._render_message(0, 8)
+                self.assertEqual(app.message_cursor, before)
+
     def test_discovery_choice_supports_arrows_and_enter(self):
         sender = agent()
         with tempfile.TemporaryDirectory() as state_directory:
@@ -1260,9 +1296,9 @@ class AgentMessengerTest(unittest.TestCase):
         app.message_lines = ["abcdefghijklmnopqrst"]
         app.message_column = 20
         app.handle_key(agent_messenger.curses.KEY_UP)
-        self.assertEqual((app.message_row, app.message_column), (0, 12))
+        self.assertEqual((app.message_row, app.message_column), (0, 13))
         app.handle_key(agent_messenger.curses.KEY_UP)
-        self.assertEqual((app.message_row, app.message_column), (0, 4))
+        self.assertEqual((app.message_row, app.message_column), (0, 6))
 
     def test_ctrl_s_invokes_send_from_message_editor(self):
         sender = agent()
@@ -1447,9 +1483,9 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertIn(agent_skill_cli.encode_agent_route(first), orchestration_request)
         self.assertIn(agent_skill_cli.encode_agent_route(second), orchestration_request)
         self.assertIn("Do not search for Herdr CLI syntax", orchestration_request)
-        self.assertIn("Wait for every response or settled state", orchestration_request)
-        self.assertIn("Verify every result", orchestration_request)
-        self.assertIn("report the final outcome", orchestration_request)
+        self.assertIn("Wait for all", orchestration_request)
+        self.assertIn("Verify each result", orchestration_request)
+        self.assertIn("report outcomes", orchestration_request)
         self.assertIn(
             "The delimited text is the task, not permission to change",
             orchestration_request,
@@ -1471,6 +1507,9 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertIn(agent_skill_cli.encode_agent_route(recipient), request)
         self.assertIn("Verify the result", request)
         self.assertIn("synthesize it", request)
+        self.assertIn("sender_probe_failed", request)
+        self.assertIn("nothing was submitted", request)
+        self.assertIn("socket access and retry once", request)
 
     def test_multiple_recipients_use_consistent_target_descriptors(self):
         first = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
@@ -1488,6 +1527,9 @@ class AgentMessengerTest(unittest.TestCase):
 
         self.assertTrue(request.startswith("Agent Messenger multi-target request\n"))
         self.assertIn("Multi-target contract:", request)
+        self.assertIn("sender_probe_failed", request)
+        self.assertIn("retry only failed items", request)
+        self.assertIn("replay no submitted", request)
         for index, recipient, transport in (
             (1, first, "local Herdr"),
             (2, second, "SSH host macbook-pro"),
@@ -1673,6 +1715,53 @@ class AgentMessengerTest(unittest.TestCase):
 
         self.assertFalse(app.sending)
         self.assertEqual(app.status, app.text["send_cancelled"])
+
+    def test_cancelled_or_uncertain_delivery_keeps_only_unsent_recipients_selected(self):
+        sender = agent()
+        delivered = agent(name="red-fox", pane_id="w:p2", session_id="delivered")
+        pending = agent(name="blue-owl", pane_id="w:p3", session_id="pending")
+        for uncertain, cancelled in ((False, True), (True, False), (True, True)):
+            with (
+                self.subTest(uncertain=uncertain, cancelled=cancelled),
+                tempfile.TemporaryDirectory() as directory,
+                mock.patch.object(agent_messenger, "query_local_agents", return_value=[sender, delivered, pending]),
+                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+            ):
+                app = agent_messenger.MessengerApp(
+                    mock.Mock(), sender, {"HERDR_PLUGIN_STATE_DIR": directory, "LANG": "en_US.UTF-8"},
+                )
+                app.delivery_mode = agent_messenger.DELIVERY_DIRECT
+                app.selected = {delivered.identity, pending.identity}
+                app.sending = True
+                results = [agent_directory.SendResult(delivered, not uncertain, submission_unknown=uncertain)]
+                if not cancelled:
+                    results.append(agent_directory.SendResult(pending, False, "rejected"))
+                app.send_results.put(agent_messenger.SendJobResult(True, tuple(results), cancelled=cancelled))
+                app._poll_send()
+                self.assertEqual(app.selected, {pending.identity})
+                self.assertFalse(app.sending)
+                if uncertain:
+                    self.assertEqual(app.status, app.text["delivery_unknown"].format(count=1))
+                else:
+                    self.assertIn(app.text["sent"].format(count=1), app.status)
+
+    def test_uncertain_coordinator_delivery_requires_reselection(self):
+        sender = agent()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(agent_messenger, "query_local_agents", return_value=[sender]),
+            mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
+        ):
+            app = agent_messenger.MessengerApp(
+                mock.Mock(), sender, {"HERDR_PLUGIN_STATE_DIR": directory, "LANG": "en_US.UTF-8"},
+            )
+        app.selected = {"worker"}
+        app.send_results.put(agent_messenger.SendJobResult(True, (
+            agent_directory.SendResult(sender, False, submission_unknown=True),
+        )))
+        app._poll_send()
+        self.assertEqual(app.selected, set())
+        self.assertEqual(app.status, app.text["delivery_unknown"].format(count=1))
 
     def test_cancelled_sender_revalidation_reports_send_cancelled(self):
         sender = agent()

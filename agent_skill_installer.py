@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 from typing import Mapping, Sequence
 
 from agent_messenger import (
@@ -24,6 +25,7 @@ from agent_messenger import (
     SKILL_PROJECT_ROOT_ENV,
     shortcut_help_spans,
     show_notification,
+    truncate_display_text,
     wrap_display_text,
 )
 from messenger_i18n import detect_language
@@ -207,7 +209,7 @@ def _matches_source(destination: Path, source: Path) -> bool:
             )
             for path in source_files
         )
-    except OSError:
+    except (OSError, UnicodeError):
         return False
 
 
@@ -216,7 +218,7 @@ def _is_managed_destination(destination: Path) -> bool:
     script_file = destination / "scripts" / "herdr_agent_messenger.py"
     try:
         contents = skill_file.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeError):
         return False
     canonical = "name: herdr-agent-messenger" in contents and script_file.is_file()
     claude_bridge = (
@@ -229,16 +231,31 @@ def _is_managed_destination(destination: Path) -> bool:
 def installation_status(destination: Path | None) -> str:
     if destination is None:
         return STATUS_UNAVAILABLE
+    if destination.is_symlink():
+        return STATUS_CONFLICT
     if not destination.exists():
         return STATUS_MISSING
-    if destination.is_symlink() or not destination.is_dir():
+    if not destination.is_dir():
         return STATUS_CONFLICT
     if not _is_managed_destination(destination):
         return STATUS_CONFLICT
     sources = (bundled_skill_path().parent, _bundled_claude_skill_path())
+    try:
+        _check_destination_paths(destination, sources[0])
+    except OSError:
+        return STATUS_CONFLICT
     if any(source.is_dir() and _matches_source(destination, source) for source in sources):
         return STATUS_CURRENT
     return STATUS_OUTDATED
+
+
+def _check_destination_paths(destination: Path, source: Path) -> None:
+    for source_file in _source_files(source):
+        target = destination
+        for component in source_file.relative_to(source).parts:
+            target /= component
+            if target.is_symlink():
+                raise OSError(f"refusing to overwrite a symlink: {target}")
 
 
 def install_skill(destination: Path, source: Path | None = None) -> None:
@@ -253,8 +270,41 @@ def install_skill(destination: Path, source: Path | None = None) -> None:
         raise OSError(f"destination is not a managed skill directory: {destination}")
     if destination.exists() and not _is_managed_destination(destination):
         raise OSError(f"refusing to overwrite an unrelated skill: {destination}")
+    _check_destination_paths(destination, source_directory)
+    if source_directory in destination.resolve().parents:
+        raise OSError("destination must not be inside the source skill directory")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source_directory, destination, dirs_exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent)
+    )
+    staged = staging_root / "skill"
+    backup = staging_root / "previous"
+    retain_backup = False
+    ignored = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", ".DS_Store")
+    try:
+        # Copy first so a failed read/write cannot leave a mixed installation.
+        # Preserve user-added files and links without following those links.
+        if destination.exists():
+            shutil.copytree(destination, staged, symlinks=True, ignore=ignored)
+        shutil.copytree(source_directory, staged, dirs_exist_ok=True, ignore=ignored)
+        try:
+            if destination.exists():
+                os.replace(destination, backup)
+            os.replace(staged, destination)
+        except BaseException:
+            # Ctrl+C must restore the old directory just like an I/O failure.
+            if backup.exists():
+                try:
+                    os.replace(backup, destination)
+                except OSError as error:
+                    retain_backup = True
+                    raise OSError(
+                        f"could not restore the previous skill; backup retained at {backup}"
+                    ) from error
+            raise
+    finally:
+        if not retain_backup:
+            shutil.rmtree(staging_root, ignore_errors=True)
 
 
 def install_selected(
@@ -366,7 +416,7 @@ def popup(environment: Mapping[str, str] | None = None) -> int:
                     screen.addnstr(
                         row,
                         column,
-                        value,
+                        truncate_display_text(value, max(0, width - column - 1)),
                         max(0, width - column - 1),
                         attribute,
                     )

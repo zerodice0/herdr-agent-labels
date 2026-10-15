@@ -132,11 +132,13 @@ def _decode_cursor(cursor: str) -> _CursorState:
         TypeError,
         UnicodeDecodeError,
         ValueError,
+        RecursionError,
     ):
         raise InvalidOutputCursor("The output cursor is invalid.") from None
     hashes = (stream, snapshot_hash, tail_hash)
     if (
         not isinstance(payload, dict)
+        or type(version) is not int
         or version != CURSOR_VERSION
         or not isinstance(snapshot_size, int)
         or isinstance(snapshot_size, bool)

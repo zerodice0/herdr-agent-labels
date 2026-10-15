@@ -205,5 +205,25 @@ class AgentRouteTest(unittest.TestCase):
         )
 
 
+class InvalidRouteTest(unittest.TestCase):
+    def test_malformed_continuity_returns_a_route_error(self):
+        record = agent()
+        original = decode_payload(agent_route.encode_agent_route(record))
+        for value in ([], {}, None, 3):
+            with self.subTest(kind=value):
+                payload = dict(original)
+                payload["continuity"] = {**original["continuity"], "kind": value}
+                malformed = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+                with self.assertRaises(agent_route.AgentRouteError) as raised:
+                    agent_route.resolve_agent_route(malformed, [record])
+                self.assertEqual(raised.exception.code, "invalid_route")
+
+    def test_excessive_json_nesting_returns_a_route_error(self):
+        malformed = base64.urlsafe_b64encode(("[" * 1100 + "]" * 1100).encode()).decode()
+        with self.assertRaises(agent_route.AgentRouteError) as raised:
+            agent_route.route_host(malformed)
+        self.assertEqual(raised.exception.code, "invalid_route")
+
+
 if __name__ == "__main__":
     unittest.main()

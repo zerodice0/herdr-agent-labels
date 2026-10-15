@@ -140,7 +140,7 @@ def _validated_continuity(value: Any) -> dict[str, Any]:
         raise _invalid_route()
     if any(not _is_fingerprint(value[field]) for field in fingerprint_fields):
         raise _invalid_route()
-    if value["kind"] not in _LABEL_KINDS:
+    if not isinstance(value["kind"], str) or value["kind"] not in _LABEL_KINDS:
         raise _invalid_route()
     if any(
         not isinstance(value[field], bool)
@@ -151,7 +151,7 @@ def _validated_continuity(value: Any) -> dict[str, Any]:
 
 
 def _decode_agent_route(route: str) -> _DecodedRoute:
-    if not route or len(route) > MAX_ROUTE_TOKEN_LENGTH:
+    if not isinstance(route, str) or not route or len(route) > MAX_ROUTE_TOKEN_LENGTH:
         raise _invalid_route()
     try:
         padding = "=" * (-len(route) % 4)
@@ -161,7 +161,7 @@ def _decode_agent_route(route: str) -> _DecodedRoute:
             validate=True,
         )
         payload = json.loads(decoded)
-    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
         raise _invalid_route() from None
     if not isinstance(payload, dict):
         raise _invalid_route()

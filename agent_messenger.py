@@ -185,6 +185,8 @@ def build_orchestration_request(
             "Single-target contract:\n"
             "- Create a tailored instruction with only needed context; run:\n"
             f"  {request_command}\n"
+            "- On `sender_probe_failed` with a sandbox/socket error, get local Herdr "
+            "socket access and retry once; nothing was submitted.\n"
             "- If nonterminal, advance the request without resending:\n"
             f"  {request_status_command}\n"
             "- Use any safely refreshed route for follow-ups.\n"
@@ -195,17 +197,18 @@ def build_orchestration_request(
     else:
         contract = (
             "Multi-target contract:\n"
-            "1. Create tailored non-overlapping assignments per target; respect "
-            "dependencies/workspaces; include only needed context.\n"
-            "2. Dispatch route/message objects in order with bounded concurrency:\n"
+            "1. Create tailored non-overlapping assignments per target/workspace.\n"
+            "2. Dispatch in order with bounded concurrency:\n"
             f"   {batch_command}\n"
             "   The router does not decompose or rewrite messages.\n"
-            "3. Wait for every response or settled state; follow up on missing, blocked, "
-            "or inconsistent work; read deltas:\n"
+            "3. On `sender_probe_failed` with a sandbox/socket error, get local Herdr "
+            "socket access and retry only failed items; replay no submitted, unknown, "
+            "or timed-out item.\n"
+            "4. Wait for all; follow up on missing/inconsistent work; read deltas:\n"
             f"   {read_command}\n"
             "   If route_refreshed, use the returned route.\n"
-            "4. Verify every result against the request/workspace, check it, synthesize, "
-            "and report the final outcome, failures, and risks.\n"
+            "5. Verify each result against its request/workspace; report outcomes, "
+            "failures, and risks.\n"
         )
     return shared + contract
 
@@ -480,7 +483,8 @@ def render_skill_guide_screen(
         if row < 0 or row >= height or column < 0 or column >= width:
             return
         try:
-            screen.addnstr(row, column, value, max(0, width - column - 1), attribute)
+            available = max(0, width - column - 1)
+            screen.addnstr(row, column, truncate_display_text(value, available), available, attribute)
         except curses.error:
             pass
 
@@ -918,10 +922,9 @@ class MessengerApp(MessengerRenderMixin):
             self.message_column += len(key)
 
     def _move_message_cursor_visual(self, delta: int) -> None:
-        _height, width = self.screen.getmaxyx()
         wrapped_lines, cursor_row, cursor_column = wrap_message_lines(
             self.message_lines,
-            width=max(1, width - 4),
+            width=self._message_editor_width(),
             cursor_row=self.message_row,
             cursor_column=self.message_column,
         )
@@ -1011,8 +1014,25 @@ class MessengerApp(MessengerRenderMixin):
         except queue.Empty:
             return
         self.sending = False
+        results = list(job.results)
+        succeeded = [result for result in results if result.success]
+        unknown = [result for result in results if result.submission_unknown]
+        failed = [result for result in results if not result.success and not result.submission_unknown]
+        if self.delivery_mode == DELIVERY_DIRECT:
+            self.selected.difference_update(result.agent.identity for result in [*succeeded, *unknown])
+        elif unknown or (job.cancelled and succeeded):
+            self.selected.clear()
         if job.cancelled:
-            self.status = self.text["send_cancelled"]
+            if unknown:
+                self.status = self.text["delivery_unknown"].format(count=len(unknown))
+            elif succeeded:
+                self.status = (
+                    self.text["delegated"]
+                    if self.delivery_mode == DELIVERY_DELEGATE
+                    else self.text["sent"].format(count=len(succeeded))
+                ) + " " + self.text["send_cancelled"]
+            else:
+                self.status = self.text["send_cancelled"]
             return
         if not job.sender_available:
             self.status = self.text["sender_unavailable"]
@@ -1024,7 +1044,6 @@ class MessengerApp(MessengerRenderMixin):
                 else self.text["all_failed"]
             )
             return
-        results = list(job.results)
         if not results:
             self.status = (
                 self.text["delegate_failed"]
@@ -1032,8 +1051,11 @@ class MessengerApp(MessengerRenderMixin):
                 else self.text["all_failed"]
             )
             return
-        succeeded = [result for result in results if result.success]
-        failed = [result for result in results if not result.success]
+        if unknown:
+            if self.delivery_mode == DELIVERY_DIRECT:
+                self.selected = {result.agent.identity for result in failed}
+            self.status = self.text["delivery_unknown"].format(count=len(unknown))
+            return
         if not failed:
             if self.delivery_mode == DELIVERY_DELEGATE:
                 body = self.text["delegated"]

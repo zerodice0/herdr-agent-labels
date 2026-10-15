@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import io
 import os
 from pathlib import Path
 import tempfile
@@ -9,6 +10,7 @@ from unittest import mock
 
 
 MODULE_PATH = Path(__file__).with_name("agent_labels.py")
+MANIFEST_PATH = Path(__file__).with_name("herdr-plugin.toml")
 SPEC = importlib.util.spec_from_file_location("agent_labels", MODULE_PATH)
 assert SPEC and SPEC.loader
 agent_labels = importlib.util.module_from_spec(SPEC)
@@ -16,6 +18,44 @@ SPEC.loader.exec_module(agent_labels)
 
 
 class AgentLabelsTest(unittest.TestCase):
+    def test_run_herdr_uses_injected_binary(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory, "herdr")
+            binary.write_text("#!/bin/sh\n", encoding="utf-8")
+            binary.chmod(0o700)
+            with (
+                mock.patch.dict(os.environ, {"HERDR_BIN_PATH": os.fspath(binary)}),
+                mock.patch.object(
+                    agent_labels.subprocess,
+                    "run",
+                    return_value=completed,
+                ) as run,
+            ):
+                self.assertIs(agent_labels.run_herdr("agent", "list"), completed)
+
+        run.assert_called_once_with(
+            [os.fspath(binary), "agent", "list"],
+            stdin=agent_labels.subprocess.DEVNULL,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+
+    def test_command_launch_failure_and_timeout_are_reportable_results(self):
+        failures = (
+            OSError("herdr unavailable"),
+            agent_labels.subprocess.TimeoutExpired(["herdr", "agent", "list"], 10),
+        )
+        for error in failures:
+            with self.subTest(error=error), mock.patch.object(
+                agent_labels.subprocess, "run", side_effect=error,
+            ):
+                result = agent_labels.run_herdr("agent", "list")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, str(error))
+
     def test_aliases_are_valid_and_unique(self):
         names = [alias.name for alias in agent_labels.ALIASES]
         self.assertEqual(len(names), 256)
@@ -51,6 +91,30 @@ class AgentLabelsTest(unittest.TestCase):
         self.assertEqual(sum(call[:2] == ("agent", "rename") for call in calls), 2)
         self.assertTrue(any(call[:2] == ("pane", "report-metadata") for call in calls))
 
+    def test_conflict_stops_retrying_when_concurrent_hook_named_the_pane(self):
+        unnamed = {
+            "agent": "codex",
+            "terminal_id": "term-1",
+        }
+        named = {**unnamed, "name": "blue-otter"}
+        conflict = mock.Mock(returncode=1, stdout="", stderr="agent_name_taken")
+        with (
+            mock.patch.object(
+                agent_labels,
+                "fetch_agent_info",
+                side_effect=[unnamed, named],
+            ),
+            mock.patch.object(
+                agent_labels,
+                "run_herdr",
+                return_value=conflict,
+            ) as run,
+        ):
+            self.assertEqual(agent_labels.assign_label("w1:p2"), 0)
+
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[:2], ("agent", "rename"))
+
     def test_named_agent_is_preserved(self):
         result = mock.Mock(
             returncode=0,
@@ -81,6 +145,20 @@ class AgentLabelsTest(unittest.TestCase):
             [agent_labels.LEGACY_SOURCE, agent_labels.SOURCE],
         )
 
+    def test_metadata_failure_is_visible_to_assignment(self):
+        info = {"agent": "codex", "terminal_id": "term-1"}
+        renamed = mock.Mock(returncode=0, stdout="", stderr="")
+        with (
+            mock.patch.object(agent_labels, "fetch_agent_info", return_value=info),
+            mock.patch.object(agent_labels, "run_herdr", return_value=renamed),
+            mock.patch.object(
+                agent_labels,
+                "report_agent_label_metadata",
+                return_value=False,
+            ),
+        ):
+            self.assertEqual(agent_labels.assign_label("w1:p3"), 1)
+
     def test_invalid_agent_response_shape_is_ignored(self):
         result = mock.Mock(returncode=0, stdout='{"result":null}', stderr="")
         with mock.patch.object(agent_labels, "run_herdr", return_value=result):
@@ -104,9 +182,117 @@ class AgentLabelsTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HERDR_PLUGIN_EVENT_JSON": value}):
             self.assertEqual(agent_labels.event_data()["pane_id"], "w1:p4")
 
+    def test_status_event_rechecks_label_without_clearing_metadata(self):
+        value = (
+            '{"event":"pane.agent_status_changed","data":'
+            '{"pane_id":"w1:p4","agent_status":"idle"}}'
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "HERDR_PLUGIN_EVENT": "pane.agent_status_changed",
+                    "HERDR_PLUGIN_EVENT_JSON": value,
+                },
+                clear=True,
+            ),
+            mock.patch.object(agent_labels, "assign_label", return_value=0) as assign,
+            mock.patch.object(agent_labels, "clear_agent_label_metadata") as clear,
+        ):
+            self.assertEqual(agent_labels.handle_event(), 0)
+
+        assign.assert_called_once_with("w1:p4")
+        clear.assert_not_called()
+
+    def test_released_detection_event_clears_current_and_legacy_metadata(self):
+        value = (
+            '{"event":"pane.agent_detected","data":'
+            '{"pane_id":"w1:p4","released":true}}'
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "HERDR_PLUGIN_EVENT": "pane.agent_detected",
+                    "HERDR_PLUGIN_EVENT_JSON": value,
+                },
+                clear=True,
+            ),
+            mock.patch.object(
+                agent_labels,
+                "clear_agent_label_metadata",
+                return_value=True,
+            ) as clear,
+            mock.patch.object(agent_labels, "assign_label") as assign,
+        ):
+            self.assertEqual(agent_labels.handle_event(), 0)
+
+        clear.assert_called_once_with("w1:p4")
+        assign.assert_not_called()
+
+    def test_reconcile_only_rechecks_unnamed_agents(self):
+        agents = [
+            {"agent": "codex", "pane_id": "w1:p1", "name": "blue-otter"},
+            {"agent": "codex", "pane_id": "w1:p2"},
+            {"agent": "claude", "pane_id": "w1:p3", "agent_name": "reviewer"},
+            {"pane_id": "w1:p4"},
+            {"agent": "codex", "pane_id": "w1:p2"},
+        ]
+        with (
+            mock.patch.object(agent_labels, "fetch_agents", return_value=agents),
+            mock.patch.object(agent_labels, "assign_label", return_value=0) as assign,
+        ):
+            self.assertEqual(agent_labels.reconcile_labels(), 0)
+
+        assign.assert_called_once_with("w1:p2")
+
+    def test_reconcile_continues_after_one_assignment_failure(self):
+        agents = [
+            {"agent": "codex", "pane_id": "w1:p1"},
+            {"agent": "codex", "pane_id": "w1:p2"},
+        ]
+        with (
+            mock.patch.object(agent_labels, "fetch_agents", return_value=agents),
+            mock.patch.object(
+                agent_labels,
+                "assign_label",
+                side_effect=[1, 0],
+            ) as assign,
+        ):
+            self.assertEqual(agent_labels.reconcile_labels(), 1)
+
+        self.assertEqual(assign.call_count, 2)
+
+    def test_reconcile_reports_agent_list_failure(self):
+        failure = mock.Mock(returncode=1, stdout="", stderr="socket unavailable")
+        errors = io.StringIO()
+        with (
+            mock.patch.object(agent_labels, "run_herdr", return_value=failure),
+            mock.patch("sys.stderr", errors),
+        ):
+            self.assertEqual(agent_labels.reconcile_labels(), 1)
+
+        self.assertIn("agent list failed: socket unavailable", errors.getvalue())
+
+    def test_manifest_reconciles_on_startup_and_agent_status_changes(self):
+        manifest = MANIFEST_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            '[[startup]]\ncommand = ["python3", "agent_labels.py", "reconcile"]',
+            manifest,
+        )
+        self.assertIn(
+            'on = "pane.agent_status_changed"\n'
+            'command = ["python3", "agent_labels.py", "event"]',
+            manifest,
+        )
+
     def test_parse_event_command(self):
         arguments = agent_labels.parse_cli_arguments(["event"])
         self.assertEqual(arguments.command, "event")
+
+    def test_parse_reconcile_command(self):
+        arguments = agent_labels.parse_cli_arguments(["reconcile"])
+        self.assertEqual(arguments.command, "reconcile")
 
     def test_parse_label_command_with_pane_id(self):
         arguments = agent_labels.parse_cli_arguments(["label", "w1:p5"])
