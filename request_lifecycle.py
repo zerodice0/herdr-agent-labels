@@ -33,14 +33,15 @@ class SubmissionResult:
     accepted: bool | None
     error: str = ""
     timed_out: bool = False
+    code: str = ""
 
     @classmethod
     def submitted(cls) -> "SubmissionResult":
         return cls(True)
 
     @classmethod
-    def failed(cls, error: str) -> "SubmissionResult":
-        return cls(False, error=error)
+    def failed(cls, error: str, *, code: str = "") -> "SubmissionResult":
+        return cls(False, error=error, code=code)
 
     @classmethod
     def unknown(
@@ -48,8 +49,9 @@ class SubmissionResult:
         error: str,
         *,
         timed_out: bool = False,
+        code: str = "",
     ) -> "SubmissionResult":
-        return cls(None, error=error, timed_out=timed_out)
+        return cls(None, error=error, timed_out=timed_out, code=code)
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ class OutputSnapshot:
 
     text: str
     truncated: bool = False
+    anchored: bool = False
 
 
 class RequestTarget(Protocol):
@@ -196,19 +199,11 @@ def capture_new_output(
     *,
     max_lines: int,
     max_chars: int,
+    anchor: str = "",
 ) -> OutputSnapshot:
-    """Return only output added after a baseline, conservatively marked."""
+    """Capture a bounded delta, falling back to the last prompt header."""
 
-    if not before.text:
-        bounded = limit_output(
-            after.text,
-            max_lines=max_lines,
-            max_chars=max_chars,
-        )
-        return OutputSnapshot(
-            bounded.text,
-            before.truncated or after.truncated or bounded.truncated,
-        )
+    anchored = False
     overlap = _suffix_prefix_overlap(before.text, after.text)
     if (
         overlap
@@ -217,16 +212,31 @@ def capture_new_output(
     ):
         # A few coincidental characters are not a reliable rolling-tail anchor.
         overlap = 0
-    if overlap == 0:
+    if not before.text:
+        delta = after.text
+        correlation_lost = before.truncated
+    elif overlap == 0:
         delta = after.text
         correlation_lost = before.text != after.text
     else:
         delta = after.text[overlap:]
         correlation_lost = False
+    if not overlap and anchor:
+        normalized_anchor = " ".join(anchor.split())
+        offset = 0
+        anchor_offset = None
+        for line in after.text.splitlines(keepends=True):
+            if " ".join(line.split()) == normalized_anchor:
+                anchor_offset = offset
+            offset += len(line)
+        if anchor_offset is not None:
+            delta = after.text[anchor_offset:]
+            anchored = True
     bounded = limit_output(delta, max_lines=max_lines, max_chars=max_chars)
     return OutputSnapshot(
         bounded.text,
         correlation_lost or after.truncated or bounded.truncated,
+        anchored=anchored,
     )
 
 
@@ -281,6 +291,8 @@ class RequestLifecycleMachine(Generic[TargetT]):
                 "correlated": False,
             },
             "error": None,
+            "error_code": None,
+            "_response_anchor": prompt.splitlines()[0] if prompt else "",
             "_limits": {
                 "lines": max_output_lines,
                 "chars": max_output_chars,
@@ -298,6 +310,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
                 state=RequestState.SUBMISSION_FAILED,
                 phase="resolve_failed",
                 error=str(error) or error.__class__.__name__,
+                error_code=getattr(error, "code", None) or "resolve_failed",
             )
 
         initial_working = initial.status == "working"
@@ -326,6 +339,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
                 state=RequestState.SUBMISSION_FAILED,
                 phase="submission_cancelled",
                 error="Request was cancelled before prompt submission.",
+                error_code="cancelled",
             )
 
         record["phase"] = "submitting"
@@ -360,6 +374,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
                 state=RequestState.SUBMISSION_FAILED,
                 phase="submission_failed",
                 error=submission.error or "Prompt submission failed.",
+                error_code=submission.code or "prompt_failed",
                 max_lines=max_output_lines,
                 max_chars=max_output_chars,
             )
@@ -401,6 +416,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
                     state=state,
                     phase="wait_cancelled",
                     error="Waiting was cancelled after prompt submission.",
+                    error_code="cancelled",
                     max_lines=max_output_lines,
                     max_chars=max_output_chars,
                 )
@@ -466,6 +482,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
                     state=RequestState.SUBMITTED_SETTLED,
                     phase="settled",
                     error=None,
+                    error_code=None,
                     max_lines=max_output_lines,
                     max_chars=max_output_chars,
                     correlated=True,
@@ -491,6 +508,11 @@ class RequestLifecycleMachine(Generic[TargetT]):
             state=timeout_state,
             phase="wait_timed_out",
             error=error,
+            error_code=(
+                "prompt_acceptance_unknown"
+                if submission.accepted is None
+                else "wait_timed_out"
+            ),
             max_lines=max_output_lines,
             max_chars=max_output_chars,
         )
@@ -531,6 +553,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
                 {
                     "phase": "refresh_unavailable",
                     "error": str(error) or error.__class__.__name__,
+                    "error_code": getattr(error, "code", None) or "resolve_failed",
                 }
             )
             self.store.save(request_id, record)
@@ -573,6 +596,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
                     "phase": "waiting_for_requested_turn",
                     "wait_safe": True,
                     "error": None,
+                    "error_code": None,
                     "timed_out": False,
                     "response": {
                         "output": "",
@@ -591,6 +615,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
                     "phase": "waiting_for_requested_settlement",
                     "requested_turn_observed": True,
                     "error": None,
+                    "error_code": None,
                     "timed_out": False,
                 }
             )
@@ -614,6 +639,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
                 state=RequestState.SUBMITTED_SETTLED,
                 phase="settled",
                 error=None,
+                error_code=None,
                 max_lines=max_lines,
                 max_chars=max_chars,
                 correlated=True,
@@ -624,6 +650,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
                 "state": RequestState.SUBMITTED_UNKNOWN.value,
                 "phase": "waiting_for_requested_turn",
                 "error": None,
+                "error_code": None,
             }
         )
         self._capture_live_response(
@@ -695,12 +722,15 @@ class RequestLifecycleMachine(Generic[TargetT]):
             final_output,
             max_lines=max_lines,
             max_chars=max_chars,
+            anchor=str(record.get("_response_anchor") or ""),
         )
         response: dict[str, Any] = {
             "output": captured.text,
             "truncated": captured.truncated or not baseline_reliable,
             "correlated": False,
         }
+        if captured.anchored:
+            response["anchored"] = True
         if read_error:
             response["error"] = read_error
         record["response"] = response
@@ -714,6 +744,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
                 "phase": "recipient_changed",
                 "terminal": True,
                 "error": "The resolved recipient occupant changed during the request.",
+                "error_code": "recipient_changed",
                 "response": {
                     **record["response"],
                     "truncated": True,
@@ -731,6 +762,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
         state: RequestState,
         phase: str,
         error: str,
+        error_code: str,
     ) -> dict[str, Any]:
         record.update(
             {
@@ -739,6 +771,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
                 "terminal": True,
                 "submitted": False,
                 "error": error,
+                "error_code": error_code,
             }
         )
         self.store.save(str(record["request_id"]), record)
@@ -754,6 +787,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
         state: RequestState,
         phase: str,
         error: str | None,
+        error_code: str | None,
         max_lines: int,
         max_chars: int,
         correlated: bool = False,
@@ -769,12 +803,15 @@ class RequestLifecycleMachine(Generic[TargetT]):
             final_output,
             max_lines=max_lines,
             max_chars=max_chars,
+            anchor=str(record.get("_response_anchor") or ""),
         )
         response = {
             "output": captured.text,
             "truncated": captured.truncated or not baseline_reliable,
             "correlated": correlated and baseline_reliable and not read_error,
         }
+        if captured.anchored:
+            response["anchored"] = True
         if read_error:
             response["error"] = read_error
         record.update(
@@ -793,6 +830,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
                 "recipient_status": target.status,
                 "response": response,
                 "error": error,
+                "error_code": error_code,
             }
         )
         self.store.save(str(record["request_id"]), record)

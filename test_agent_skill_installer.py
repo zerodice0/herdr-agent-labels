@@ -1,5 +1,7 @@
+from contextlib import redirect_stderr
 from pathlib import Path
 import curses
+import io
 import tempfile
 import unittest
 from unittest import mock
@@ -159,6 +161,10 @@ class AgentSkillInstallerTest(unittest.TestCase):
             destinations["claude"],
             Path("/tmp/example-home/.claude/skills/herdr-agent-messenger"),
         )
+        self.assertEqual(
+            destinations["omp"],
+            Path("/tmp/example-home/.omp/agent/skills/herdr-agent-messenger"),
+        )
 
     def test_targets_include_project_and_system_scopes(self):
         targets = agent_skill_installer.installation_targets(
@@ -175,8 +181,10 @@ class AgentSkillInstallerTest(unittest.TestCase):
             [
                 ("project", "codex"),
                 ("project", "claude"),
+                ("project", "omp"),
                 ("system", "codex"),
                 ("system", "claude"),
+                ("system", "omp"),
             ],
         )
         self.assertEqual(
@@ -186,6 +194,72 @@ class AgentSkillInstallerTest(unittest.TestCase):
             / "skills"
             / "herdr-agent-messenger",
         )
+        self.assertEqual(
+            targets[2].destination,
+            Path("/tmp/example-project").resolve()
+            / ".omp"
+            / "skills"
+            / "herdr-agent-messenger",
+        )
+        self.assertEqual(
+            targets[5].destination,
+            Path("/tmp/example-home/.omp/agent/skills/herdr-agent-messenger"),
+        )
+
+    def test_omp_project_installation_is_recognized_and_can_be_updated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            targets = agent_skill_installer.installation_targets(
+                {
+                    "HOME": str(root / "home"),
+                    agent_skill_installer.SKILL_PROJECT_ROOT_ENV: str(root / "project"),
+                }
+            )
+            target = next(
+                target
+                for target in targets
+                if (target.scope, target.agent) == ("project", "omp")
+            )
+            destination = agent_skill_installer.install_target(target)
+            source = agent_skill_installer.bundled_skill_path().parent
+            self.assertEqual(
+                (destination / "scripts/herdr_agent_messenger.py").read_bytes(),
+                (source / "scripts/herdr_agent_messenger.py").read_bytes(),
+            )
+            self.assertEqual(
+                agent_skill_installer.installation_status(destination),
+                agent_skill_installer.STATUS_CURRENT,
+            )
+            (destination / "SKILL.md").write_text(
+                "---\nname: herdr-agent-messenger\n---\nold version\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                agent_skill_installer.installation_status(destination),
+                agent_skill_installer.STATUS_OUTDATED,
+            )
+            agent_skill_installer.install_target(target)
+            self.assertEqual(
+                agent_skill_installer.installation_status(destination),
+                agent_skill_installer.STATUS_CURRENT,
+            )
+
+    def test_project_omp_is_unavailable_without_a_workspace(self):
+        targets = agent_skill_installer.installation_targets(
+            {"HOME": "/tmp/example-home"}
+        )
+        target = next(
+            target
+            for target in targets
+            if (target.scope, target.agent) == ("project", "omp")
+        )
+        self.assertIsNone(target.destination)
+        self.assertEqual(
+            agent_skill_installer.installation_status(target.destination),
+            agent_skill_installer.STATUS_UNAVAILABLE,
+        )
+        with self.assertRaises(OSError):
+            agent_skill_installer.install_target(target)
 
     def test_installation_status_distinguishes_current_outdated_and_conflict(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -218,18 +292,52 @@ class AgentSkillInstallerTest(unittest.TestCase):
                 agent_skill_installer.STATUS_MISSING,
             )
 
-    def test_install_both_copies_the_bundled_skill(self):
+    def test_install_all_copies_the_bundled_skill_to_three_targets(self):
         with tempfile.TemporaryDirectory() as directory:
             environment = {"HOME": directory}
 
-            installed = agent_skill_installer.install_selected("both", environment)
+            installed = agent_skill_installer.install_selected("all", environment)
 
-            self.assertEqual(len(installed), 2)
+            self.assertEqual(
+                installed,
+                list(agent_skill_installer.install_destinations(environment).values()),
+            )
+            self.assertEqual(len(installed), 3)
             for destination in installed:
                 self.assertTrue((destination / "SKILL.md").is_file())
                 self.assertTrue(
                     (destination / "scripts" / "herdr_agent_messenger.py").is_file()
                 )
+                self.assertEqual(
+                    agent_skill_installer.installation_status(destination),
+                    agent_skill_installer.STATUS_CURRENT,
+                )
+
+    def test_install_omp_copies_only_the_user_skill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            installed = agent_skill_installer.install_selected("omp", {"HOME": directory})
+            destination = (
+                Path(directory) / ".omp/agent/skills/herdr-agent-messenger"
+            )
+            self.assertEqual(installed, [destination])
+            self.assertEqual(
+                (destination / "SKILL.md").read_bytes(),
+                agent_skill_installer.bundled_skill_path().read_bytes(),
+            )
+            self.assertTrue((destination / "scripts/herdr_agent_messenger.py").is_file())
+            self.assertFalse((Path(directory) / ".agents").exists())
+            self.assertFalse((Path(directory) / ".claude").exists())
+
+    def test_parser_accepts_omp_and_all_but_rejects_the_removed_selection(self):
+        for target in ("omp", "all"):
+            with self.subTest(target=target):
+                arguments = agent_skill_installer.parse_cli_arguments(["install", target])
+                self.assertEqual(arguments.target, target)
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            agent_skill_installer.parse_cli_arguments(["install", "both"])
+        self.assertEqual(error.exception.code, 2)
+        with self.assertRaises(ValueError):
+            agent_skill_installer.install_selected("both", {"HOME": "/tmp/example-home"})
 
     def test_install_refuses_to_replace_unrelated_skill(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -262,7 +370,7 @@ class AgentSkillInstallerTest(unittest.TestCase):
     def test_popup_arrow_selection_installs_the_highlighted_target(self):
         screen = mock.Mock()
         screen.getmaxyx.return_value = (22, 60)
-        screen.get_wch.side_effect = [curses.KEY_DOWN, curses.KEY_DOWN, "\n", "\x1b"]
+        screen.get_wch.side_effect = [curses.KEY_DOWN] * 5 + ["\n", "\x1b"]
 
         def run_wrapper(callback):
             return callback(screen)
@@ -285,7 +393,7 @@ class AgentSkillInstallerTest(unittest.TestCase):
             )
 
         target = install.call_args.args[0]
-        self.assertEqual((target.scope, target.agent), ("system", "codex"))
+        self.assertEqual((target.scope, target.agent), ("system", "omp"))
 
     def test_question_mark_opens_usage_and_escape_returns_to_targets(self):
         screen = mock.Mock()
@@ -316,6 +424,8 @@ class AgentSkillInstallerTest(unittest.TestCase):
             rendered_text,
         )
         self.assertIn("Claude Code: invoke /herdr-agent-messenger.", rendered)
+        self.assertIn("omp: ask in natural language", rendered_text)
+        self.assertIn("skill://herdr-agent-messenger.", rendered_text)
         self.assertIn("Example target: local/yellow-falcon", rendered)
 
 

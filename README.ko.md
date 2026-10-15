@@ -8,15 +8,16 @@
 
 HAM은 Herdr용 에이전트 라벨링 및 다중 에이전트 메시징 플러그인입니다.
 이름 없는 에이전트에 기억하기 쉬운 `color-animal` 이름을 붙이고, 키보드
-중심 팝업이나 Codex, Claude Code에서 해당 에이전트로 프롬프트를 전달합니다.
+중심 팝업이나 Codex, Claude Code, omp에서 해당 에이전트로 프롬프트를 전달합니다.
+기존 에이전트에 메시지를 보내는 것뿐 아니라 `spawn`으로 새 세션도 시작할 수 있습니다.
 
 ## 주요 기능
 
-- `blue-otter` 같은 자동 라벨과 색상 표시
-- `~/.ssh/config`의 명시적 별칭을 이용한 로컬·SSH 에이전트 탐색
-- 코디네이터 위임과 다중 수신자 직접 전송
-- Codex와 Claude Code용 `herdr-agent-messenger` 스킬
-- 안전한 요청·대기·읽기·배치·원격 배포 도구
+- `blue-otter` 같은 자동 라벨과 색상 표시를 제공합니다.
+- `~/.ssh/config`의 명시적 별칭으로 로컬·SSH 에이전트를 탐색합니다.
+- 코디네이터 위임과 다중 수신자 직접 전송을 지원합니다.
+- Codex, Claude Code, omp용 `herdr-agent-messenger` 스킬을 제공합니다.
+- 안전한 요청·대기·읽기·배치·세션 생성·원격 배포 도구를 제공합니다.
 
 사용자가 직접 붙인 이름은 변경하지 않습니다. 에이전트 주소는
 `local/blue-otter`, `macbook-pro/purple-koala`처럼 항상 호스트를
@@ -53,7 +54,8 @@ Herdr 에이전트 pane에서 **Send Prompt to Agents**를 열어 수신자를 �
 
 Codex에서는 `$ham`을 입력한 뒤 **HAM — Herdr Agent Messenger**를 선택합니다.
 Claude Code에서는 `/herdr-agent-messenger`를 명시적으로 호출하거나 자연어로
-HAM 작업을 요청할 수 있습니다.
+HAM 작업을 요청할 수 있습니다. omp에서는 스킬을 설치한 뒤 자연어로 요청하거나
+`skill://herdr-agent-messenger`를 읽도록 지시합니다.
 
 ```text
 $ham local/yellow-falcon에게 dxp-ui에서 사용하는 언어 라벨을 물어봐.
@@ -63,12 +65,22 @@ $ham local/yellow-falcon에게 dxp-ui에서 사용하는 언어 라벨을 물어
 Herdr에 표시된 정확한 `host/label`을 사용하세요. 라벨만 쓰면 다른 호스트의
 에이전트와 충돌하거나 AI 클라이언트 자체 서브에이전트로 오인될 수 있습니다.
 
+새 에이전트 세션을 열고 메시지를 보내라는 요청에는 `spawn`을 사용한 뒤 반환된
+`address`로 `request --address HOST/LABEL`을 실행하세요. 직접
+`herdr agent start <name>`을 실행하면 HAM의 라벨 선택과 메타데이터 처리를
+우회합니다. 기존 라벨이 없다는 이유만으로 새 세션을 만들거나 라벨을 추측하지 마세요.
+전체 옵션과 예시는 [스킬 가이드](docs/ko/skill-guide.md)를 참고하세요.
+
 Herdr 명령 팔레트의 **HAM Skill**에서 번들 스킬을 설치·갱신하거나 다음 명령을
 실행합니다.
 
 ```bash
 herdr plugin action invoke agent-skill-guide --plugin herdr.agent-messenger
 ```
+
+설치 대상은 `codex`, `claude`, `omp`, `all`입니다. omp의 System 설치 경로는
+`~/.omp/agent/skills/herdr-agent-messenger`이며, Project 설치 경로는
+`<root>/.omp/skills/herdr-agent-messenger`입니다.
 
 HAM 플러그인을 활성화하지 않고 Herdr와 스킬만 사용할 수도 있습니다. 소스 기반
 단독 설치 방법과 제약은 [스킬 가이드](docs/ko/skill-guide.md#플러그인-없이-ham-사용)를

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
 import io
 import os
@@ -84,11 +85,17 @@ class AgentLabelsTest(unittest.TestCase):
                 return mock.Mock(returncode=1, stdout="", stderr="agent_name_taken")
             return mock.Mock(returncode=0, stdout="{}", stderr="")
 
-        with mock.patch.object(agent_labels, "run_herdr", side_effect=fake_run):
+        output = io.StringIO()
+        with (
+            mock.patch.object(agent_labels, "run_herdr", side_effect=fake_run),
+            redirect_stdout(output),
+        ):
             self.assertEqual(agent_labels.assign_label("w1:p2"), 0)
 
         self.assertFalse(any(call[:2] == ("agent", "list") for call in calls))
         self.assertEqual(sum(call[:2] == ("agent", "rename") for call in calls), 2)
+        renamed = [call for call in calls if call[:2] == ("agent", "rename")]
+        self.assertEqual(output.getvalue(), f"{renamed[-1][3]}\n")
         self.assertTrue(any(call[:2] == ("pane", "report-metadata") for call in calls))
 
     def test_conflict_stops_retrying_when_concurrent_hook_named_the_pane(self):
@@ -148,21 +155,30 @@ class AgentLabelsTest(unittest.TestCase):
     def test_metadata_failure_is_visible_to_assignment(self):
         info = {"agent": "codex", "terminal_id": "term-1"}
         renamed = mock.Mock(returncode=0, stdout="", stderr="")
+        output = io.StringIO()
         with (
             mock.patch.object(agent_labels, "fetch_agent_info", return_value=info),
-            mock.patch.object(agent_labels, "run_herdr", return_value=renamed),
+            mock.patch.object(agent_labels, "run_herdr", return_value=renamed) as run,
             mock.patch.object(
                 agent_labels,
                 "report_agent_label_metadata",
                 return_value=False,
             ),
+            redirect_stdout(output),
         ):
             self.assertEqual(agent_labels.assign_label("w1:p3"), 1)
+        self.assertEqual(output.getvalue(), f"{run.call_args.args[3]}\n")
 
     def test_invalid_agent_response_shape_is_ignored(self):
         result = mock.Mock(returncode=0, stdout='{"result":null}', stderr="")
-        with mock.patch.object(agent_labels, "run_herdr", return_value=result):
+        errors = io.StringIO()
+        with (
+            mock.patch.object(agent_labels, "run_herdr", return_value=result),
+            redirect_stderr(errors),
+        ):
             self.assertEqual(agent_labels.fetch_agent_info("w1:p3"), {})
+        self.assertIn("w1:p3", errors.getvalue())
+        self.assertTrue(errors.getvalue().strip())
 
     def test_invalid_agent_session_shape_is_ignored(self):
         info = {
@@ -171,11 +187,14 @@ class AgentLabelsTest(unittest.TestCase):
             "agent_session": "invalid",
         }
         renamed = mock.Mock(returncode=0, stdout="", stderr="")
+        output = io.StringIO()
         with (
             mock.patch.object(agent_labels, "fetch_agent_info", return_value=info),
-            mock.patch.object(agent_labels, "run_herdr", return_value=renamed),
+            mock.patch.object(agent_labels, "run_herdr", return_value=renamed) as run,
+            redirect_stdout(output),
         ):
             self.assertEqual(agent_labels.assign_label("w1:p3"), 0)
+        self.assertEqual(output.getvalue(), f"{run.call_args_list[0].args[3]}\n")
 
     def test_event_envelope_is_supported(self):
         value = '{"event":"pane.agent_detected","data":{"pane_id":"w1:p4","agent":"codex"}}'

@@ -75,6 +75,19 @@ agent, including agents reached over SSH.
 Every operation resolves the current host and Agent Labels occupant again. HAM
 does not silently reuse a stale pane occupant.
 
+For CLI use, copy the exact `address` from `list` or `spawn` into
+`--address HOST/LABEL` on `status`, `send`, `read`, or `request`, or into an `address` field
+in a batch item. An item accepts exactly one of `address` and `route`; duplicate
+resolved occupants are rejected even when represented differently. Only literal
+`local` means local transport; every other host must be a configured concrete
+SSH alias. A non-default `--host` must agree with `--address`.
+
+When asked to start a new session, use HAM `spawn`, then message its returned
+address. Raw `herdr agent start <name>` bypasses HAM label selection and metadata
+reporting. Never create a replacement merely because an existing label is
+missing. Remote spawning requires `--cwd` on that host and, for a split,
+`--from-pane` on that host.
+
 V2 route tokens contain the host, an occupant fingerprint, and hashed continuity
 fields rather than raw session IDs or working directories. A stale registered
 label can refresh only when pane, workspace, and agent kind still match uniquely.
@@ -82,8 +95,12 @@ Unlabeled or display-only routes require stricter continuity. Ambiguous or
 changed occupants remain `route_expired`. V1 tokens remain readable for exact
 matches.
 
-`status`, `send`, `read`, and `request` return `route_refreshed` and a current
-`route`; use that returned token for later operations.
+`status`, `send`, `read`, and request payloads expose `route_refreshed` and a
+current `route`; `spawn` also returns the new occupant's `route`. Use that token
+for later GUI-style operations. A coordinator prompt's supplied absolute CLI
+path and opaque route tokens work without a globally installed skill and can
+select unlabeled agents. Do not decode, modify, or replace tokens with guessed
+commands. If `route_refreshed: true`, retain the new token.
 
 ## Stored metadata
 

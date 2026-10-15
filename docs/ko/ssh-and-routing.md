@@ -52,6 +52,26 @@ Host winmini
 HAM은 명시한 별칭만 표시하고 허용합니다. tailnet의 모든 기기를 자동으로 허용하지
 않습니다.
 
+## CLI 주소 전달과 세션 생성
+
+기존 수신자는 `list`가 반환한 `address`를 그대로 사용하세요. `status`, `send`,
+`read`, `request`는 `--address HOST/LABEL`을 받고, 배치 항목은
+`{"address":"host/label","message":"..."}`을 받습니다. 단일 명령의
+`--address`, `--label`, `--route`는 서로 배타적이며, 배치 항목에도 `address`와
+`route` 중 정확히 하나만 지정합니다. 기본값이 아닌 `--host`가 주소의 호스트와
+다르면 `conflicting_address`로 거부합니다.
+
+사용자가 새 에이전트 세션을 열고 메시지를 보내라고 요청하면 `spawn`으로 시작한 뒤
+반환된 `address`를 `request --address`에 전달하세요. `spawn`은 로컬과 설정된
+SSH 별칭을 지원하며 새 세션에 HAM 라벨과 메타데이터를 적용합니다. 직접
+`herdr agent start <name>`을 사용하면 이 처리를 우회합니다. 기존 라벨을 찾지
+못했다고 해서 추측하거나, 생성 요청 없이 새 세션을 만들지 마세요.
+
+`status`, `spawn` 및 요청 payload가 반환한 `route`는 GUI 방식의 후속 라우팅에
+사용할 수 있습니다. 특히 GUI에서 선택한 에이전트는 라벨이 없을 수도 있으므로
+제공받은 절대 CLI 경로와 불투명한 token을 그대로 사용하고, token을 해독하거나
+수정하지 마세요. 명령과 전체 옵션은 [스킬 가이드](skill-guide.md)를 참고하세요.
+
 ## 전송 방식
 
 에이전트 탐색 후 두 방식 중 하나를 선택합니다.
@@ -80,8 +100,11 @@ V2 route token은 원본 session ID나 작업 디렉터리 대신 호스트, 점
 연속성 조건이 적용됩니다. 모호하거나 점유자가 바뀌면 `route_expired` 상태를
 유지합니다. V1 token은 정확히 일치할 때 계속 읽을 수 있습니다.
 
-`status`, `send`, `read`, `request`는 `route_refreshed`와 현재 `route`를
-반환합니다. 이후 작업에는 반환된 token을 사용하세요.
+`status`, `send`, `read`, `request`는 안전하게 수신자를 확인한 경우
+`route_refreshed`와 현재 `route`를 반환합니다. `spawn`도 생성한 세션의 `route`를
+반환합니다. 이후 작업에는 반환된 token을 사용하세요. 진행 중 요청에서 점유자가
+바뀌면 `error_code: recipient_changed`로 수집을 중단하고 기존 경로와 이미 수집한
+출력만 유지합니다. 새 에이전트의 출력이나 경로를 이전 요청에 연결하지 않습니다.
 
 ## 저장되는 메타데이터
 

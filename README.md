@@ -7,16 +7,16 @@
 [한국어](README.ko.md) · English
 
 HAM is an agent-labeling and multi-agent messaging plugin for Herdr. It gives
-unnamed agents memorable `color-animal` names and routes prompts to those agents
-from a keyboard-first popup, Codex, or Claude Code.
+unnamed agents memorable `color-animal` names, starts new labeled sessions, and
+routes prompts from a keyboard-first popup, Codex, Claude Code, or omp.
 
 ## What HAM provides
 
 - Automatic labels such as `blue-otter` with matching color markers
 - Local and SSH agent discovery using concrete aliases from `~/.ssh/config`
 - Coordinator delegation and direct multi-recipient delivery
-- A bundled `herdr-agent-messenger` skill for Codex and Claude Code
-- Safe request, wait, read, batch, and rollout helpers
+- A bundled `herdr-agent-messenger` skill for Codex, Claude Code, and omp
+- Labeled interactive-session creation with `spawn`, plus safe request, wait, read, batch, and rollout helpers
 
 Manually named agents are left unchanged. Agent addresses are always
 host-qualified, for example `local/blue-otter` or
@@ -52,7 +52,8 @@ choose coordinator delegation or direct delivery.
 
 Codex users can type `$ham` and select **HAM — Herdr Agent Messenger**. Claude
 Code users can invoke `/herdr-agent-messenger` or make a matching natural-language
-request.
+request. omp users can ask naturally to use HAM or read
+`skill://herdr-agent-messenger` after installing the omp skill target.
 
 ```text
 $ham Ask local/yellow-falcon what language label dxp-ui uses. Wait for the
@@ -62,12 +63,30 @@ reply, then align this work and its defaults with that answer.
 Use the exact `host/label` shown by Herdr. A bare label can collide with an agent
 on another host or be mistaken for a client's own subagent.
 
+To start a new agent and message it, ask HAM explicitly to create the session.
+HAM uses `spawn`, then `request --address` with the returned address; it does not
+silently create a session when an existing label is missing. From a checkout:
+
+```bash
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py spawn \
+  --kind omp --cwd "$PWD" --placement tab
+# Copy the returned address, then:
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py request \
+  --address RETURNED_HOST/RETURNED_LABEL --message 'Review this project.'
+```
+
 Install or update the bundled skill from **HAM Skill** in Herdr's command
 palette, or run:
 
 ```bash
 herdr plugin action invoke agent-skill-guide --plugin herdr.agent-messenger
 ```
+
+The installer supports `codex`, `claude`, `omp`, and `all`; for example, from the
+plugin/checkout root, `python3 agent_skill_installer.py install all` installs all
+user-scope targets. The omp destination is
+`~/.omp/agent/skills/herdr-agent-messenger`, or
+`<project>/.omp/skills/herdr-agent-messenger` for a project-scope popup install.
 
 HAM can also be used with Herdr without enabling the plugin. See the
 [skill guide](docs/skill-guide.md#use-ham-without-the-plugin) for the

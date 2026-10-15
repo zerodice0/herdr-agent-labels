@@ -181,6 +181,90 @@ class AgentBatchDispatchTest(unittest.TestCase):
                 )
             self.assertEqual(raised.exception.code, "invalid_workers")
 
+    def test_address_items_are_resolved_before_dispatch(self):
+        sent = []
+
+        def resolve(request):
+            self.assertEqual(request.address, "local/white-bison")
+            return agent_batch_dispatch.BatchRequest("verified", request.message), "agent-1"
+
+        def send(request):
+            sent.append(request)
+            return agent_batch_dispatch.DispatchOutcome(agent_batch_dispatch.SUBMITTED)
+
+        payload = agent_batch_dispatch.dispatch_batch(
+            [{"address": "local/white-bison", "message": "work"}],
+            send,
+            resolve_request=resolve,
+        )
+        self.assertEqual([request.route for request in sent], ["verified"])
+        self.assertEqual(payload["results"][0]["status"], "submitted")
+        self.assertEqual(payload["results"][0]["route"], "verified")
+
+    def test_both_or_neither_address_keys_are_invalid_requests(self):
+        sent = []
+        payload = agent_batch_dispatch.dispatch_batch(
+            [
+                {"route": "token", "address": "local/label", "message": "work"},
+                {"message": "work"},
+            ],
+            lambda request: sent.append(request),
+        )
+        self.assertEqual(
+            [item["error"] for item in payload["results"]],
+            ["invalid_request", "invalid_request"],
+        )
+        self.assertFalse(sent)
+
+    def test_distinct_routes_and_addresses_for_one_identity_are_duplicates(self):
+        sent = []
+
+        def resolve(request):
+            return (
+                agent_batch_dispatch.BatchRequest(
+                    request.route or "resolved-address", request.message
+                ),
+                "same-occupant",
+            )
+
+        payload = agent_batch_dispatch.dispatch_batch(
+            [
+                {"route": "old-route", "message": "one"},
+                {"route": "new-route", "message": "two"},
+                {"address": "local/label", "message": "three"},
+            ],
+            lambda request: sent.append(request),
+            resolve_request=resolve,
+        )
+        self.assertEqual(
+            [item["error"] for item in payload["results"]], ["duplicate_route"] * 3
+        )
+        self.assertFalse(sent)
+
+    def test_resolution_errors_preserve_codes_and_do_not_block_other_items(self):
+        sent = []
+
+        def resolve(request):
+            if request.address:
+                raise CodedError("agent_ambiguous", "multiple occupants")
+            return request, "valid-occupant"
+
+        def send(request):
+            sent.append(request)
+            return agent_batch_dispatch.DispatchOutcome(agent_batch_dispatch.SUCCEEDED)
+
+        payload = agent_batch_dispatch.dispatch_batch(
+            [
+                {"address": "local/label", "message": "one"},
+                {"route": "valid", "message": "two"},
+            ],
+            send,
+            resolve_request=resolve,
+        )
+        self.assertEqual(payload["results"][0]["error"], "agent_ambiguous")
+        self.assertEqual(payload["results"][1]["status"], "succeeded")
+        self.assertEqual([request.route for request in sent], ["valid"])
+
     def test_json_parser_accepts_array_and_requests_wrapper(self):
         expected = [{"route": "one", "message": "instruction"}]
         self.assertEqual(

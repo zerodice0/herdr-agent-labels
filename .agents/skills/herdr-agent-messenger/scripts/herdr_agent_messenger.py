@@ -71,15 +71,18 @@ def find_plugin_root(
             return installed_root
 
     if command_error:
-        raise SystemExit(
+        message = (
             "Could not query HAM plugins through Herdr: "
             f"{command_error}. If this is a sandbox or socket permission error, "
             "rerun with local Herdr socket access."
         )
-    raise SystemExit(
-        "Could not locate HAM as herdr.agent-messenger or the legacy "
-        "herdr.agent-labels plugin."
-    ) from last_error
+    else:
+        message = (
+            "Could not locate HAM as herdr.agent-messenger or the legacy "
+            "herdr.agent-labels plugin."
+        )
+    print(json.dumps({"error": {"code": "cli_not_found", "message": message}}))
+    raise SystemExit(1) from last_error
 
 
 PLUGIN_ROOT = find_plugin_root()

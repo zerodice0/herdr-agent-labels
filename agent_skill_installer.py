@@ -60,6 +60,7 @@ COPY = {
         "system": "System",
         "codex": "Codex",
         "claude": "Claude",
+        "omp": "omp",
         "current": "Current",
         "outdated": "Update available",
         "missing": "Not installed",
@@ -73,6 +74,7 @@ COPY = {
         "usage_intro": "Address agents as host/label; use local for this Herdr server.",
         "usage_codex": "Codex: type $ham, then select HAM — Herdr Agent Messenger.",
         "usage_claude": "Claude Code: invoke /herdr-agent-messenger.",
+        "usage_omp": 'omp: ask in natural language (e.g. "Use HAM to ask local/blue-otter for a status report") or reference skill://herdr-agent-messenger.',
         "usage_target": "Example target: local/yellow-falcon",
         "usage_example": "Prompt: Ask local/yellow-falcon for a status report, wait, and report back.",
         "usage_scope": "Project affects this workspace; System affects every workspace.",
@@ -88,6 +90,7 @@ COPY = {
         "system": "시스템",
         "codex": "Codex",
         "claude": "Claude",
+        "omp": "omp",
         "current": "최신",
         "outdated": "업데이트 가능",
         "missing": "설치되지 않음",
@@ -101,6 +104,7 @@ COPY = {
         "usage_intro": "에이전트는 host/label로 지정하며 현재 Herdr 서버는 local을 사용합니다.",
         "usage_codex": "Codex: $ham을 입력한 뒤 HAM — Herdr Agent Messenger를 선택하세요.",
         "usage_claude": "Claude Code: /herdr-agent-messenger를 호출하세요.",
+        "usage_omp": 'omp: "HAM으로 local/blue-otter에게 상태를 물어봐"처럼 자연어로 요청하거나 skill://herdr-agent-messenger를 참조하세요.',
         "usage_target": "대상 예: local/yellow-falcon",
         "usage_example": "프롬프트: local/yellow-falcon에게 상태를 묻고 응답을 기다린 뒤 보고해줘.",
         "usage_scope": "프로젝트는 현재 작업공간, 시스템은 모든 작업공간에 적용됩니다.",
@@ -116,6 +120,7 @@ COPY = {
         "system": "システム",
         "codex": "Codex",
         "claude": "Claude",
+        "omp": "omp",
         "current": "最新",
         "outdated": "更新可能",
         "missing": "未インストール",
@@ -129,6 +134,7 @@ COPY = {
         "usage_intro": "エージェントは host/label で指定し、現在の Herdr サーバーには local を使います。",
         "usage_codex": "Codex: $ham と入力し、HAM — Herdr Agent Messenger を選択します。",
         "usage_claude": "Claude Code: /herdr-agent-messenger を呼び出します。",
+        "usage_omp": 'omp: 「HAM で local/blue-otter に状態を聞いて」のように自然言語で依頼するか、skill://herdr-agent-messenger を参照します。',
         "usage_target": "宛先の例: local/yellow-falcon",
         "usage_example": "プロンプト: local/yellow-falcon に状態を尋ね、応答を待って報告する。",
         "usage_scope": "プロジェクトは現在のワークスペース、システムはすべてに適用されます。",
@@ -148,6 +154,7 @@ def install_destinations(
     return {
         "codex": home / ".agents" / "skills" / SKILL_NAME,
         "claude": home / ".claude" / "skills" / SKILL_NAME,
+        "omp": home / ".omp" / "agent" / "skills" / SKILL_NAME,
     }
 
 
@@ -172,11 +179,12 @@ def installation_targets(
     project = {
         "codex": root / ".agents" / "skills" / SKILL_NAME if root else None,
         "claude": root / ".claude" / "skills" / SKILL_NAME if root else None,
+        "omp": root / ".omp" / "skills" / SKILL_NAME if root else None,
     }
     return tuple(
         InstallTarget(scope, agent, destinations[agent])
         for scope, destinations in (("project", project), ("system", system))
-        for agent in ("codex", "claude")
+        for agent in ("codex", "claude", "omp")
     )
 
 
@@ -312,9 +320,9 @@ def install_selected(
     environment: Mapping[str, str] | None = None,
 ) -> list[Path]:
     destinations = install_destinations(environment)
-    if selection not in {"codex", "claude", "both"}:
+    if selection not in {"codex", "claude", "omp", "all"}:
         raise ValueError(f"unknown installation target: {selection}")
-    names = ("codex", "claude") if selection == "both" else (selection,)
+    names = ("codex", "claude", "omp") if selection == "all" else (selection,)
     installed: list[Path] = []
     for name in names:
         destination = destinations[name]
@@ -431,6 +439,7 @@ def popup(environment: Mapping[str, str] | None = None) -> int:
                     "",
                     text["usage_codex"],
                     text["usage_claude"],
+                    text["usage_omp"],
                     "",
                     text["usage_target"],
                     text["usage_example"],
@@ -534,7 +543,7 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     subparsers.add_parser("launch")
     subparsers.add_parser("popup")
     install_parser = subparsers.add_parser("install")
-    install_parser.add_argument("target", choices=("codex", "claude", "both"))
+    install_parser.add_argument("target", choices=("codex", "claude", "omp", "all"))
     return parser.parse_args(argv)
 
 

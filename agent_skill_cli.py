@@ -57,6 +57,7 @@ from agent_output import (
     compact_output,
     output_stream_id,
 )
+from agent_spawn import SpawnError, add_spawn_parser, spawn_command
 from request_lifecycle import (
     JsonRequestStateStore,
     OutputSnapshot,
@@ -172,6 +173,24 @@ def resolve_or_refresh_routed_agent(
         return resolve_agent_route(route, discover_agents(host, environment))
     except AgentRouteError as error:
         raise SkillCommandError(error.code, error.message) from None
+
+
+def parse_agent_address(address: str, host: str = "local") -> tuple[str, str]:
+    """Split a list-provided address without guessing a host or label."""
+
+    parts = address.split("/")
+    if len(parts) != 2 or not all(parts) or any(
+        character.isspace() for character in address
+    ):
+        raise SkillCommandError(
+            "invalid_address", "An address must have the form HOST/LABEL."
+        )
+    address_host, label = parts
+    if host != "local" and host != address_host:
+        raise SkillCommandError(
+            "conflicting_address", "--host disagrees with the address host."
+        )
+    return address_host, label
 
 
 def resolve_recipient(
@@ -342,7 +361,8 @@ class AgentRequestTransport(RequestTransport[AgentRecord]):
     def submit(self, target: AgentRecord, prompt: str) -> SubmissionResult:
         if target.identity == self._sender_identity:
             return SubmissionResult.failed(
-                "The current sender cannot also be the recipient."
+                "The current sender cannot also be the recipient.",
+                code="recipient_is_sender",
             )
         command = _agent_command(
             target,
@@ -636,6 +656,22 @@ def batch_command(
         )
     items = parse_batch_json(requests_json)
 
+    def resolve_request(request: BatchRequest) -> tuple[BatchRequest, str]:
+        if request.address:
+            host, label = parse_agent_address(request.address)
+            resolution = resolve_or_refresh_recipient(
+                host=host,
+                label=label,
+                route=None,
+                environment=environment,
+            )
+        else:
+            resolution = resolve_or_refresh_routed_agent(request.route, environment)
+        return (
+            BatchRequest(resolution.route, request.message),
+            resolution.agent.identity,
+        )
+
     def send_one(request: BatchRequest) -> DispatchOutcome:
         try:
             if wait:
@@ -675,6 +711,7 @@ def batch_command(
         send_one,
         max_workers=max_workers,
         cancel_event=cancel_event,
+        resolve_request=resolve_request,
     )
 
 
@@ -934,24 +971,50 @@ def _record_request_route(
         store.save(request_id, payload)
 
 
-def _public_request_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Hide private routing and baseline data from the CLI interface."""
+# Agent tools often truncate long single-line JSON, so decision fields come
+# first and bulky output, identity, and route data come last.
+_REQUEST_PAYLOAD_TRAILING_KEYS = ("response", "recipient", "sender", "route")
 
-    return {
+
+def _public_request_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Hide private data and put lifecycle decision fields before bulky data."""
+
+    public = {
         key: value
         for key, value in payload.items()
         if not key.startswith("_")
     }
+    ordered = {
+        key: value
+        for key, value in public.items()
+        if key not in _REQUEST_PAYLOAD_TRAILING_KEYS
+    }
+    ordered.update(
+        (key, public[key]) for key in _REQUEST_PAYLOAD_TRAILING_KEYS if key in public
+    )
+    return ordered
+
+
+def _add_recipient_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--host", default="local", help="Herdr host: local or a configured SSH alias."
+    )
+    address = parser.add_mutually_exclusive_group(required=True)
+    address.add_argument("--label", help="Exact current agent label on --host.")
+    address.add_argument("--route", help="Opaque verified route returned by HAM.")
+    address.add_argument("--address", help="Exact HOST/LABEL address returned by list.")
 
 
 def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Route Herdr prompts using a label or verified GUI route."
+        description="Route Herdr prompts using an address, label, or verified route."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     list_parser = subparsers.add_parser("list", help="List current labeled agents.")
-    list_parser.add_argument("--host", default="local")
+    list_parser.add_argument(
+        "--host", default="local", help="Herdr host: local or a configured SSH alias."
+    )
     list_parser.add_argument(
         "--verbose",
         action="store_true",
@@ -968,10 +1031,7 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
         "status",
         help="Read one resolved agent's current status.",
     )
-    status_parser.add_argument("--host", default="local")
-    status_address = status_parser.add_mutually_exclusive_group(required=True)
-    status_address.add_argument("--label")
-    status_address.add_argument("--route")
+    _add_recipient_arguments(status_parser)
     status_parser.add_argument(
         "--verbose",
         action="store_true",
@@ -982,19 +1042,27 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
         "send",
         help="Send a prompt to one resolved agent.",
     )
-    send_parser.add_argument("--host", default="local")
-    send_address = send_parser.add_mutually_exclusive_group(required=True)
-    send_address.add_argument("--label")
-    send_address.add_argument("--route")
-    send_parser.add_argument("--message", required=True)
+    _add_recipient_arguments(send_parser)
+    send_parser.add_argument(
+        "--message", required=True, help="Prompt text to send unchanged."
+    )
     wait_group = send_parser.add_mutually_exclusive_group()
-    wait_group.add_argument("--wait", dest="wait", action="store_true", default=True)
-    wait_group.add_argument("--no-wait", dest="wait", action="store_false")
-    send_parser.add_argument("--timeout", type=int, default=DEFAULT_WAIT_TIMEOUT_MS)
+    wait_group.add_argument(
+        "--wait", dest="wait", action="store_true", default=True,
+        help="Wait for Herdr's completion signal (default).",
+    )
+    wait_group.add_argument(
+        "--no-wait", dest="wait", action="store_false",
+        help="Return after prompt acceptance without waiting.",
+    )
+    send_parser.add_argument(
+        "--timeout", type=int, default=DEFAULT_WAIT_TIMEOUT_MS,
+        help="Wait deadline in ms (default: 120000).",
+    )
 
     batch_parser = subparsers.add_parser(
         "batch",
-        help="Send pre-tailored route/message JSON with bounded concurrency.",
+        help="Send tailored address/message or route/message JSON concurrently.",
     )
     batch_parser.add_argument(
         "--requests-json",
@@ -1007,28 +1075,37 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
         dest="wait",
         action="store_true",
         default=True,
+        help="Observe each submitted request through its lifecycle (default).",
     )
-    batch_wait_group.add_argument("--no-wait", dest="wait", action="store_false")
-    batch_parser.add_argument("--timeout", type=int, default=DEFAULT_WAIT_TIMEOUT_MS)
+    batch_wait_group.add_argument(
+        "--no-wait", dest="wait", action="store_false",
+        help="Return after prompt acceptance without observing completion.",
+    )
+    batch_parser.add_argument(
+        "--timeout", type=int, default=DEFAULT_WAIT_TIMEOUT_MS,
+        help="Per-request wait deadline in ms (default: 120000).",
+    )
     batch_parser.add_argument(
         "--max-workers",
         type=int,
         default=DEFAULT_BATCH_WORKERS,
+        help="Concurrent dispatch limit, 1–8 (default: 4).",
     )
 
     read_parser = subparsers.add_parser(
         "read",
         help="Read one resolved agent's recent output.",
     )
-    read_parser.add_argument("--host", default="local")
-    read_address = read_parser.add_mutually_exclusive_group(required=True)
-    read_address.add_argument("--label")
-    read_address.add_argument("--route")
-    read_parser.add_argument("--lines", type=int, default=DEFAULT_READ_LINES)
+    _add_recipient_arguments(read_parser)
+    read_parser.add_argument(
+        "--lines", type=int, default=DEFAULT_READ_LINES,
+        help="Maximum recent output lines (default: 120).",
+    )
     read_parser.add_argument(
         "--max-bytes",
         type=int,
         default=DEFAULT_READ_MAX_BYTES,
+        help="Maximum UTF-8 output bytes (default: 65536).",
     )
     read_parser.add_argument(
         "--cursor",
@@ -1041,28 +1118,35 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
         "request",
         help="Submit, safely observe, and read one agent request.",
     )
-    request_parser.add_argument("--host", default="local")
-    request_address = request_parser.add_mutually_exclusive_group(required=True)
-    request_address.add_argument("--label")
-    request_address.add_argument("--route")
-    request_parser.add_argument("--message", required=True)
-    request_parser.add_argument("--timeout", type=int, default=DEFAULT_WAIT_TIMEOUT_MS)
+    _add_recipient_arguments(request_parser)
+    request_parser.add_argument(
+        "--message", required=True, help="Prompt text for this request."
+    )
+    request_parser.add_argument(
+        "--timeout", type=int, default=DEFAULT_WAIT_TIMEOUT_MS,
+        help="Lifecycle observation deadline in ms (default: 120000).",
+    )
     request_parser.add_argument(
         "--output-lines",
         type=int,
         default=DEFAULT_READ_LINES,
+        help="Maximum response lines (default: 120).",
     )
     request_parser.add_argument(
         "--output-chars",
         type=int,
         default=DEFAULT_REQUEST_OUTPUT_CHARS,
+        help="Maximum response characters (default: 12000).",
     )
 
     request_status_parser = subparsers.add_parser(
         "request-status",
         help="Read the latest stored state for a request ID.",
     )
-    request_status_parser.add_argument("--request-id", required=True)
+    request_status_parser.add_argument(
+        "--request-id", required=True, help="Request ID returned by request or batch."
+    )
+    add_spawn_parser(subparsers)
     return parser.parse_args(argv)
 
 
@@ -1070,9 +1154,15 @@ def main(
     argv: Sequence[str] | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> int:
-    arguments = parse_cli_arguments(argv)
+    command = ""
     exit_code = 0
     try:
+        arguments = parse_cli_arguments(argv)
+        command = arguments.command
+        if getattr(arguments, "address", None) is not None:
+            arguments.host, arguments.label = parse_agent_address(
+                arguments.address, arguments.host
+            )
         if arguments.command == "list":
             payload = list_command(
                 arguments.host,
@@ -1110,8 +1200,11 @@ def main(
                 max_workers=arguments.max_workers,
                 environment=environment,
             )
-            if payload["status"] != SUCCEEDED:
+            statuses = [item["status"] for item in payload["results"]]
+            if any(status in {FAILED, CANCELLED, TIMED_OUT} for status in statuses):
                 exit_code = 1
+            elif SUBMITTED in statuses:
+                exit_code = 3
         elif arguments.command == "read":
             payload = read_command(
                 host=arguments.host,
@@ -1138,16 +1231,31 @@ def main(
                 request_id=arguments.request_id,
                 environment=environment,
             )
+        elif arguments.command == "spawn":
+            payload = spawn_command(arguments, environment)
         else:  # pragma: no cover - argparse rejects unknown commands
             raise SkillCommandError("invalid_command", "Unsupported command.")
-    except (BatchDispatchError, SkillCommandError) as error:
+        if command in {"request", "request-status"}:
+            exit_code = {
+                "submitted_settled": 0,
+                "submission_failed": 1,
+                "submitted_working": 3,
+                "submitted_unknown": 3,
+            }[payload["state"]]
+        _write_json(payload, compact=command == "batch")
+        return exit_code
+    except (BatchDispatchError, SkillCommandError, SpawnError) as error:
         _write_json(
             {"error": {"code": error.code, "message": error.message}},
-            compact=arguments.command == "batch",
+            compact=command == "batch",
         )
         return 1
-    _write_json(payload, compact=arguments.command == "batch")
-    return exit_code
+    except Exception as error:
+        _write_json(
+            {"error": {"code": "internal_error", "message": str(error)}},
+            compact=command == "batch",
+        )
+        return 1
 
 
 if __name__ == "__main__":

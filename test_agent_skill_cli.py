@@ -54,6 +54,12 @@ def agent(
     )
 
 
+def batch_route_resolution(route, environment=None):
+    return agent_skill_cli.RouteResolution(
+        agent(name=route, pane_id=route), route_refreshed=False, route=route
+    )
+
+
 class AgentSkillCliTest(unittest.TestCase):
     def test_local_discovery_reports_snapshot_permission_failure(self):
         failed = agent_directory.ProbeResult(
@@ -604,6 +610,9 @@ class AgentSkillCliTest(unittest.TestCase):
                 )
             self.assertEqual(raised.exception.code, expected_code)
 
+    @mock.patch.object(
+        agent_skill_cli, "resolve_or_refresh_routed_agent", new=batch_route_resolution
+    )
     def test_batch_reuses_request_lifecycle_and_aggregates_results(self):
         def request_command(**arguments):
             route = arguments["route"]
@@ -659,6 +668,9 @@ class AgentSkillCliTest(unittest.TestCase):
         self.assertEqual(payload["results"][0]["response"]["output"], "answer\n")
         self.assertEqual(payload["status"], "partial")
 
+    @mock.patch.object(
+        agent_skill_cli, "resolve_or_refresh_routed_agent", new=batch_route_resolution
+    )
     def test_batch_no_wait_reports_submitted(self):
         with mock.patch.object(
             agent_skill_cli,
@@ -676,6 +688,9 @@ class AgentSkillCliTest(unittest.TestCase):
         self.assertEqual(payload["status"], "succeeded")
         self.assertEqual(payload["results"][0]["status"], "submitted")
 
+    @mock.patch.object(
+        agent_skill_cli, "resolve_or_refresh_routed_agent", new=batch_route_resolution
+    )
     def test_no_wait_batch_does_not_turn_uncertain_submission_into_failure(self):
         with mock.patch.object(agent_skill_cli, "send_command", side_effect=agent_skill_cli.SkillCommandError(
             "prompt_acceptance_unknown", "Connection lost after possible delivery.",
@@ -740,6 +755,9 @@ class AgentSkillCliTest(unittest.TestCase):
         request.assert_not_called()
         self.assertEqual(payload["results"][0]["status"], "cancelled")
 
+    @mock.patch.object(
+        agent_skill_cli, "resolve_or_refresh_routed_agent", new=batch_route_resolution
+    )
     def test_batch_returns_a_future_refreshed_route(self):
         with mock.patch.object(
             agent_skill_cli,
@@ -1096,6 +1114,275 @@ class AgentSkillCliTest(unittest.TestCase):
         )
 
 
+class AgentSkillContractTest(unittest.TestCase):
+    def test_request_and_status_exit_codes_follow_lifecycle_state(self):
+        states = {
+            "submitted_settled": 0,
+            "submission_failed": 1,
+            "submitted_working": 3,
+            "submitted_unknown": 3,
+        }
+        commands = (
+            ("request", ["--route", "token", "--message", "work"], "request_command"),
+            ("request-status", ["--request-id", "a" * 32], "request_status_command"),
+        )
+        for command, flags, handler in commands:
+            for state, expected in states.items():
+                payload = {"state": state, "error_code": None}
+                output = StringIO()
+                with (
+                    self.subTest(command=command, state=state),
+                    mock.patch.object(agent_skill_cli, handler, return_value=payload),
+                    mock.patch("sys.stdout", output),
+                ):
+                    result = agent_skill_cli.main([command, *flags], {})
+                    self.assertEqual(result, expected)
+                    self.assertEqual(json.loads(output.getvalue()), payload)
+
+    def test_batch_exit_codes_inspect_items_not_aggregate_delivery(self):
+        cases = (
+            (["succeeded"], 0),
+            (["succeeded", "submitted"], 3),
+            (["submitted"], 3),
+            (["succeeded", "failed"], 1),
+            (["submitted", "cancelled"], 1),
+            (["submitted", "timeout"], 1),
+        )
+        for statuses, expected in cases:
+            payload = {
+                "status": "succeeded",
+                "results": [
+                    {"route": str(index), "status": status}
+                    for index, status in enumerate(statuses)
+                ],
+            }
+            output = StringIO()
+            with (
+                self.subTest(statuses=statuses),
+                mock.patch.object(agent_skill_cli, "batch_command", return_value=payload),
+                mock.patch("sys.stdout", output),
+            ):
+                result = agent_skill_cli.main(
+                    ["batch", "--requests-json", "[]"], {}
+                )
+                self.assertEqual(result, expected)
+                self.assertEqual(json.loads(output.getvalue()), payload)
+
+    def test_unexpected_exceptions_return_internal_error_envelope(self):
+        output = StringIO()
+        with (
+            mock.patch.object(
+                agent_skill_cli, "list_command", side_effect=RuntimeError("broken")
+            ),
+            mock.patch("sys.stdout", output),
+        ):
+            result = agent_skill_cli.main(["list"], {})
+        self.assertEqual(result, 1)
+        self.assertEqual(json.loads(output.getvalue())["error"]["code"], "internal_error")
+
+    def test_address_resolves_exact_remote_label(self):
+        recipient = agent(host="remote", name="purple-koala", local=False)
+        for flags in ([], ["--host", "remote"], ["--host", "local"]):
+            output = StringIO()
+            with (
+                self.subTest(flags=flags),
+                mock.patch.object(
+                    agent_skill_cli, "discover_agents", return_value=[recipient]
+                ) as discover,
+                mock.patch("sys.stdout", output),
+            ):
+                result = agent_skill_cli.main(
+                    ["status", "--address", "remote/purple-koala", *flags], {}
+                )
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                json.loads(output.getvalue())["agent"]["address"], "remote/purple-koala"
+            )
+            self.assertEqual(discover.call_args.args[0], "remote")
+
+    def test_address_is_available_on_each_recipient_command(self):
+        for command, extra in (
+            ("status", []),
+            ("send", ["--message", "work"]),
+            ("read", []),
+            ("request", ["--message", "work"]),
+        ):
+            with self.subTest(command=command):
+                arguments = agent_skill_cli.parse_cli_arguments(
+                    [command, "--address", "local/white-bison", *extra]
+                )
+                self.assertEqual(arguments.address, "local/white-bison")
+                self.assertIsNone(arguments.label)
+                self.assertIsNone(arguments.route)
+
+    def test_address_cannot_be_combined_with_label_or_route(self):
+        for flag in ("--label", "--route"):
+            with (
+                self.subTest(flag=flag),
+                mock.patch("sys.stderr"),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                agent_skill_cli.parse_cli_arguments(
+                    ["status", "--address", "local/white-bison", flag, "other"]
+                )
+            self.assertEqual(raised.exception.code, 2)
+
+    def test_invalid_and_conflicting_addresses_fail_before_discovery(self):
+        cases = [
+            (address, [], "invalid_address")
+            for address in ("", "label", "/label", "host/", "a/b/c", "host/ label")
+        ]
+        cases.append(("remote/label", ["--host", "other"], "conflicting_address"))
+        for address, extra, code in cases:
+            output = StringIO()
+            with (
+                self.subTest(address=address, extra=extra),
+                mock.patch.object(agent_skill_cli, "discover_agents") as discover,
+                mock.patch("sys.stdout", output),
+            ):
+                result = agent_skill_cli.main(
+                    ["status", "--address", address, *extra], {}
+                )
+            self.assertEqual(result, 1)
+            self.assertEqual(json.loads(output.getvalue())["error"]["code"], code)
+            discover.assert_not_called()
+
+    def test_batch_address_submits_to_the_label_resolved_occupant(self):
+        recipient = agent(pane_id="w1:p2")
+        sender = agent(name="blue-raven")
+        commands = []
+
+        def run(command, **options):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            mock.patch.object(
+                agent_skill_cli, "discover_agents", return_value=[recipient]
+            ),
+            mock.patch.object(agent_skill_cli, "current_sender", return_value=sender),
+            mock.patch.object(agent_skill_cli, "run_bounded_command", side_effect=run),
+        ):
+            result = agent_skill_cli.batch_command(
+                requests_json='[{"address":"local/white-bison","message":"work"}]',
+                wait=False, timeout_ms=1000, max_workers=1, environment={},
+            )
+        self.assertEqual(result["results"][0]["status"], "submitted")
+        self.assertEqual(len(commands), 1)
+        self.assertIn(recipient.target, commands[0])
+        self.assertEqual(
+            agent_skill_cli.route_host(result["results"][0]["route"]), "local"
+        )
+
+    def test_batch_duplicate_route_and_address_never_submit(self):
+        recipient = agent(pane_id="w1:p2")
+        route = agent_skill_cli.encode_agent_route(recipient)
+        with (
+            mock.patch.object(
+                agent_skill_cli, "discover_agents", return_value=[recipient]
+            ),
+            mock.patch.object(agent_skill_cli, "send_command") as send,
+        ):
+            result = agent_skill_cli.batch_command(
+                requests_json=json.dumps([
+                    {"route": route, "message": "one"},
+                    {"address": "local/white-bison", "message": "two"},
+                    {"route": route, "message": "three"},
+                ]),
+                wait=False, timeout_ms=1000, max_workers=1, environment={},
+            )
+        self.assertEqual(
+            [item["error"] for item in result["results"]], ["duplicate_route"] * 3
+        )
+        send.assert_not_called()
+
+    def test_request_preserves_resolver_error_codes(self):
+        errors = (
+            agent_skill_cli.SkillCommandError("agent_not_found", "missing"),
+            agent_skill_cli.AgentRouteError("route_expired", "expired"),
+        )
+        for error in errors:
+            with (
+                self.subTest(code=error.code),
+                tempfile.TemporaryDirectory() as directory,
+                mock.patch.object(
+                    agent_skill_cli, "current_sender", return_value=agent()
+                ),
+            ):
+                result = agent_skill_cli.request_command(
+                    host="local", route="token", message="work", timeout_ms=1000,
+                    output_lines=10, output_chars=100, environment={},
+                    resolver=mock.Mock(side_effect=error),
+                    state_store=agent_skill_cli.JsonRequestStateStore(Path(directory)),
+                )
+            self.assertEqual(result["state"], "submission_failed")
+            self.assertEqual(result["error_code"], error.code)
+
+    def test_self_request_reports_recipient_is_sender(self):
+        sender = agent()
+        runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(agent_skill_cli, "current_sender", return_value=sender),
+        ):
+            result = agent_skill_cli.request_command(
+                host="local", label=sender.name, message="work", timeout_ms=1000,
+                output_lines=10, output_chars=100, environment={},
+                resolver=lambda: sender, command_runner=runner,
+                state_store=agent_skill_cli.JsonRequestStateStore(Path(directory)),
+            )
+        self.assertEqual(result["state"], "submission_failed")
+        self.assertEqual(result["error_code"], "recipient_is_sender")
+        self.assertTrue(all("prompt" not in call.args[0] for call in runner.call_args_list))
+
+    def test_spawn_errors_use_the_standard_error_envelope(self):
+        output = StringIO()
+        with (
+            mock.patch.object(
+                agent_skill_cli, "spawn_command",
+                side_effect=agent_skill_cli.SpawnError("spawn_failed", "failed"),
+            ),
+            mock.patch("sys.stdout", output),
+        ):
+            result = agent_skill_cli.main(["spawn", "--kind", "codex"], {})
+        self.assertEqual(result, 1)
+        self.assertEqual(json.loads(output.getvalue())["error"]["code"], "spawn_failed")
+
+
+    def test_default_request_resolver_preserves_invalid_route_code(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(agent_skill_cli, "current_sender", return_value=agent()),
+        ):
+            result = agent_skill_cli.request_command(
+                host="local", route="not-a-route", message="work", timeout_ms=1000,
+                output_lines=10, output_chars=100, environment={},
+                state_store=agent_skill_cli.JsonRequestStateStore(Path(directory)),
+            )
+        self.assertEqual(result["state"], "submission_failed")
+        self.assertEqual(result["error_code"], "invalid_route")
+
+    def test_batch_rejects_malformed_addresses_without_submission(self):
+        with mock.patch.object(agent_skill_cli, "send_command") as send:
+            result = agent_skill_cli.batch_command(
+                requests_json='[{"address":"missing-host","message":"work"}]',
+                wait=False, timeout_ms=1000, max_workers=1, environment={},
+            )
+        self.assertEqual(result["results"][0]["error"], "invalid_address")
+        send.assert_not_called()
+
+    def test_spawn_success_returns_payload_and_zero_exit(self):
+        payload = {"address": "local/white-bison", "created": "pane"}
+        output = StringIO()
+        with (
+            mock.patch.object(agent_skill_cli, "spawn_command", return_value=payload),
+            mock.patch("sys.stdout", output),
+        ):
+            result = agent_skill_cli.main(["spawn", "--kind", "codex"], {})
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue()), payload)
+
+
 class AgentSkillWrapperTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1213,14 +1500,20 @@ class AgentSkillWrapperTest(unittest.TestCase):
             ),
         )
         for completed in cases:
+            output = StringIO()
             with (
                 self.subTest(stdout=completed.stdout),
-                self.assertRaises(SystemExit),
+                mock.patch("sys.stdout", output),
+                self.assertRaises(SystemExit) as raised,
             ):
                 self.wrapper.find_plugin_root(
                     Path("/tmp/copied-skill/scripts/herdr_agent_messenger.py"),
                     mock.Mock(return_value=completed),
                 )
+            self.assertEqual(raised.exception.code, 1)
+            self.assertEqual(
+                json.loads(output.getvalue())["error"]["code"], "cli_not_found"
+            )
 
     def test_standalone_wrapper_preserves_plugin_probe_failure(self):
         failed = subprocess.CompletedProcess(
@@ -1229,25 +1522,36 @@ class AgentSkillWrapperTest(unittest.TestCase):
             "",
             "Operation not permitted",
         )
-        with self.assertRaises(SystemExit) as raised:
+        output = StringIO()
+        with (
+            mock.patch("sys.stdout", output),
+            self.assertRaises(SystemExit) as raised,
+        ):
             self.wrapper.find_plugin_root(
                 Path("/tmp/copied-skill/scripts/herdr_agent_messenger.py"),
                 mock.Mock(return_value=failed),
             )
 
-        self.assertIn("Could not query HAM plugins", str(raised.exception))
-        self.assertIn("Operation not permitted", str(raised.exception))
-        self.assertIn("local Herdr socket access", str(raised.exception))
+        self.assertEqual(raised.exception.code, 1)
+        error = json.loads(output.getvalue())["error"]
+        self.assertEqual(error["code"], "cli_not_found")
+        self.assertIn("Operation not permitted", error["message"])
 
     def test_standalone_wrapper_preserves_plugin_command_launch_failure(self):
-        with self.assertRaises(SystemExit) as raised:
+        output = StringIO()
+        with (
+            mock.patch("sys.stdout", output),
+            self.assertRaises(SystemExit) as raised,
+        ):
             self.wrapper.find_plugin_root(
                 Path("/tmp/copied-skill/scripts/herdr_agent_messenger.py"),
                 mock.Mock(side_effect=OSError("herdr unavailable")),
             )
 
-        self.assertIn("Could not query HAM plugins", str(raised.exception))
-        self.assertIn("herdr unavailable", str(raised.exception))
+        self.assertEqual(raised.exception.code, 1)
+        error = json.loads(output.getvalue())["error"]
+        self.assertEqual(error["code"], "cli_not_found")
+        self.assertIn("herdr unavailable", error["message"])
 
 
 if __name__ == "__main__":

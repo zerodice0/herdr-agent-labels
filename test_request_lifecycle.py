@@ -78,7 +78,9 @@ class FakeTransport:
         )
 
 
-def run_machine(targets, submission, *, timeout=3.0, lines=20, chars=500):
+def run_machine(
+    targets, submission, *, timeout=3.0, lines=20, chars=500, prompt="do it",
+):
     store = MemoryStore()
     clock = FakeClock()
     transport = FakeTransport(targets, submission)
@@ -90,7 +92,7 @@ def run_machine(targets, submission, *, timeout=3.0, lines=20, chars=500):
     )
     result = machine.run(
         request_id="1" * 32,
-        prompt="do it",
+        prompt=prompt,
         timeout_seconds=timeout,
         poll_interval_seconds=1.0,
         max_output_lines=lines,
@@ -100,6 +102,44 @@ def run_machine(targets, submission, *, timeout=3.0, lines=20, chars=500):
 
 
 class RequestLifecycleMachineTest(unittest.TestCase):
+    def test_resolve_failure_preserves_machine_readable_error_code(self):
+        for error, code in (
+            (RuntimeError("discovery failed"), "resolve_failed"),
+            (
+                agent_skill_cli.SkillCommandError("agent_not_found", "not found"),
+                "agent_not_found",
+            ),
+        ):
+            with self.subTest(code=code):
+                store = MemoryStore()
+                transport = FakeTransport(
+                    [FakeTarget("worker", "idle")], SubmissionResult.submitted(),
+                )
+                transport.resolve = mock.Mock(side_effect=error)
+                result = RequestLifecycleMachine(transport, store).run(
+                    request_id="a" * 32,
+                    prompt="do it",
+                    timeout_seconds=3,
+                    poll_interval_seconds=1,
+                    max_output_lines=20,
+                    max_output_chars=500,
+                )
+
+                self.assertEqual(result["state"], "submission_failed")
+                self.assertEqual(result["error_code"], code)
+                self.assertIsNone(store.history[0]["error"])
+                self.assertIsNone(store.history[0]["error_code"])
+                self.assertFalse(transport.prompts)
+
+    def test_submission_failure_uses_transport_error_code(self):
+        result, _store, _transport = run_machine(
+            [FakeTarget("worker", "idle")],
+            SubmissionResult.failed("cannot send to self", code="recipient_is_sender"),
+        )
+
+        self.assertEqual(result["state"], "submission_failed")
+        self.assertEqual(result["error_code"], "recipient_is_sender")
+
     def test_submission_failure_is_terminal_and_distinct(self):
         result, store, transport = run_machine(
             [FakeTarget("agent-1", "idle", "before")],
@@ -110,6 +150,7 @@ class RequestLifecycleMachineTest(unittest.TestCase):
         self.assertFalse(result["submitted"])
         self.assertFalse(result["timed_out"])
         self.assertEqual(result["error"], "rejected")
+        self.assertEqual(result["error_code"], "prompt_failed")
         self.assertEqual(len(transport.prompts), 1)
         self.assertEqual(store.load(result["request_id"]), result)
 
@@ -117,13 +158,18 @@ class RequestLifecycleMachineTest(unittest.TestCase):
         idle = FakeTarget("agent-1", "idle", "before")
         result, _store, _transport = run_machine(
             [idle, idle, idle, idle],
-            SubmissionResult.unknown("command timed out", timed_out=True),
+            SubmissionResult.unknown(
+                "command timed out",
+                timed_out=True,
+                code="prompt_acceptance_unknown",
+            ),
         )
 
         self.assertEqual(result["state"], "submitted_unknown")
         self.assertIsNone(result["submitted"])
         self.assertTrue(result["submission_timed_out"])
         self.assertTrue(result["timed_out"])
+        self.assertEqual(result["error_code"], "prompt_acceptance_unknown")
 
     def test_timeout_exception_is_also_an_unknown_submission(self):
         idle = FakeTarget("agent-1", "idle", "before")
@@ -135,6 +181,7 @@ class RequestLifecycleMachineTest(unittest.TestCase):
         self.assertEqual(result["state"], "submitted_unknown")
         self.assertIsNone(result["submitted"])
         self.assertTrue(result["submission_timed_out"])
+        self.assertEqual(result["error_code"], "prompt_acceptance_unknown")
 
     def test_fresh_working_then_nonworking_is_settled(self):
         result, _store, _transport = run_machine(
@@ -152,6 +199,8 @@ class RequestLifecycleMachineTest(unittest.TestCase):
         self.assertEqual(result["response"]["output"], "answer\n")
         self.assertTrue(result["response"]["correlated"])
         self.assertFalse(result["response"]["truncated"])
+        self.assertIsNone(result["error"])
+        self.assertIsNone(result["error_code"])
 
     def test_working_at_wait_deadline_remains_a_submitted_working_timeout(self):
         working = FakeTarget("agent-1", "working", "before\npartial\n")
@@ -164,6 +213,7 @@ class RequestLifecycleMachineTest(unittest.TestCase):
         self.assertTrue(result["timed_out"])
         self.assertTrue(result["requested_turn_observed"])
         self.assertFalse(result["terminal"])
+        self.assertEqual(result["error_code"], "wait_timed_out")
 
     def test_cancel_stops_waiting_without_forgetting_accepted_submission(self):
         store = MemoryStore()
@@ -193,6 +243,7 @@ class RequestLifecycleMachineTest(unittest.TestCase):
         self.assertEqual(result["state"], "submitted_working")
         self.assertEqual(result["phase"], "wait_cancelled")
         self.assertFalse(result["terminal"])
+        self.assertEqual(result["error_code"], "cancelled")
 
     def test_refresh_advances_a_timed_out_working_request_to_settled(self):
         working = FakeTarget("agent-1", "working", "before\npartial\n")
@@ -212,6 +263,106 @@ class RequestLifecycleMachineTest(unittest.TestCase):
         self.assertTrue(refreshed["terminal"])
         self.assertFalse(refreshed["timed_out"])
         self.assertEqual(refreshed["response"]["output"], "answer\n")
+        self.assertIsNone(refreshed["error"])
+        self.assertIsNone(refreshed["error_code"])
+
+    def test_refresh_resolve_failure_preserves_error_code_then_clears_it(self):
+        working = FakeTarget("worker", "working", "before\npartial\n")
+        for error, code in (
+            (RuntimeError("discovery failed"), "resolve_failed"),
+            (
+                agent_skill_cli.SkillCommandError("host_unavailable", "unavailable"),
+                "host_unavailable",
+            ),
+        ):
+            with self.subTest(code=code):
+                result, store, _transport = run_machine(
+                    [FakeTarget("worker", "idle", "before\n"), working],
+                    SubmissionResult.submitted(),
+                )
+                transport = FakeTransport(
+                    [working], SubmissionResult.submitted(),
+                )
+                transport.resolve = mock.Mock(side_effect=[
+                    error,
+                    working,
+                    FakeTarget("worker", "done", "before\nanswer\n"),
+                ])
+                machine = RequestLifecycleMachine(transport, store)
+
+                unavailable = machine.refresh(request_id=result["request_id"])
+                self.assertEqual(unavailable["error_code"], code)
+                self.assertFalse(unavailable["terminal"])
+                resumed = machine.refresh(request_id=result["request_id"])
+                self.assertIsNone(resumed["error"])
+                self.assertIsNone(resumed["error_code"])
+                settled = machine.refresh(request_id=result["request_id"])
+                self.assertEqual(settled["state"], "submitted_settled")
+                self.assertIsNone(settled["error"])
+                self.assertIsNone(settled["error_code"])
+
+    def test_rewritten_screen_anchors_response_without_changing_correlation(self):
+        prompt = "Message from x/y:\n\ndo it"
+        reply = "Message from x/y:\n\ndo it\nreply\n"
+        screen = "omp startup banner\navailable models\n" + reply
+        for baseline in ("old screen\n", ""):
+            for settled in (False, True):
+                with self.subTest(baseline=baseline, settled=settled):
+                    targets = [FakeTarget("worker", "idle", baseline)]
+                    if settled:
+                        targets.extend([
+                            FakeTarget("worker", "working", screen),
+                            FakeTarget("worker", "done", screen),
+                        ])
+                    else:
+                        targets.append(FakeTarget("worker", "idle", screen))
+                    result, store, _transport = run_machine(
+                        targets, SubmissionResult.submitted(), prompt=prompt,
+                    )
+
+                    self.assertEqual(result["response"]["output"], reply)
+                    self.assertTrue(result["response"]["anchored"])
+                    self.assertEqual(result["response"]["correlated"], settled)
+                    self.assertEqual(
+                        store.load(result["request_id"])["_response_anchor"],
+                        "Message from x/y:",
+                    )
+
+    def test_refresh_anchors_rewritten_live_and_settled_screens(self):
+        working = FakeTarget("worker", "working", "before\npartial\n")
+        result, store, _transport = run_machine(
+            [FakeTarget("worker", "idle", "before\n"), working],
+            SubmissionResult.submitted(),
+            prompt="Message from x/y:\n\ndo it",
+        )
+        transport = FakeTransport(
+            [
+                FakeTarget(
+                    "worker", "working",
+                    "banner\nMessage from x/y:\n\ndo it\npartial\n",
+                ),
+                FakeTarget(
+                    "worker", "done",
+                    "redrawn banner\nMessage from x/y:\n\ndo it\nreply\n",
+                ),
+            ],
+            SubmissionResult.submitted(),
+        )
+        machine = RequestLifecycleMachine(transport, store)
+
+        live = machine.refresh(request_id=result["request_id"])
+        self.assertEqual(
+            live["response"]["output"], "Message from x/y:\n\ndo it\npartial\n",
+        )
+        self.assertTrue(live["response"]["anchored"])
+        self.assertFalse(live["response"]["correlated"])
+        settled = machine.refresh(request_id=result["request_id"])
+        self.assertEqual(settled["state"], "submitted_settled")
+        self.assertEqual(
+            settled["response"]["output"], "Message from x/y:\n\ndo it\nreply\n",
+        )
+        self.assertTrue(settled["response"]["anchored"])
+        self.assertTrue(settled["response"]["correlated"])
 
     def test_preexisting_turn_settlement_is_not_mistaken_for_requested_turn(self):
         old_done = FakeTarget("agent-1", "done", "old complete\n")
@@ -289,6 +440,7 @@ class RequestLifecycleMachineTest(unittest.TestCase):
 
         self.assertEqual(result["state"], "submitted_unknown")
         self.assertEqual(result["phase"], "recipient_changed")
+        self.assertEqual(result["error_code"], "recipient_changed")
 
     def test_replacement_stops_output_reads(self):
         store = MemoryStore()
@@ -332,6 +484,7 @@ class RequestLifecycleMachineTest(unittest.TestCase):
         self.assertFalse(result["submitted"])
         self.assertTrue(result["cancelled"])
         self.assertTrue(result["terminal"])
+        self.assertEqual(result["error_code"], "cancelled")
 
 
 class RequestOutputTest(unittest.TestCase):
@@ -358,6 +511,64 @@ class RequestOutputTest(unittest.TestCase):
             max_chars=100,
         )
         self.assertEqual(captured.text, "new tail")
+        self.assertTrue(captured.truncated)
+
+    def test_anchor_matches_normalized_lines_and_uses_last_occurrence(self):
+        reply = "  Message\tfrom   x/y:  \nlatest reply\n"
+        captured = capture_new_output(
+            OutputSnapshot("old screen\n"),
+            OutputSnapshot(
+                "banner\nMessage from x/y:\nprevious reply\n"
+                "quoted Message from x/y:\n" + reply,
+            ),
+            anchor="Message from x/y:",
+            max_lines=20,
+            max_chars=500,
+        )
+
+        self.assertEqual(captured.text, reply)
+        self.assertTrue(captured.anchored)
+        self.assertTrue(captured.truncated)
+
+    def test_missing_anchor_keeps_rewritten_screen_behavior(self):
+        screen = "banner\nquoted Message from x/y:\nunrelated output\n"
+        captured = capture_new_output(
+            OutputSnapshot("old screen\n"),
+            OutputSnapshot(screen),
+            anchor="Message from x/y:",
+            max_lines=20,
+            max_chars=500,
+        )
+
+        self.assertEqual(captured.text, screen)
+        self.assertFalse(captured.anchored)
+        self.assertTrue(captured.truncated)
+
+    def test_reliable_overlap_does_not_reinclude_prompt_anchor(self):
+        baseline = "Message from x/y:\n\ndo it\n"
+        captured = capture_new_output(
+            OutputSnapshot(baseline),
+            OutputSnapshot(baseline + "reply\n"),
+            anchor="Message from x/y:",
+            max_lines=20,
+            max_chars=500,
+        )
+
+        self.assertEqual(captured.text, "reply\n")
+        self.assertFalse(captured.anchored)
+        self.assertFalse(captured.truncated)
+
+    def test_anchor_cannot_bypass_output_bounds(self):
+        captured = capture_new_output(
+            OutputSnapshot(""),
+            OutputSnapshot("banner\nMessage from x/y:\none\ntwo\nthree\n"),
+            anchor="Message from x/y:",
+            max_lines=2,
+            max_chars=8,
+        )
+
+        self.assertEqual(captured.text, "o\nthree\n")
+        self.assertTrue(captured.anchored)
         self.assertTrue(captured.truncated)
 
 

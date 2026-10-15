@@ -38,10 +38,11 @@ class BatchDispatchError(Exception):
 
 @dataclass(frozen=True)
 class BatchRequest:
-    """One opaque route and the instruction already tailored for that route."""
+    """One route or address and its already-tailored instruction."""
 
     route: str
     message: str
+    address: str = ""
 
 
 @dataclass(frozen=True)
@@ -157,11 +158,14 @@ def _exception_result(request: BatchRequest, error: Exception) -> BatchResult:
 
 def _prepare_requests(
     items: Sequence[object],
+    resolve_request: Callable[[BatchRequest], tuple[BatchRequest, str]] | None,
+    cancel_event: threading.Event | None,
 ) -> tuple[list[BatchResult | None], list[tuple[int, BatchRequest]]]:
     routes = [
         item.get("route")
         for item in items
         if isinstance(item, Mapping)
+        and "address" not in item
         and isinstance(item.get("route"), str)
         and item.get("route")
     ]
@@ -169,17 +173,23 @@ def _prepare_requests(
         route for route, count in Counter(routes).items() if count > 1
     }
     results: list[BatchResult | None] = [None] * len(items)
-    ready: list[tuple[int, BatchRequest]] = []
+    prepared: list[tuple[int, BatchRequest, str]] = []
     for index, item in enumerate(items):
-        if not isinstance(item, Mapping):
+        if not isinstance(item, Mapping) or (
+            ("route" in item) == ("address" in item)
+        ):
             results[index] = _failure("", "invalid_request")
             continue
-        route = item.get("route")
+        route = item.get("route", "")
+        address = item.get("address", "")
         message = item.get("message")
-        if not isinstance(route, str) or not route:
+        if "route" in item and (not isinstance(route, str) or not route):
             results[index] = _failure("", "invalid_route")
             continue
-        if route in duplicate_routes:
+        if "address" in item and (not isinstance(address, str) or not address):
+            results[index] = _failure("", "invalid_address")
+            continue
+        if resolve_request is None and route in duplicate_routes:
             results[index] = _failure(route, "duplicate_route")
             continue
         if not isinstance(message, str):
@@ -188,7 +198,27 @@ def _prepare_requests(
         if not message.strip():
             results[index] = _failure(route, "empty_message")
             continue
-        ready.append((index, BatchRequest(route, message)))
+        request = BatchRequest(route, message, address)
+        identity = route or address
+        if cancel_event is None or not cancel_event.is_set():
+            try:
+                if resolve_request is not None:
+                    request, identity = resolve_request(request)
+                elif address:
+                    raise BatchDispatchError(
+                        "invalid_address", "Address dispatch requires a resolver."
+                    )
+            except Exception as error:
+                results[index] = _exception_result(request, error)
+                continue
+        prepared.append((index, request, identity))
+    identities = Counter(identity for _index, _request, identity in prepared)
+    ready: list[tuple[int, BatchRequest]] = []
+    for index, request, identity in prepared:
+        if identities[identity] > 1:
+            results[index] = _failure(request.route, "duplicate_route")
+        else:
+            ready.append((index, request))
     return results, ready
 
 
@@ -207,12 +237,13 @@ def dispatch_batch(
     *,
     max_workers: int = DEFAULT_BATCH_WORKERS,
     cancel_event: threading.Event | None = None,
+    resolve_request: Callable[[BatchRequest], tuple[BatchRequest, str]] | None = None,
 ) -> dict[str, Any]:
     """Dispatch valid items concurrently and return results in input order.
 
-    This function does not inspect route tokens or interpret messages. Route
-    resolution, sender validation, transport, and request lifecycle semantics
-    belong to the injected single-request sender.
+    The optional resolver converts addresses to routes and supplies a target
+    identity for duplicate detection before any prompt is submitted. Transport
+    and request lifecycle semantics belong to the injected single-request sender.
     """
 
     if isinstance(max_workers, bool) or not isinstance(max_workers, int):
@@ -231,7 +262,7 @@ def dispatch_batch(
             "Batch input must contain at least one request.",
         )
 
-    result_slots, ready = _prepare_requests(items)
+    result_slots, ready = _prepare_requests(items, resolve_request, cancel_event)
     pending: queue.Queue[tuple[int, BatchRequest]] = queue.Queue()
     for prepared in ready:
         pending.put(prepared)

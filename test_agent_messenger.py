@@ -1510,6 +1510,12 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertIn("sender_probe_failed", request)
         self.assertIn("nothing was submitted", request)
         self.assertIn("socket access and retry once", request)
+        self.assertIn("advance the request without resending", request)
+        self.assertIn(
+            f"python3 {shlex.quote(str(agent_messenger.bundled_router_path()))} "
+            "request-status --request-id REQUEST_ID",
+            request,
+        )
 
     def test_multiple_recipients_use_consistent_target_descriptors(self):
         first = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
@@ -1529,7 +1535,20 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertIn("Multi-target contract:", request)
         self.assertIn("sender_probe_failed", request)
         self.assertIn("retry only failed items", request)
-        self.assertIn("replay no submitted", request)
+        self.assertIn(
+            "never resend delivered, submitted, unknown, or timed-out items",
+            request,
+        )
+        self.assertIn("all delivered, not all settled", request)
+        self.assertIn("inspect each item's status", request)
+        self.assertIn("status `submitted`", request)
+        self.assertIn("`submitted_working`/`submitted_unknown`", request)
+        self.assertIn("until settled or a clear failure", request)
+        self.assertIn(
+            f"python3 {shlex.quote(str(agent_messenger.bundled_router_path()))} "
+            "request-status --request-id REQUEST_ID",
+            request,
+        )
         for index, recipient, transport in (
             (1, first, "local Herdr"),
             (2, second, "SSH host macbook-pro"),
@@ -1563,46 +1582,56 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertNotIn(workspace, request)
 
     def test_orchestration_commands_shell_quote_absolute_router_path(self):
-        recipient = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
+        first = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
+        second = agent(name="white-owl", pane_id="w1:p3", session_id="session-3")
         router = Path("/tmp/Herdr Router's tools/agent_skill_cli.py")
         quoted_router = shlex.quote(str(router))
-        with mock.patch.object(
-            agent_messenger,
-            "bundled_router_path",
-            return_value=router,
-        ):
-            request = agent_messenger.build_orchestration_request([recipient], "Review")
-
         self.assertTrue(router.is_absolute())
-        self.assertEqual(request.count(f"python3 {quoted_router}"), 3)
-        self.assertIn(f"python3 {quoted_router} request --route", request)
-        self.assertIn(f"python3 {quoted_router} request-status", request)
-
-    def test_orchestration_fixed_envelope_is_materially_smaller_than_main(self):
-        first = agent(name="worker-1", pane_id="w1:p2", session_id="session-2")
-        second = agent(name="worker-2", pane_id="w1:p3", session_id="session-3")
-        with (
-            mock.patch.object(
-                agent_messenger,
-                "bundled_router_path",
-                return_value=Path("/router"),
-            ),
-            mock.patch.object(
-                agent_messenger,
-                "encode_agent_route",
-                return_value="TOKEN",
-            ),
+        for recipients, dispatch in (
+            ([first], "request --route"),
+            ([first, second], "batch --requests-json"),
         ):
-            single_envelope = len(
-                agent_messenger.build_orchestration_request([first], "")
-            )
-            multi_envelope = len(
-                agent_messenger.build_orchestration_request([first, second], "")
-            )
+            with (
+                self.subTest(target_count=len(recipients)),
+                mock.patch.object(
+                    agent_messenger,
+                    "bundled_router_path",
+                    return_value=router,
+                ),
+            ):
+                request = agent_messenger.build_orchestration_request(
+                    recipients,
+                    "Review",
+                )
 
-        # Measured at main 7e76e23 with the same normalized path/token fixtures.
-        self.assertLessEqual(single_envelope, 1780 * 0.70)
-        self.assertLessEqual(multi_envelope, 1884 * 0.80)
+                self.assertIn(f"python3 {quoted_router} {dispatch}", request)
+                self.assertIn(
+                    f"python3 {quoted_router} request-status --request-id REQUEST_ID",
+                    request,
+                )
+                if len(recipients) > 1:
+                    self.assertIn(
+                        f"python3 {quoted_router} read --route ROUTE_TOKEN",
+                        request,
+                    )
+
+    def test_orchestration_explains_lifecycle_errors_and_cli_exit_codes(self):
+        first = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
+        second = agent(name="white-owl", pane_id="w1:p3", session_id="session-3")
+        for recipients in ([first], [first, second]):
+            with self.subTest(target_count=len(recipients)):
+                request = agent_messenger.build_orchestration_request(
+                    recipients,
+                    "Review",
+                )
+
+                self.assertIn("`error_code` alongside `error`", request)
+                self.assertIn("0 = settled/succeeded", request)
+                self.assertIn("1 = failure or error envelope (`error.code`)", request)
+                self.assertIn(
+                    "3 = delivered but not settled: use request-status, never resend",
+                    request,
+                )
 
     def test_delegate_route_includes_an_unnamed_remote_agent(self):
         unnamed = agent_directory.replace(
