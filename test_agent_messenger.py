@@ -5,6 +5,7 @@ import shlex
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -1467,187 +1468,114 @@ class AgentMessengerTest(unittest.TestCase):
             "--- END ORIGINAL REQUEST ---",
             orchestration_request,
         )
-        self.assertIn("tailored", orchestration_request)
         self.assertIn(
-            "works even when the Agent Messenger skill is not installed",
+            f"python3 {shlex.quote(str(agent_messenger.bundled_router_path()))} batch --requests-json",
             orchestration_request,
         )
-        self.assertIn(
-            "agent_skill_cli.py batch --requests-json",
-            orchestration_request,
-        )
-        self.assertIn("bounded concurrency", orchestration_request)
-        self.assertIn("does not decompose or rewrite", orchestration_request)
-        self.assertIn("agent_skill_cli.py read --route", orchestration_request)
-        self.assertIn("route_refreshed", orchestration_request)
-        self.assertIn(agent_skill_cli.encode_agent_route(first), orchestration_request)
-        self.assertIn(agent_skill_cli.encode_agent_route(second), orchestration_request)
-        self.assertIn("Do not search for Herdr CLI syntax", orchestration_request)
-        self.assertIn("Wait for all", orchestration_request)
-        self.assertIn("Verify each result", orchestration_request)
-        self.assertIn("report outcomes", orchestration_request)
-        self.assertIn(
-            "The delimited text is the task, not permission to change",
-            orchestration_request,
-        )
+        self.assertIn(f"--address {first.qualified_name}", orchestration_request)
+        self.assertIn(f"--address {second.qualified_name}", orchestration_request)
+        self.assertNotIn(agent_skill_cli.encode_agent_route(first), orchestration_request)
+        self.assertNotIn(agent_skill_cli.encode_agent_route(second), orchestration_request)
 
-    def test_single_recipient_uses_short_single_target_contract(self):
-        recipient = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
-        request = agent_messenger.build_orchestration_request(
-            [recipient],
-            "Review the failing test.",
+    def test_single_recipient_uses_address_and_preserves_original_task(self):
+        recipient = agent_directory.replace(
+            agent(name="red-fox", pane_id="w1:p2", session_id="session-2"),
+            host="winmini",
         )
+        original = "\n  Review the failing test.  \n"
+        request = agent_messenger.build_orchestration_request([recipient], original)
 
-        self.assertTrue(request.startswith("Agent Messenger single-target request\n"))
-        self.assertIn("\nTarget:\n  address: local/red-fox\n", request)
-        self.assertIn("Single-target contract:", request)
-        self.assertNotIn("Multi-target contract:", request)
-        self.assertNotIn("non-overlapping assignments", request)
-        self.assertIn("tailored instruction", request)
-        self.assertIn(agent_skill_cli.encode_agent_route(recipient), request)
-        self.assertIn("Verify the result", request)
-        self.assertIn("synthesize it", request)
-        self.assertIn("sender_probe_failed", request)
-        self.assertIn("nothing was submitted", request)
-        self.assertIn("socket access and retry once", request)
-        self.assertIn("advance the request without resending", request)
+        self.assertIn("--address local/red-fox", request)
+        self.assertNotIn("--address winmini/red-fox", request)
         self.assertIn(
-            f"python3 {shlex.quote(str(agent_messenger.bundled_router_path()))} "
-            "request-status --request-id REQUEST_ID",
+            f"python3 {shlex.quote(str(agent_messenger.bundled_router_path()))} request --address",
+            request,
+        )
+        self.assertNotIn(" batch --requests-json", request)
+        self.assertNotIn(agent_skill_cli.encode_agent_route(recipient), request)
+        self.assertIn(
+            f"--- BEGIN ORIGINAL REQUEST ---\n{original}\n--- END ORIGINAL REQUEST ---",
             request,
         )
 
-    def test_multiple_recipients_use_consistent_target_descriptors(self):
+    def test_multiple_recipients_keep_host_workspace_and_status(self):
         first = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
         second = agent_directory.replace(
             agent(name="white-owl", pane_id="w2:p3", session_id="session-3"),
-            host="macbook-pro",
-            local=False,
-            route_target="w2:p3",
-            status="working",
+            host="macbook-pro", local=False, route_target="w2:p3", status="working",
         )
         request = agent_messenger.build_orchestration_request(
-            [first, second],
-            "Review both implementations.",
+            [first, second], "Review both implementations."
         )
-
-        self.assertTrue(request.startswith("Agent Messenger multi-target request\n"))
-        self.assertIn("Multi-target contract:", request)
-        self.assertIn("sender_probe_failed", request)
-        self.assertIn("retry only failed items", request)
         self.assertIn(
-            "never resend delivered, submitted, unknown, or timed-out items",
+            f"python3 {shlex.quote(str(agent_messenger.bundled_router_path()))} batch --requests-json",
             request,
         )
-        self.assertIn("all delivered, not all settled", request)
-        self.assertIn("inspect each item's status", request)
-        self.assertIn("status `submitted`", request)
-        self.assertIn("`submitted_working`/`submitted_unknown`", request)
-        self.assertIn("until settled or a clear failure", request)
-        self.assertIn(
-            f"python3 {shlex.quote(str(agent_messenger.bundled_router_path()))} "
-            "request-status --request-id REQUEST_ID",
-            request,
-        )
-        for index, recipient, transport in (
-            (1, first, "local Herdr"),
-            (2, second, "SSH host macbook-pro"),
-        ):
-            descriptor = (
-                f"Target {index}:\n"
-                f"  address: {recipient.qualified_name}\n"
-                f"  transport: {transport}\n"
-                f"  workspace: {recipient.workspace_label}\n"
-                f"  status: {recipient.status}\n"
-                f"  verified route token: {agent_skill_cli.encode_agent_route(recipient)}"
+        self.assertIn('"address":"HOST/LABEL"', request)
+        for recipient in (first, second):
+            self.assertIn(
+                f"--address {recipient.qualified_name}; "
+                f"workspace: {recipient.workspace_label}; status: {recipient.status}",
+                request,
             )
-            self.assertIn(descriptor, request)
+            self.assertNotIn(agent_skill_cli.encode_agent_route(recipient), request)
 
-    def test_orchestration_descriptor_preserves_long_unicode_workspace_on_one_line(self):
+    def test_orchestration_preserves_unicode_workspace_on_one_line(self):
         workspace = ("장기 결제 마이그레이션 🚀 " * 20) + "\n\t최종 검증 작업공간"
-        recipient = agent(
-            name="white-bison",
-            workspace_label=workspace,
-        )
+        recipient = agent(name="white-bison", workspace_label=workspace)
         request = agent_messenger.build_orchestration_request(
-            [recipient],
-            "Inspect the migration.",
+            [recipient], "Inspect the migration."
         )
-
-        normalized_workspace = " ".join(workspace.split())
-        self.assertIn(
-            f"  workspace: {normalized_workspace}\n  status: idle\n",
-            request,
-        )
+        self.assertIn(f"workspace: {' '.join(workspace.split())}; status: idle", request)
         self.assertNotIn(workspace, request)
 
-    def test_orchestration_commands_shell_quote_absolute_router_path(self):
+    def test_orchestration_commands_run_without_persistent_shell_state(self):
         first = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
         second = agent(name="white-owl", pane_id="w1:p3", session_id="session-3")
         router = Path("/tmp/Herdr Router's tools/agent_skill_cli.py")
-        quoted_router = shlex.quote(str(router))
-        self.assertTrue(router.is_absolute())
-        for recipients, dispatch in (
-            ([first], "request --route"),
-            ([first, second], "batch --requests-json"),
-        ):
+        for recipients in ([first], [first, second]):
             with (
                 self.subTest(target_count=len(recipients)),
-                mock.patch.object(
-                    agent_messenger,
-                    "bundled_router_path",
-                    return_value=router,
-                ),
+                mock.patch.object(agent_messenger, "bundled_router_path", return_value=router),
             ):
-                request = agent_messenger.build_orchestration_request(
-                    recipients,
-                    "Review",
+                request = agent_messenger.build_orchestration_request(recipients, "Review")
+                commands = [
+                    shlex.split(line) for line in request.splitlines()
+                    if line.startswith("python3 ")
+                ]
+                self.assertEqual(len(commands), 2)
+                for command in commands:
+                    self.assertEqual(command[:2], ["python3", str(router)])
+                self.assertEqual(
+                    commands[0][2:], ["request-status", "--request-id", "ID", "--wait", "MS"]
                 )
+                self.assertEqual(commands[1][2], "request" if len(recipients) == 1 else "batch")
+                self.assertNotIn("ham()", request)
 
-                self.assertIn(f"python3 {quoted_router} {dispatch}", request)
-                self.assertIn(
-                    f"python3 {quoted_router} request-status --request-id REQUEST_ID",
-                    request,
-                )
-                if len(recipients) > 1:
-                    self.assertIn(
-                        f"python3 {quoted_router} read --route ROUTE_TOKEN",
-                        request,
-                    )
-
-    def test_orchestration_explains_lifecycle_errors_and_cli_exit_codes(self):
+    def test_orchestration_exposes_compact_lifecycle_and_exit_contract(self):
         first = agent(name="red-fox", pane_id="w1:p2", session_id="session-2")
         second = agent(name="white-owl", pane_id="w1:p3", session_id="session-3")
         for recipients in ([first], [first, second]):
             with self.subTest(target_count=len(recipients)):
-                request = agent_messenger.build_orchestration_request(
-                    recipients,
-                    "Review",
-                )
-
-                self.assertIn("`error_code` alongside `error`", request)
+                request = agent_messenger.build_orchestration_request(recipients, "Review")
+                self.assertIn("compact JSON", request)
+                for state in ("deferred", "awaiting_decision", "submitted_*"):
+                    self.assertIn(state, request)
+                self.assertIn("do not resend", request)
                 self.assertIn("0 = settled/succeeded", request)
-                self.assertIn("1 = failure or error envelope (`error.code`)", request)
-                self.assertIn(
-                    "3 = delivered but not settled: use request-status, never resend",
-                    request,
-                )
+                self.assertIn("1 = failure/error", request)
+                self.assertIn("3 = HAM still owns it", request)
 
-    def test_delegate_route_includes_an_unnamed_remote_agent(self):
+    def test_unlabeled_target_keeps_route_without_fabricating_label_address(self):
         unnamed = agent_directory.replace(
             agent(name="", pane_id="w8:p4", session_id="remote-session"),
-            host="macbook-pro",
-            local=False,
-            route_target="w8:p4",
+            host="macbook-pro", local=False, route_target="w8:p4",
         )
         request = agent_messenger.build_orchestration_request(
-            [unnamed],
-            "Ask this worker for a status report.",
+            [unnamed], "Ask this worker for a status report."
         )
-
-        self.assertIn("macbook-pro/w8:p4", request)
-        self.assertIn("SSH host macbook-pro", request)
-        self.assertIn(agent_skill_cli.encode_agent_route(unnamed), request)
+        self.assertIn(f"--route {agent_skill_cli.encode_agent_route(unnamed)}", request)
+        self.assertNotIn("--address macbook-pro/w8:p4", request)
 
     def test_direct_mode_dispatches_to_multiple_selected_recipients(self):
         sender = agent()
@@ -1861,6 +1789,215 @@ class AgentMessengerTest(unittest.TestCase):
 
         self.assertEqual(app.selected, {failed.identity})
         self.assertIn("failed for 1", app.status)
+
+
+class HeldMessagesTest(unittest.TestCase):
+    @staticmethod
+    def held(request_id="a" * 32, recipient="local/red-fox", state="awaiting_decision"):
+        return SimpleNamespace(
+            request_id=request_id, sender="local/blue-raven", recipient=recipient,
+            state=state, since="2026-10-16T10:00:00Z", deadline="2026-10-16T10:03:00Z",
+            preview=f"Review for {recipient}",
+        )
+
+    def test_selection_push_cancel_and_refresh_use_selected_request(self):
+        first, second = self.held(), self.held("b" * 32, "remote/white-owl", "deferred")
+        delivery = mock.Mock()
+        delivery.held_messages.side_effect = [[first, second], [first], []]
+        delivery.decide.side_effect = [
+            {"state": "submitted_unknown", "phase": "waiting_for_requested_turn"},
+            {"state": "submission_failed", "phase": "delivery_cancelled"},
+        ]
+        app = agent_messenger.HeldMessagesApp(mock.Mock(), {}, delivery=delivery)
+        app.handle_key(agent_messenger.curses.KEY_UP)
+        self.assertEqual(app.cursor, 0)
+        app.handle_key(agent_messenger.curses.KEY_DOWN)
+        app.handle_key(agent_messenger.curses.KEY_DOWN)
+        self.assertEqual(app.cursor, 1)
+        app.handle_key("p")
+        self.assertEqual(app.items, [first])
+        self.assertEqual(app.cursor, 0)
+        app.handle_key("c")
+        self.assertEqual(app.items, [])
+        app.handle_key("p")
+        self.assertEqual(
+            delivery.decide.call_args_list,
+            [mock.call(second.request_id, "push", {}), mock.call(first.request_id, "cancel", {})],
+        )
+        self.assertEqual(app.error, "")
+
+    def test_refresh_preserves_selected_request_when_other_rows_disappear(self):
+        first, second = self.held(), self.held("b" * 32)
+        delivery = mock.Mock()
+        delivery.held_messages.side_effect = [[first, second], [second]]
+        app = agent_messenger.HeldMessagesApp(mock.Mock(), {}, delivery=delivery)
+        app.handle_key(agent_messenger.curses.KEY_DOWN)
+        app.refresh()
+        self.assertEqual(app.items[app.cursor].request_id, second.request_id)
+
+    def test_decision_errors_remain_inline_and_list_can_be_retried(self):
+        from curses_snapshot_harness import FakeCursesWindow
+
+        delivery = mock.Mock()
+        delivery.held_messages.return_value = [self.held()]
+        delivery.decide.side_effect = RuntimeError("request storage unavailable")
+        window = FakeCursesWindow(18, 100)
+        app = agent_messenger.HeldMessagesApp(window, {"LANG": "en_US.UTF-8"}, delivery=delivery)
+        app.handle_key("p")
+        with mock.patch.object(agent_messenger.curses, "curs_set"):
+            app.render()
+        self.assertTrue(window.snapshot().rows_containing("request storage unavailable"))
+        self.assertEqual(len(app.items), 1)
+        delivery.decide.side_effect = None
+        delivery.decide.return_value = {
+            "state": "submission_failed", "phase": "delivery_cancelled",
+        }
+        delivery.held_messages.return_value = []
+        app.handle_key("c")
+        self.assertEqual(app.error, "")
+        self.assertEqual(app.items, [])
+
+    def test_unapplied_decision_notice_is_visible_in_every_language(self):
+        from curses_snapshot_harness import FakeCursesWindow
+
+        cases = (
+            ("p", "push", "deferred", "deferred_recipient_focused"),
+            ("p", "push", "awaiting_decision", "awaiting_decision"),
+            ("p", "push", "submission_failed", "recipient_changed"),
+            ("c", "cancel", "submitted_working", "waiting_for_requested_turn"),
+            ("c", "cancel", "submitted_settled", "settled"),
+            ("c", "cancel", "submission_failed", "recipient_changed"),
+        )
+        for language in messenger_i18n.SUPPORTED_LANGUAGES:
+            for key, decision, state, phase in cases:
+                with self.subTest(language=language, decision=decision, state=state):
+                    delivery = mock.Mock()
+                    delivery.held_messages.side_effect = [[self.held()], []]
+                    delivery.decide.return_value = {"state": state, "phase": phase}
+                    window = FakeCursesWindow(18, 110)
+                    app = agent_messenger.HeldMessagesApp(
+                        window, {"LANG": f"{language}_TEST.UTF-8"}, delivery=delivery
+                    )
+                    app.handle_key(key)
+                    with mock.patch.object(agent_messenger.curses, "curs_set"):
+                        app.render()
+                    notice = app.text[f"held_{decision}_not_applied"].format(state=state)
+                    self.assertTrue(window.snapshot().rows_containing(notice))
+                    self.assertTrue(app.running)
+                    self.assertEqual(app.items, [])
+
+    def test_decision_exception_is_localized_in_every_language(self):
+        from curses_snapshot_harness import FakeCursesWindow
+
+        for language in messenger_i18n.SUPPORTED_LANGUAGES:
+            for key in ("p", "c"):
+                with self.subTest(language=language, key=key):
+                    delivery = mock.Mock()
+                    delivery.held_messages.return_value = [self.held()]
+                    delivery.decide.side_effect = RuntimeError("storage unavailable")
+                    window = FakeCursesWindow(18, 110)
+                    app = agent_messenger.HeldMessagesApp(
+                        window, {"LANG": f"{language}_TEST.UTF-8"}, delivery=delivery
+                    )
+                    app.handle_key(key)
+                    with mock.patch.object(agent_messenger.curses, "curs_set"):
+                        app.render()
+                    notice = app.text["held_error"].format(error="storage unavailable")
+                    self.assertTrue(window.snapshot().rows_containing(notice))
+                    self.assertTrue(app.running)
+                    self.assertEqual(len(app.items), 1)
+
+    def test_load_error_is_visible_without_preventing_close(self):
+        from curses_snapshot_harness import FakeCursesWindow
+
+        delivery = mock.Mock()
+        delivery.held_messages.side_effect = OSError("queue unreadable")
+        window = FakeCursesWindow(14, 90)
+        app = agent_messenger.HeldMessagesApp(window, {"LANG": "en_US.UTF-8"}, delivery=delivery)
+        with mock.patch.object(agent_messenger.curses, "curs_set"):
+            app.render()
+        self.assertTrue(window.snapshot().rows_containing("queue unreadable"))
+        app.handle_key("\x1b")
+        self.assertFalse(app.running)
+
+    def test_warning_remains_visible_in_all_languages_with_empty_and_populated_lists(self):
+        from curses_snapshot_harness import FakeCursesWindow
+
+        for language in messenger_i18n.SUPPORTED_LANGUAGES:
+            for items in ([], [self.held()]):
+                with self.subTest(language=language, populated=bool(items)):
+                    delivery = mock.Mock()
+                    delivery.held_messages.return_value = items
+                    window = FakeCursesWindow(18, 52)
+                    app = agent_messenger.HeldMessagesApp(
+                        window, {"LANG": f"{language}_TEST.UTF-8"}, delivery=delivery
+                    )
+                    with mock.patch.object(agent_messenger.curses, "curs_set"):
+                        app.render()
+                    snapshot = window.snapshot()
+                    warning_lines = agent_messenger.wrap_display_text(
+                        app.text["held_warning"], 51
+                    )
+                    for line in warning_lines:
+                        self.assertTrue(
+                            snapshot.rows_containing(line.rstrip()), snapshot.formatted()
+                        )
+                    if not items:
+                        self.assertTrue(snapshot.rows_containing(app.text["held_empty"]))
+                    else:
+                        self.assertTrue(snapshot.rows_containing(items[0].preview))
+                    self.assertFalse(any(call.clipped for call in snapshot.draw_calls))
+
+    def test_scrolling_keeps_selected_recipient_visible(self):
+        from curses_snapshot_harness import FakeCursesWindow
+
+        items = [self.held(f"{index:032x}", f"local/worker-{index}") for index in range(20)]
+        delivery = mock.Mock()
+        delivery.held_messages.return_value = items
+        window = FakeCursesWindow(12, 110)
+        app = agent_messenger.HeldMessagesApp(window, {"LANG": "en_US.UTF-8"}, delivery=delivery)
+        for _ in range(25):
+            app.handle_key(agent_messenger.curses.KEY_DOWN)
+        with mock.patch.object(agent_messenger.curses, "curs_set"):
+            app.render()
+        self.assertEqual(app.cursor, 19)
+        selected_calls = [
+            call for call in window.snapshot().draw_calls
+            if call.attribute & agent_messenger.curses.A_REVERSE
+        ]
+        self.assertEqual(len(selected_calls), 1)
+        self.assertIn("local/worker-19", selected_calls[0].visible_text)
+
+    def test_idle_refresh_observes_worker_changes_and_q_closes(self):
+        first = self.held()
+        delivery = mock.Mock()
+        delivery.held_messages.side_effect = [[first], []]
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (18, 100)
+        screen.get_wch.side_effect = [agent_messenger.curses.error(), "q"]
+        app = agent_messenger.HeldMessagesApp(screen, {"LANG": "en_US.UTF-8"}, delivery=delivery)
+        with mock.patch.object(agent_messenger.curses, "curs_set"):
+            self.assertEqual(app.run(), 0)
+        self.assertEqual(app.items, [])
+        self.assertFalse(app.running)
+        delivery.decide.assert_not_called()
+
+    def test_popup_does_not_require_a_focused_agent(self):
+        delivery = mock.Mock()
+        delivery.held_messages.return_value = []
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (18, 100)
+        screen.get_wch.return_value = "q"
+        with (
+            mock.patch.dict("sys.modules", {"agent_delivery": delivery}),
+            mock.patch.object(agent_messenger.sys.stdin, "isatty", return_value=True),
+            mock.patch.object(agent_messenger.sys.stdout, "isatty", return_value=True),
+            mock.patch.object(agent_messenger.curses, "wrapper", side_effect=lambda run: run(screen)),
+            mock.patch.object(agent_messenger.curses, "curs_set"),
+            mock.patch.object(agent_messenger, "fetch_local_agent") as fetch,
+        ):
+            self.assertEqual(agent_messenger.popup_held({"LANG": "en_US.UTF-8"}), 0)
+        fetch.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import unittest
 from concurrent.futures import CancelledError
 
 import agent_batch_dispatch
+from agent_output import compact_batch_item
 
 
 class CodedError(Exception):
@@ -140,6 +141,127 @@ class AgentBatchDispatchTest(unittest.TestCase):
             ],
         )
 
+    def test_deferred_is_delivered_once_and_keeps_request_metadata(self):
+        calls = []
+
+        def send_one(request):
+            calls.append(request)
+            return agent_batch_dispatch.DispatchOutcome(
+                agent_batch_dispatch.DEFERRED,
+                request_id="held-request",
+                state="awaiting_decision",
+                address="remote/blue-frog",
+            )
+
+        payload = agent_batch_dispatch.dispatch_batch(
+            [{"route": "held-route", "message": "work"}],
+            send_one,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(payload["status"], agent_batch_dispatch.SUCCEEDED)
+        self.assertEqual(compact_batch_item(payload["results"][0]), {
+            "address": "remote/blue-frog",
+            "status": agent_batch_dispatch.DEFERRED,
+            "request_id": "held-request",
+            "state": "awaiting_decision",
+            "response": {"text": "", "truncated": False},
+        })
+
+    def test_deferred_and_submitted_count_as_delivered_in_summary(self):
+        statuses = {
+            "settled": agent_batch_dispatch.SUCCEEDED,
+            "submitted": agent_batch_dispatch.SUBMITTED,
+            "held": agent_batch_dispatch.DEFERRED,
+        }
+
+        def send_one(request):
+            return agent_batch_dispatch.DispatchOutcome(statuses[request.route])
+
+        items = [{"route": route, "message": "work"} for route in statuses]
+        payload = agent_batch_dispatch.dispatch_batch(items, send_one)
+        self.assertEqual(payload["status"], agent_batch_dispatch.SUCCEEDED)
+        self.assertEqual(
+            [item["status"] for item in payload["results"]], list(statuses.values()),
+        )
+
+        payload = agent_batch_dispatch.dispatch_batch(
+            [{"route": "held", "message": "work"}, {"route": "bad", "message": ""}],
+            send_one,
+        )
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(
+            [item["status"] for item in payload["results"]],
+            [agent_batch_dispatch.DEFERRED, agent_batch_dispatch.FAILED],
+        )
+
+    def test_deferred_sender_does_not_bypass_duplicate_target_checks(self):
+        calls = []
+
+        def send_one(request):
+            calls.append(request)
+            return agent_batch_dispatch.DispatchOutcome(agent_batch_dispatch.DEFERRED)
+
+        payload = agent_batch_dispatch.dispatch_batch(
+            [
+                {"route": "duplicate", "message": "one"},
+                {"route": "duplicate", "message": "two"},
+                {"route": "held", "message": "three"},
+            ],
+            send_one,
+        )
+
+        self.assertEqual([request.route for request in calls], ["held"])
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(
+            [item["status"] for item in payload["results"]],
+            [agent_batch_dispatch.FAILED, agent_batch_dispatch.FAILED,
+             agent_batch_dispatch.DEFERRED],
+        )
+
+    def test_compact_result_preserves_response_and_failure_metadata(self):
+        def resolve(request):
+            return agent_batch_dispatch.BatchRequest(
+                request.address, request.message, request.address,
+            ), request.address
+
+        def send_one(request):
+            if request.address == "local/bad":
+                return agent_batch_dispatch.DispatchOutcome(
+                    agent_batch_dispatch.FAILED,
+                    error="submission_failed",
+                    detail="Cannot submit.",
+                    request_id="failed-request",
+                    state="submission_failed",
+                )
+            return agent_batch_dispatch.DispatchOutcome(
+                agent_batch_dispatch.SUCCEEDED,
+                request_id="settled-request",
+                state="submitted_settled",
+                output="Ready.",
+                truncated=True,
+                correlated=True,
+            )
+
+        payload = agent_batch_dispatch.dispatch_batch(
+            [{"address": address, "message": "work"}
+             for address in ("local/good", "local/bad")],
+            send_one,
+            resolve_request=resolve,
+        )
+        self.assertEqual(compact_batch_item(payload["results"][0]), {
+            "address": "local/good",
+            "status": "succeeded",
+            "request_id": "settled-request",
+            "state": "submitted_settled",
+            "response": {"text": "Ready.", "truncated": True},
+        })
+        failed = compact_batch_item(payload["results"][1])
+        self.assertEqual(failed["address"], "local/bad")
+        self.assertEqual(failed["state"], "submission_failed")
+        self.assertEqual(failed["error_code"], "submission_failed")
+        self.assertEqual(failed["error"], "Cannot submit.")
+
     def test_cancel_event_marks_requests_that_never_started(self):
         cancel_event = threading.Event()
 
@@ -200,6 +322,7 @@ class AgentBatchDispatchTest(unittest.TestCase):
         self.assertEqual([request.route for request in sent], ["verified"])
         self.assertEqual(payload["results"][0]["status"], "submitted")
         self.assertEqual(payload["results"][0]["route"], "verified")
+        self.assertEqual(payload["results"][0]["address"], "local/white-bison")
 
     def test_both_or_neither_address_keys_are_invalid_requests(self):
         sent = []
@@ -262,6 +385,7 @@ class AgentBatchDispatchTest(unittest.TestCase):
             resolve_request=resolve,
         )
         self.assertEqual(payload["results"][0]["error"], "agent_ambiguous")
+        self.assertEqual(payload["results"][0]["address"], "local/label")
         self.assertEqual(payload["results"][1]["status"], "succeeded")
         self.assertEqual([request.route for request in sent], ["valid"])
 

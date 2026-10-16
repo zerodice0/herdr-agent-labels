@@ -7,6 +7,11 @@ HAM은 기존 Herdr 에이전트로 메시지를 보내고 응답을 수집하�
 번들 스킬의 정식 이름은 `herdr-agent-messenger`입니다. **HAM**은 짧은 사용자
 표시 이름입니다.
 
+번들 스킬은 일반적인 작업을 안내하는 짧은
+[SKILL.md](../../.agents/skills/herdr-agent-messenger/SKILL.md)와 필요할 때 읽는
+[reference.md](../../.agents/skills/herdr-agent-messenger/reference.md#command-and-flag-reference)로
+나뉩니다. 전체 옵션과 오류 코드 표는 `reference.md`에 있습니다.
+
 ## 설치와 클라이언트별 호출
 
 플러그인에는 Codex용 `.agents/skills/herdr-agent-messenger`와 Claude Code용
@@ -61,7 +66,7 @@ python3 agent_skill_installer.py install all
 클라이언트별 호출 방법은 다음과 같습니다.
 
 - **Codex CLI와 IDE 확장**에서는 `$ham`을 입력한 뒤 스킬 선택기에서
-  **HAM — Herdr Agent Messenger**를 선택하세요. `$ham`은 검색어이며 정식 스킬
+  **HAM (Herdr Agent Messenger)**를 선택하세요. `$ham`은 검색어이며 정식 스킬
   이름은 계속 `herdr-agent-messenger`입니다.
 - **Claude Code**에서는 자연어 요청으로 스킬을 자동 선택하거나
   `/herdr-agent-messenger`로 명시적으로 호출하세요. `$ham`은 Claude 명령이 아닙니다.
@@ -117,21 +122,24 @@ python3 "$HAM_CLI" request --address local/yellow-heron \
 `spawn`은 기본적으로 사용 중이지 않은 HAM `color-animal` 라벨을 선택하고 색상
 메타데이터를 보고합니다. `--label`로 명시한 이름을 사용할 수도 있습니다.
 
-GUI에서 선택한 수신자는 라벨이 없을 수도 있으므로 GUI가 제공한 절대 CLI 경로와
-불투명한 `--route` token을 그대로 사용하세요. `status`, `spawn` 및 요청 결과의
-`route`도 후속 작업에 사용할 수 있습니다. 수신자 확인에 성공한 요청 결과는
-최상위 `route`와 `recipient.route`를 제공할 수 있습니다. token을 해독하거나
-수정하거나 추측한 `herdr` 명령으로 바꾸지 마세요. `route_refreshed: true`이면
-이후 작업에 반환된 최신 `route`를 사용하세요. 각 작업은 현재 점유자를 다시
-확인하므로 에이전트가 재시작되어도 같은 라벨이 같은 세션이라고 가정하지 않습니다.
-자세한 연속성 규칙은 [SSH 및 라우팅](ssh-and-routing.md)을 참고하세요.
+GUI의 코디네이터 지시에는 절대 CLI 경로와 호스트가 포함된 주소가 제공됩니다.
+라벨이 없는 수신자 등을 위해 불투명한 `--route` token이 제공되었다면 해당 명령을
+그대로 사용하세요. token을 해독하거나 수정하거나 추측한 `herdr` 명령으로 바꾸지
+마세요. 기본 출력은 경로 대신 주소를 표시하며, `--verbose`를 사용하면 후속 GUI
+라우팅에 필요한 `route`도 확인할 수 있습니다. `route_refreshed: true`이면 반환된
+최신 token을 사용하세요. 각 작업은 현재 점유자를 다시 확인하므로 같은 라벨이
+재시작 후에도 같은 세션이라고 가정하지 않습니다. 자세한 연속성 규칙은
+[SSH 및 라우팅](ssh-and-routing.md)을 참고하세요.
 
 ## CLI 전체 참고서
 
 하위 명령은 `list`, `status`, `send`, `batch`, `read`, `request`,
 `request-status`, `spawn`의 8개입니다. 모든 하위 명령은 `-h` 또는 `--help`로
 도움말을 표시합니다. 일반적인 단일 작업에는 하위 수준의 `send`보다 `request`를
-권장합니다.
+권장합니다. 모든 명령은 기본적으로 간결한 결과를 반환하며, `--verbose`를 지정하면
+전체 진단 정보를 반환합니다. 일반 응답에서는 TUI 테두리, 상태 표시줄, 다시 출력된
+프롬프트를 제거합니다. 전체 메타데이터나 정리 전 출력이 필요할 때만 `--verbose`를
+사용하세요.
 
 ### 공통 수신자 옵션
 
@@ -172,9 +180,14 @@ python3 "$HAM_CLI" status --route ROUTE_TOKEN --verbose
 ```
 
 공통 수신자 옵션 `--host`, `--address`, `--label`, `--route`를 받습니다.
-추가 옵션 `--verbose`는 기본적으로 꺼져 있으며, 켜면 `agent`에 전체 AgentRecord
-호환 정보를 포함합니다. 결과에는 `agent`, `route_refreshed`, 현재 `route`가
-포함됩니다. 호스트 전체를 다시 나열하지 않고 선택한 수신자의 상태를 확인합니다.
+호스트 전체를 다시 나열하지 않고 선택한 수신자의 상태를 확인합니다.
+
+| 옵션 | 기본값과 규칙 |
+| --- | --- |
+| `--verbose` | 기본적으로 꺼져 있습니다. 전체 에이전트 정보와 라우팅 메타데이터를 반환합니다. |
+
+기본 결과에는 `address`와 `status`가 있고, 오래된 상태이면 `stale: true`가
+추가됩니다.
 
 ### `send`
 
@@ -191,15 +204,19 @@ python3 "$HAM_CLI" send --address local/yellow-falcon \
 | `--wait` | 기본값입니다. Herdr의 완료 신호를 기다립니다. |
 | `--no-wait` | 접수 후 완료를 기다리지 않고 반환합니다. `--wait`와 함께 사용할 수 없습니다. |
 | `--timeout MS` | 기본값은 `120000`밀리초이며 0보다 큰 정수여야 합니다. `--wait`의 대기 제한입니다. |
+| `--defer-timeout MS` | 기본값은 `180000`밀리초, 즉 3분입니다. 포커스 때문에 보류한 메시지를 사용자 결정 대기로 전환할 때까지의 시간이며 `--timeout`과 별개입니다. |
+| `--verbose` | 기본적으로 꺼져 있습니다. 전체 전송 결과와 진단 정보를 반환합니다. |
 
-성공 결과에는 `sent`, `recipient`, `waited`, `route_refreshed`, `route`,
-`warnings`가 포함됩니다. `--wait`에서는 `wait_can_track_submitted_turn`도
-반환합니다. 수신자가 이미 작업 중이면 `recipient_already_working` 경고와
-`wait_can_track_submitted_turn: false`가 반환될 수 있습니다. 이 경우 Herdr의
-완료 신호만으로 새 요청의 완료를 판단할 수 없습니다. `send`는 수명 주기
-`request_id`나 응답 본문을 제공하지 않으므로 안전한 요청 추적에는 `request`를
-사용하세요. 메시지의 앞뒤 공백을 제거하고 `Message from host/label:` 헤더를 붙여
-전달합니다.
+즉시 전송한 기본 결과에는 `sent`, `address`, `waited`가 있고, 경고가 있을 때만
+`warnings`가 포함됩니다. `--verbose`에서는 `recipient`, `route_refreshed`,
+`route` 등의 전체 정보를 확인할 수 있습니다. 수신자가 이미 작업 중이면
+`recipient_already_working` 경고가 있으며, 전체 결과의
+`wait_can_track_submitted_turn`이 `false`일 수 있습니다. 기존 작업의 완료 신호일
+수 있으므로 안전한 요청 추적에는 `request`를 사용하세요. 즉시 전송한 `send`는
+수명 주기 ID나 응답 본문을 제공하지 않습니다. 반면 수신자 pane에 포커스가 있으면
+`--wait`와 관계없이 보류된 요청의 `request_id`와 종료 코드 `3`을 즉시 반환합니다.
+HAM이 이후 전송을 맡으므로 다시 보내지 마세요. 메시지는 앞뒤 공백을 제거하고
+`Message from host/label:` 헤더를 붙여 전달합니다.
 
 ### `request`
 
@@ -214,12 +231,14 @@ python3 "$HAM_CLI" request --address macbook-pro/purple-koala \
 | 옵션 | 기본값과 규칙 |
 | --- | --- |
 | `--message TEXT` | 필수입니다. 공백만 있는 메시지는 허용하지 않습니다. |
-| `--timeout MS` | 기본값은 `120000`밀리초이며 0보다 큰 정수여야 합니다. 제출 후 수명 주기를 관찰하는 대기 제한입니다. |
+| `--timeout MS` | 기본값은 `120000`밀리초이며 0보다 큰 정수여야 합니다. 보류 중인 시간을 포함하여 이 명령이 상태를 관찰하는 대기 제한입니다. |
 | `--output-lines N` | 기본값은 `120`줄이며 0보다 큰 정수여야 합니다. 반환할 응답의 최대 줄 수입니다. |
 | `--output-chars N` | 기본값은 `12000`자이며 0보다 큰 정수여야 합니다. 반환할 응답의 최대 문자 수이며 바이트 수가 아닙니다. |
+| `--defer-timeout MS` | 기본값은 `180000`밀리초, 즉 3분입니다. 포커스로 인한 보류를 사용자 결정 대기로 전환하는 제한이며 `--timeout`과 별개입니다. |
+| `--verbose` | 기본적으로 꺼져 있습니다. 전체 수명 주기 결과와 정리 전 응답을 반환합니다. |
 
 `HERDR_PANE_ID`로 송신자를 확인할 수 있도록 코디네이터의 활성 Herdr 에이전트
-pane에서 실행하세요. 수신자를 확인하고 기준 화면을 수집한 뒤 프롬프트를 한 번만
+pane에서 실행하세요. 전송이 허용되면 수신자를 확인하고 기준 화면을 수집한 뒤 프롬프트를 한 번만
 제출합니다. Herdr의 모호한 `--wait`에 의존하지 않고 새 작업 시작과 종료를
 관찰하며, 기준 화면 이후 출력을 지정한 한도 안에서 반환합니다. 수신자가 이미
 작업 중이었다면 첫 종료는 기존 turn의 경계로만 취급하고 그 다음 작업 시작과
@@ -228,21 +247,30 @@ pane에서 실행하세요. 수신자를 확인하고 기준 화면을 수집한
 ### `request-status`
 
 ```bash
-python3 "$HAM_CLI" request-status --request-id REQUEST_ID
+python3 "$HAM_CLI" request-status --request-id REQUEST_ID --wait 30000
 ```
 
-`--request-id ID`가 필수이며 기본값은 없습니다. `request` 또는 배치 수명 주기
-결과에서 받은 32자리 소문자 16진수 ID를 그대로 전달하세요. 저장된 원자적 상태를
-읽고, 종료되지 않은 요청이면 현재 수신자를 한 번 관찰해 상태를 진전시킵니다.
-프롬프트를 다시 보내거나 새 대기 루프를 시작하지 않습니다. 계속 진행 중이면 같은
-ID로 나중에 다시 확인하세요. 종료 상태이면 저장된 결과를 그대로 반환합니다.
+| 옵션 | 기본값과 규칙 |
+| --- | --- |
+| `--request-id ID` | 필수입니다. `request`, 보류된 `send` 또는 배치 결과에서 받은 32자리 소문자 16진수 ID를 그대로 전달합니다. |
+| `--wait MS` | 기본값은 `0`이며 한 번만 관찰합니다. 값을 지정하면 `state`, `phase`, `error_code` 중 하나가 바뀌거나, 요청이 종료 상태가 되거나, 지정한 시간이 지나면 반환합니다. 응답 텍스트가 늘어나는 것만으로는 대기를 끝내지 않습니다. `send`와 `batch`의 값 없는 `--wait`와 다릅니다. |
+| `--verbose` | 기본적으로 꺼져 있습니다. 변경 여부와 관계없이 전체 저장 결과를 반환합니다. |
 
-요청 상태는 같은 실행 환경의 로컬 저장소에 보관됩니다.
-`HERDR_AGENT_REQUEST_STATE_DIR`로 경로를 지정할 수 있으며, 기본적으로
-`HERDR_PLUGIN_STATE_DIR/requests` 또는 XDG 상태 경로의
-`herdr-agent-messenger/requests`를 사용합니다. 이전 플러그인의 요청 저장소가
-있으면 해당 저장소를 이어서 사용할 수 있습니다. 다른 환경에서 조회해
-`request_not_found`가 발생했다고 해서 미전달로 판단하지 마세요.
+저장된 상태를 읽고 종료되지 않은 요청을 관찰하며 중복 요청을 제출하지 않습니다.
+보류 제한 전에 포커스가 해제되었다면 저장된 메시지를 전송할 수 있습니다.
+기본 결과는 이전 보고와 상태, 단계, 오류 코드 또는 응답 텍스트가 다르면
+`changed: true`를 포함합니다. 바뀌지 않았다면 `request_id`, `state`,
+`terminal`, `submitted`, `changed: false`만 반환합니다. 같은 ID로 이어서
+확인하세요. 관찰 사이에 놓친 작업 시작과 종료를 완전히 복원할 수는 없습니다.
+대기를 끝내는 조건과 변경 보고는 별개이므로 응답 텍스트만 늘어났다면 대기를
+계속하다가 반환 시점에 `changed: true`로 보고할 수 있습니다.
+
+요청과 보류 대기열은 송신 호스트의 공용 저장소에 보관됩니다.
+`HERDR_AGENT_REQUEST_STATE_DIR`로 경로를 지정할 수 있으며, 기본 경로는
+`${XDG_STATE_HOME:-$HOME/.local/state}/herdr-agent-messenger/requests`입니다.
+새 디렉터리가 없을 때만 기존 `herdr-agent-labels/requests`를 이어서 사용합니다.
+`HERDR_PLUGIN_STATE_DIR`는 사용하지 않습니다. 원래 송신 호스트와 같은 저장소에서
+조회하세요. 다른 환경에서 `request_not_found`가 발생해도 미전달로 판단하지 마세요.
 
 ### `batch`
 
@@ -259,6 +287,8 @@ python3 "$HAM_CLI" batch \
 | `--no-wait` | 접수 후 완료를 관찰하지 않고 반환합니다. `--wait`와 함께 사용할 수 없습니다. |
 | `--timeout MS` | 기본값은 `120000`밀리초이며 0보다 큰 정수여야 합니다. 전체 배치가 아니라 각 요청의 대기 제한입니다. |
 | `--max-workers N` | 기본값은 `4`이며 `1`부터 `8`까지의 정수여야 합니다. 동시에 전송할 요청 수의 상한입니다. |
+| `--defer-timeout MS` | 기본값은 `180000`밀리초, 즉 3분입니다. 각 수신자의 포커스 보류를 사용자 결정 대기로 전환하는 제한입니다. |
+| `--verbose` | 기본적으로 꺼져 있습니다. 각 항목의 전체 전송·수명 주기 정보를 반환합니다. |
 
 각 항목은 비어 있지 않은 문자열 `message`와 `address` 또는 `route` 중 정확히
 하나를 포함해야 합니다. 같은 에이전트에 주소와 token을 각각 사용한 경우도
@@ -268,9 +298,10 @@ CLI는 이미 작성된 개별 지시를 제한된 동시성으로 전달할 뿐
 유지합니다.
 
 `--wait`에서 수명 주기에 진입한 항목은 `request_id`와 제한된 `response`를
-포함합니다. 사전 검증에 실패한 항목과 `--no-wait` 결과에는 요청 ID가 없을 수
-있습니다. `submitted` 항목은 `request-status`로 이어서 확인하고 다시 보내지
-마세요. 배치 응답의 필드와 종료 코드 해석은 아래 표를 참고하세요.
+포함합니다. 보류된 항목에는 `--no-wait`에서도 요청 ID가 있습니다. 사전 검증에
+실패했거나 즉시 전송한 `--no-wait` 항목에는 ID가 없을 수 있습니다.
+`submitted`와 `deferred` 항목은 다시 보내지 말고 반환된 ID로 `request-status`를
+실행하세요. 배치 응답의 필드와 종료 코드 해석은 아래 표를 참고하세요.
 
 ### `read`
 
@@ -289,13 +320,15 @@ python3 "$HAM_CLI" read --address macbook-pro/purple-koala \
 | `--max-bytes N` | 기본값은 `65536`바이트이며 0보다 큰 정수여야 합니다. 반환할 UTF-8 출력의 최대 바이트 수입니다. |
 | `--cursor TOKEN` | 기본값은 없습니다. 이전 `read`가 반환한 불투명한 `cursor`를 전달하면 안전하게 계산할 수 있는 경우 변경분만 반환합니다. |
 | `--watermark TOKEN` | `--cursor`와 같은 옵션의 별칭이며 기본값은 없습니다. |
+| `--verbose` | 기본적으로 꺼져 있습니다. 정리 전 출력, cursor 진단 정보와 라우팅 메타데이터를 반환합니다. |
 
-결과에는 `address`, `output`, `truncated`, `delta`, `cursor_status`, `cursor`,
-`route_refreshed`, `route`가 포함됩니다. 터미널은 추가 전용 로그가 아니라 다시
-그려지는 화면일 수 있으므로 줄 번호로 진행 상황을 추측하지 마세요.
-`cursor_status: expired`이면 `delta`는 `false`이며 현재 화면을 제한된 크기로
-다시 반환합니다. 안전하지 않은 변경분을 추측하지 않습니다. `truncated: true`이면
-이전 출력의 일부가 생략되었다고 보고하세요.
+기본 결과에는 `address`, 정리된 `output`, `truncated`, `delta`, `cursor`가
+포함됩니다. `--verbose`를 사용하면 `cursor_status`, `route_refreshed`, `route`도
+확인할 수 있습니다. 터미널은 추가 전용 로그가 아니라 다시 그려지는 화면일 수
+있으므로 줄 번호로 진행 상황을 추측하지 마세요. 안전한 변경분을 계산할 수 없으면
+`delta: false`로 현재 화면을 제한된 크기로 반환하며, 전체 결과에서는
+`cursor_status: expired`를 확인할 수 있습니다. `truncated: true`이면 일부 출력이
+생략되었다고 보고하세요.
 
 ### `spawn`
 
@@ -318,15 +351,16 @@ python3 "$HAM_CLI" spawn --kind omp --host macbook-pro \
 | `--workspace-label TEXT` | 새 `tab` 또는 `workspace`의 표시 이름을 지정합니다. 생략 시 명시한 `--label`을 사용하며, 둘 다 없으면 시작 후 자동 HAM 라벨로 이름을 맞춥니다. |
 | `--label LABEL` | 기본적으로 사용 중이지 않은 HAM `color-animal` 라벨을 선택합니다. 직접 지정할 때는 비어 있지 않고 `/`를 포함하지 않아야 합니다. |
 | `--timeout MS` | 기본값은 `90000`밀리초이며 `1`부터 `300000`까지의 정수여야 합니다. 대화형 에이전트의 준비 완료를 기다리는 제한입니다. |
+| `--verbose` | 기본적으로 꺼져 있습니다. 전체 세션·라우팅 정보와 메타데이터 보고 결과를 반환합니다. |
 | `-- AGENT_ARGS...` | 선택 사항입니다. `--` 뒤의 인수를 대화형 에이전트에 전달합니다. HAM 옵션은 구분자 앞에 두세요. |
 
-성공 결과에는 `address`, `label`, `marker`, `color`, `host`, `pane_id`,
-`workspace_id`, `kind`, `cwd`, `route`, 간결한 `agent` 정보,
-`label_metadata_reported`, `placement_label_reported`, `created`가 포함됩니다.
-`tab_id`는 값이 있을 때만 포함됩니다. `created`는 `pane`, `tab`, `workspace`
-중 하나입니다. HAM 팔레트에 없는 사용자 지정 라벨은 `marker`와 `color`가 빈
-문자열이고 `label_metadata_reported`가 `false`일 수 있습니다. 이 필드나
-`placement_label_reported`가 `false`여도 세션 생성 실패를 뜻하지는 않습니다.
+기본 성공 결과에는 `address`, `marker`, `created`, `pane_id`,
+`workspace_id`가 있고, `tab_id`는 값이 있을 때만 포함됩니다. `created`는 `pane`,
+`tab`, `workspace` 중 하나입니다. `label_metadata_reported`와
+`placement_label_reported`는 `false`일 때만 표시됩니다. `--verbose`를 사용하면
+`label`, `color`, `host`, `kind`, `cwd`, `route`, `agent`와 두 보고 플래그를
+모두 확인할 수 있습니다. HAM 팔레트에 없는 라벨은 marker가 비어 있고 팔레트
+메타데이터가 없습니다. 보고 플래그가 `false`여도 세션 생성 실패를 뜻하지는 않으므로
 실제 주소와 상태를 확인하세요.
 
 생성 후 시작 단계가 실패하면 HAM은 자신이 만든 리소스를 닫으려고 시도하고 오류
@@ -337,17 +371,54 @@ python3 "$HAM_CLI" spawn --kind omp --host macbook-pro \
 
 ### 요청 수명 주기
 
-`request`와 `request-status`의 수명 주기 payload에는 `request_id`, `state`,
-`phase`, `terminal`, `submitted`, `error`, `error_code`, `response`가
-포함됩니다. `error`는 사람이 읽는 설명이고 `error_code`는 기계가 분기할 코드이며,
-오류가 없으면 둘 다 `null`입니다. 수명 주기에 진입하기 전의 입력 검증이나 송신자
-확인이 실패하면 `{"error":{"code":"...","message":"..."}}` 형태의 오류
-envelope가 반환되고 `request_id`는 없습니다. 모든 명령 결과에 요청 ID가 있는
-것은 아닙니다.
+에이전트가 CLI의 `request`, `send`, `batch`로 메시지를 보낼 때 수신자 pane에
+포커스가 있으면 HAM이 전송을 보류합니다. 단, 자기 자신에게 보내면 포커스를
+확인하기 전에 `recipient_is_sender`로 즉시 실패합니다. 송신자 pane에 포커스가
+있어도 자기 자신에게 보낸 메시지를 보류하지 않습니다. 입력창을 읽거나 실제
+타이핑을 감지하는 기능은 아닙니다. 제한 시간이 지나기 전에 해당 pane을 떠나면
+백그라운드 worker가 메시지를 전달합니다. 원래 CLI의 대기가 끝나도 HAM이
+보관한 메시지의 전송을 계속 맡습니다.
+
+`--defer-timeout`의 기본값인 3분이 지나도록 포커스가 유지되면
+`awaiting_decision`으로 바뀌고 Herdr 알림을 보냅니다. 명령 팔레트에서
+**HAM: Held Messages**를 열고 Up/Down으로 요청을 선택한 뒤 **Push** (`p`) 또는
+**Cancel** (`c`)을 선택하세요. `q` 또는 Esc로 창을 닫을 수 있습니다. Push는 해당
+pane에 제출하지 않은 글이 있으면 메시지와 합쳐서 제출할 수 있습니다.
+Cancel은 미제출 상태에서 요청을 끝내며 `submission_failed`,
+`phase: delivery_cancelled`, `error_code: delivery_cancelled`,
+`submitted: false`로 기록합니다. **제한 시간이 지난 메시지는 나중에 포커스를
+옮겨도 자동으로 전송하지 않습니다.** 반드시 Push 또는 Cancel을 선택해야 합니다.
+
+보류 후 전송하거나 Push로 전송한 요청은 worker가 약 0.5초마다 관찰합니다.
+요청이 종료 상태가 되거나 제출 후 30분이 지나면 해당 요청의 관찰을 끝냅니다.
+저장된 결과는 `request-status`로 읽으세요. 30분이 지난 뒤에도 이 명령으로
+관찰을 이어갈 수 있습니다. worker는 보류 중인 요청, 사용자 결정 대기 요청,
+관찰 중인 요청이 모두 없어야 종료합니다.
+
+HAM 팝업의 직접 전송과 코디네이터 위임은 사용자가 시작한 작업이므로 보류하지
+않습니다. 알려진 한계도 있습니다. 글을 입력한 뒤 제출하지 않고 다른 pane으로
+이동하면 남아 있는 초안과 수신 메시지가 여전히 합쳐질 수 있습니다.
+
+SSH 수신자는 수신 호스트의 포커스를 확인하지만 보류 대기열, worker,
+**HAM: Held Messages**는 모두 **송신 호스트**에 있습니다. 제한 시간이 지나면
+양쪽 호스트에 알림을 보내며, 수신 호스트의 알림에는 결정을 내릴 송신 호스트가
+표시됩니다. 전송 전에 수신자가 사라지거나 교체되면 새 점유자에게 보내지 않고
+미전달 실패로 종료합니다.
+
+기본 수명 주기 payload에는 `request_id`, `state`, `phase`, `terminal`,
+`submitted`, `address`가 있습니다. 오류가 있을 때만 사람이 읽는 `error`와
+기계가 분기할 `error_code`를 포함하며, `null`인 선택 필드는 생략합니다.
+보류 중에는 `defer.reason: recipient_focused`와 `defer.deadline`을 반환합니다.
+응답이 있으면 정리된 텍스트를 `response.text`로 반환하며, 완료되지 않았고 텍스트도
+없으면 `response`를 생략합니다. `--verbose`에서는 전체 메타데이터와 응답을
+반환합니다. 사전 검증 실패는 `{"error":{"code":"...","message":"..."}}`
+형태이며 `request_id`가 없습니다. 모든 명령 결과에 요청 ID가 있는 것은 아닙니다.
 
 | `state` | 의미와 후속 조치 |
 | --- | --- |
-| `submission_failed` | 수신자 확인에 실패했거나 제출이 거부되었습니다. 원인을 고치고 미전달임을 확인한 뒤 재시도할 수 있습니다. |
+| `submission_failed` | 수신자 확인이나 제출에 실패했거나 보류된 메시지를 취소했습니다. `error_code`를 확인하고 취소 결정을 존중하세요. |
+| `deferred` | 수신자 pane에 포커스가 있어 전송을 보류했습니다. 단계는 `deferred_recipient_focused`이며 `submitted: false`인 비종료 상태입니다. HAM이 전송을 맡으므로 다시 보내지 마세요. |
+| `awaiting_decision` | 보류 제한 시간이 지났습니다. 단계는 `awaiting_decision`이며 `submitted: false`인 비종료 상태입니다. 송신 호스트에서 Push 또는 Cancel을 선택하세요. |
 | `submitted_working` | 요청을 제출했거나 제출했을 수 있으며 마지막으로 확인한 수신자는 작업 중입니다. 완료를 뜻하지 않습니다. `request-status`로 확인하세요. |
 | `submitted_settled` | 새 요청의 작업 시작과 종료를 관찰했습니다. 응답 품질과 상관관계를 확인한 뒤 사용하세요. |
 | `submitted_unknown` | 제출했거나 제출했을 수 있으나 해당 turn의 완료를 안전하게 확인하지 못했습니다. 재전송하지 말고 저장된 상태와 수신자를 확인하세요. |
@@ -370,35 +441,34 @@ envelope가 반환되고 `request_id`는 없습니다. 모든 명령 결과에 �
 
 | 필드 | 의미 |
 | --- | --- |
-| `response.output` | 기준 화면 이후에서 수집한 제한된 텍스트입니다. 화면 연속성을 찾지 못하면 현재 화면 일부가 포함될 수 있습니다. |
-| `response.truncated` | 줄·문자 한도로 출력이 잘렸거나, 기준 화면과의 연속성 또는 기준 화면 읽기의 신뢰성을 잃었음을 뜻합니다. 전체 응답이라고 단정하지 마세요. |
+| `response.text` | 기본 결과의 정리된 응답 텍스트입니다. 기준 화면 이후에서 제한된 분량을 수집하며, 화면 연속성을 찾지 못하면 현재 화면 일부가 포함될 수 있습니다. 전체 결과에서는 `response.output`을 사용합니다. |
+| `response.truncated` | 기본 결과와 전체 결과 모두 출력 한도나 읽기 실패로 응답 텍스트 자체가 잘렸을 때만 `true`입니다. 오래된 이력을 생략했거나 기준 화면과의 연속성을 잃었다는 이유만으로는 설정하지 않습니다. `false`여도 응답의 상관관계나 신뢰할 수 있는 전체 기록을 보장하지 않습니다. |
 | `response.correlated` | 새 요청의 작업 시작과 종료를 관찰했고 기준 화면과 최종 읽기도 성공했음을 뜻합니다. 출력이 잘리지 않았거나 내용이 정확하다는 보장은 아닙니다. |
 | `response.anchored` | 화면 겹침을 찾지 못했을 때 마지막 `Message from host/label:` 헤더를 찾아 그 위치부터 수집했음을 뜻합니다. 성공한 경우 `true`로 포함되며, 없으면 `false`로 취급하세요. 요청별 고유 ID로 응답을 인증한 것은 아닙니다. |
-| `response.error` | 응답 화면 읽기에 실패했을 때 포함될 수 있는 설명입니다. 수명 주기의 최상위 `error_code`와 별도로 확인하세요. |
+| `response.error` | 전체 결과에서 응답 화면 읽기에 실패했을 때 포함될 수 있는 설명입니다. 수명 주기의 최상위 `error_code`와 별도로 확인하세요. |
 
 ### 배치 결과
 
-배치 결과는 `{"status":"...","results":[...]}`입니다. 각 항목에는 `route`와
-`status`가 있고 필요에 따라 `error`, `detail`, `request_id`, `response`가
-포함됩니다. 배치의 `error`는 보통 오류 코드이며 `detail`이 설명입니다. 수명 주기
-제출 실패를 정규화한 일부 결과는 `error`에 사람이 읽는 설명이 들어갈 수 있으므로
-항목에 요청 ID가 있으면 `request-status`의 `error_code`로 정확히 분기하세요.
-배치의 `response`는 `output`, `truncated`, `correlated`를 제공하며 원본 수명
-주기의 `anchored` 필드는 전달하지 않습니다.
+배치 결과는 `{"status":"...","results":[...]}`입니다. 기본 항목에는 `address`와
+`status`가 있고 필요에 따라 `request_id`, `state`, `error_code`, `error`,
+`response`가 포함됩니다. 기본 `response`는 `text`와 `truncated`를 제공합니다.
+`--verbose`는 경로와 전체 항목 정보를 반환합니다. 원본 수명 주기의 상관관계나
+`anchored` 정보를 확인하려면 해당 ID로 `request-status`를 실행하세요.
 
 | 항목 `status` | 의미와 후속 조치 |
 | --- | --- |
 | `succeeded` | 해당 요청의 완료를 확인했습니다. 응답을 검토하세요. |
 | `submitted` | 접수는 확인했지만 이 실행에서 완료를 확인하지 못했습니다. `--no-wait`도 여기에 해당합니다. 요청 ID가 있으면 `request-status`로 이어서 확인하세요. |
+| `deferred` | 포커스 보류 또는 사용자 결정 대기 중입니다. HAM이 전송을 맡고 있으므로 다시 보내지 말고 ID로 상태를 확인하세요. |
 | `failed` | 입력·주소 검증이나 제출이 실패했습니다. 해당 항목의 원인과 전달 여부를 확인한 뒤 미전달 항목만 재시도하세요. |
 | `timeout` | 접수를 확인하지 못했거나 전송 호출이 시간 초과되었습니다. 미전달의 증거가 아니므로 자동으로 다시 보내지 마세요. |
 | `cancelled` | 해당 항목이 취소되었습니다. 재시도 전 전달 여부를 확인하세요. 접수가 확인된 후 대기만 취소되면 `submitted`로 보고됩니다. |
 
 | 전체 `status` | 의미 |
 | --- | --- |
-| `succeeded` | 모든 항목이 `succeeded` 또는 `submitted`입니다. 모두 전달되었다는 뜻이며 모두 완료되었다는 뜻은 아닙니다. |
-| `partial` | 일부 항목만 `succeeded` 또는 `submitted`입니다. 각 항목을 개별적으로 처리하세요. |
-| `failed` | `succeeded` 또는 `submitted`인 항목이 없습니다. 불명·시간 초과 항목까지 미전달로 단정하지 마세요. |
+| `succeeded` | 모든 항목이 `succeeded`, `submitted` 또는 `deferred`입니다. HAM이 접수하거나 보관했다는 뜻이며 모두 전달되거나 완료되었다는 뜻은 아닙니다. |
+| `partial` | 일부 항목만 `succeeded`, `submitted` 또는 `deferred`입니다. 각 항목을 개별적으로 처리하세요. |
+| `failed` | `succeeded`, `submitted`, `deferred`인 항목이 없습니다. 불명·시간 초과 항목까지 미전달로 단정하지 마세요. |
 
 ### 프로세스 종료 코드
 
@@ -407,7 +477,7 @@ envelope가 반환되고 `request_id`는 없습니다. 모든 명령 결과에 �
 | `0` | 성공입니다. `request`와 `request-status`는 `submitted_settled`이고, 배치는 모든 항목이 `succeeded`입니다. `list`, `status`, `read`, `send`, `spawn`은 정상 payload를 반환했다는 뜻이므로 특히 `send --no-wait`를 완료로 해석하지 마세요. |
 | `1` | JSON 오류 envelope, `submission_failed` 또는 배치의 `failed`·`cancelled`·`timeout` 항목이 있습니다. 오류와 각 항목을 읽고 미전달이 확인된 경우에만 원인을 고쳐 재시도하세요. 배치 전체를 다시 보내지 마세요. |
 | `2` | argparse의 사용법 오류입니다. 도움말을 보고 인수 형식이나 필수 옵션을 고치세요. 보통 표준 오류에 사용법이 출력되며 JSON 결과를 기대하면 안 됩니다. |
-| `3` | 전달되었거나 전달되었을 수 있지만 완료를 확인하지 못했습니다. 요청은 `submitted_working` 또는 `submitted_unknown`이며, 배치는 실패 항목 없이 `submitted`가 남은 경우입니다. 재전송하지 말고 반환된 ID로 `request-status`를 실행하세요. `--no-wait`처럼 ID가 없는 경우에는 `status`와 `read`로 수신자를 확인하세요. |
+| `3` | HAM이 요청을 계속 맡고 있으므로 다시 보내면 안 됩니다. 요청은 `submitted_working`, `submitted_unknown`, `deferred` 또는 `awaiting_decision`이며, 배치는 실패 항목 없이 `submitted`나 `deferred`가 남은 경우입니다. 반환된 ID로 `request-status`를 실행하고 결정 대기 중이면 송신 호스트에서 Push 또는 Cancel을 선택하세요. ID가 없는 즉시 전송 항목은 `status`와 `read`로 확인하세요. |
 
 시간 초과나 SSH 연결 종료는 접수 후에도 발생할 수 있습니다. 종료 코드 `1`도
 무조건 재시도하라는 뜻이 아니며, 종료 코드 `3`은 전송 실패가 아닙니다.
@@ -416,7 +486,8 @@ envelope가 반환되고 `request_id`는 없습니다. 모든 명령 결과에 �
 
 아래 코드는 오류 envelope의 `error.code`, 수명 주기의 `error_code` 또는 배치
 항목의 `error`에 나타납니다. 같은 명령을 그대로 반복하는 대신 발생 지점과
-`submitted` 값을 확인하세요. 오류가 없을 때 수명 주기의 `error_code`는 `null`입니다.
+`submitted` 값을 확인하세요. 기본 결과는 오류가 없으면 `error_code`를 생략하며,
+전체 결과에서는 `null`로 표시합니다.
 
 ### 입력과 대상 선택: 원인을 수정한 뒤 미전달 요청만 재시도합니다
 
@@ -427,7 +498,8 @@ envelope가 반환되고 `request_id`는 없습니다. 모든 명령 결과에 �
 | `host_not_configured` | 해당 호스트가 설정된 명시적 SSH 별칭이 아닙니다. 기존 설정에서 올바른 별칭을 찾으세요. |
 | `agent_not_found`, `agent_ambiguous` | 정확한 현재 라벨을 확인할 수 없습니다. 성공한 탐색 결과로 사용자에게 보고하고 추측하지 마세요. 생성 요청이 없으면 `spawn`하지 마세요. |
 | `empty_message`, `invalid_message` | 메시지가 비었거나 배치 메시지가 문자열이 아닙니다. 메시지를 고치세요. |
-| `invalid_timeout` | 일반 요청·전송·배치는 양의 밀리초 정수여야 하며 `spawn`은 `1`부터 `300000`까지여야 합니다. |
+| `invalid_timeout` | 일반 요청·전송·배치는 양의 밀리초 정수여야 하며 `spawn`은 `1`부터 `300000`까지여야 합니다. `request-status --wait`는 `0` 이상의 밀리초 정수여야 합니다. |
+| `invalid_defer_timeout` | `request`, `send`, `batch`의 `--defer-timeout`을 양의 밀리초 정수로 고치세요. |
 | `invalid_lines`, `invalid_max_bytes`, `invalid_output_lines`, `invalid_output_chars` | 해당 출력 한도를 양의 정수로 고치세요. |
 | `invalid_cursor` | cursor가 유효하지 않습니다. token을 임의로 고치지 말고 cursor 없이 새 화면을 읽으세요. |
 | `invalid_label` | `spawn --label`을 비어 있지 않고 `/`가 없는 값으로 고치세요. |
@@ -444,7 +516,7 @@ envelope가 반환되고 `request_id`는 없습니다. 모든 명령 결과에 �
 | `host_unavailable` | Herdr 탐색에 실패했습니다. 연결·인증·서버 상태를 확인하세요. 로컬 상세에 샌드박스나 소켓 권한 오류가 있으면 필요한 로컬 Herdr 소켓 접근 권한을 얻어 같은 탐색 명령을 다시 실행하세요. 탐색이 성공하기 전에는 에이전트가 없다고 보고하지 마세요. 이미 제출한 요청의 관찰에서 발생했다면 새 요청을 보내지 말고 `request-status`로 이어서 확인하세요. |
 | `sender_probe_failed` | 제출 전에 현재 송신자 확인이 실패했으며 프롬프트는 제출되지 않았습니다. 로컬 소켓·샌드박스 권한 문제라면 필요한 접근 권한을 얻은 뒤 정확히 그 미전달 요청만 다시 실행하세요. 배치에서는 이 코드로 실패한 항목만 재시도하고 전달·제출·불명·시간 초과 항목은 다시 보내지 마세요. |
 | `sender_unavailable` | `HERDR_PANE_ID`가 없거나 현재 pane에 에이전트가 없습니다. 활성 Herdr 에이전트 pane에서 실행하세요. 제출 전에 실패합니다. |
-| `recipient_is_sender` | 송신자 자신을 수신자로 지정했습니다. 다른 수신자를 선택하세요. 제출되지 않았습니다. |
+| `recipient_is_sender` | 송신자 자신을 수신자로 지정했습니다. 포커스 확인 전에 즉시 실패하므로 송신자 pane에 포커스가 있어도 보류하지 않으며 제출되지 않았습니다. 다른 수신자를 선택하세요. |
 | `resolve_failed` | 구체적인 코드가 없는 수신자 확인 실패입니다. 초기 실패면 미제출이며, 제출 후 조회 실패면 기존 요청만 이어서 확인하세요. |
 
 SSH 신뢰 설정을 바꾸거나 host-key 검증을 우회하지 마세요. 설정 파일에 없는
@@ -459,7 +531,8 @@ SSH 신뢰 설정을 바꾸거나 host-key 검증을 우회하지 마세요. 설
 | `wait_timed_out` | 접수 후 관찰 제한 시간이 지났습니다. 미전달이 아니므로 `request-status`로 이어서 확인하세요. |
 | `prompt_timeout`, `timeout` | 하위 전송 또는 배치 호출이 시간 초과되었습니다. 접수 여부를 확인하기 전에는 재전송하지 마세요. |
 | `cancelled`, `prompt_cancelled` | 제출 전 취소인지 접수 후 대기 취소인지 `submitted`와 상태로 구분하세요. 접수 후라면 기존 요청을 조회하세요. |
-| `recipient_changed` | 요청 도중 점유자가 바뀌어 수집을 중단했습니다. 원래 요청의 결과는 불명 상태로 보존하며 새 점유자의 출력으로 대체하지 마세요. |
+| `delivery_cancelled` | 사용자가 보류된 메시지를 제출 전에 취소했습니다. 종료 상태인 `submission_failed`와 `submitted: false`로 기록합니다. 취소 결정을 존중하고 자동으로 다시 보내지 마세요. |
+| `recipient_changed` | 요청 도중 점유자가 바뀌었습니다. 제출 전의 보류 요청은 미전달 실패로 종료하며, 제출 후에는 결과를 불명 상태로 보존합니다. 새 점유자의 출력으로 대체하거나 이전 요청을 다시 보내지 마세요. |
 | `read_failed` | 하위 `read`가 실패했습니다. 수신자와 접근 권한을 확인한 뒤 읽기만 다시 시도하세요. 프롬프트를 재전송하지 마세요. |
 
 ### 저장소·설치·내부 오류: 복구 전에 실제 상태를 확인합니다
@@ -484,7 +557,7 @@ SSH 신뢰 설정을 바꾸거나 host-key 검증을 우회하지 마세요. 설
    만들어 `batch`로 전송하세요. GUI가 제공한 절대 CLI 경로와 token은 스킬이
    전역에 설치되지 않았더라도 그대로 사용할 수 있습니다.
 5. 요청한 모든 worker가 응답하거나 명확한 종료 실패가 확인될 때까지 기다리세요.
-   `submitted`는 재전송하지 말고 `request-status`로 이어서 관찰하세요.
+   `submitted`, `deferred`, `awaiting_decision`은 재전송하지 말고 `request-status`로 이어서 관찰하세요.
 6. 각 응답을 읽고 관련 workspace에서 내용을 확인한 뒤 누락되거나 서로 맞지 않는
    부분에 후속 요청을 보내세요.
 7. 결과를 종합할 때 사용할 수 없는 호스트, 시간 초과 에이전트, 검증하지 못한 주장,

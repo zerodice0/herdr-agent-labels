@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import suppress
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import glob
 import json
 import os
@@ -54,6 +54,7 @@ class AgentRecord:
     terminal_id: str = ""
     workspace_is_worktree: bool = False
     route_target: str = ""
+    focused: bool = field(default=False, compare=False)
 
     @property
     def target(self) -> str:
@@ -187,6 +188,14 @@ def parse_agent_payload(
                 and bool(worktree.get("is_linked_worktree")),
             )
 
+    pane_focus: dict[str, bool] = {}
+    raw_panes = container.get("panes")
+    if isinstance(raw_panes, list):
+        for raw_pane in raw_panes:
+            if isinstance(raw_pane, dict) and isinstance(raw_pane.get("focused"), bool):
+                pane_focus[str(raw_pane.get("pane_id") or "")] = raw_pane["focused"]
+    focused_pane_id = container.get("focused_pane_id")
+
     records: list[AgentRecord] = []
     for raw_agent in raw_agents:
         if not isinstance(raw_agent, dict):
@@ -223,6 +232,7 @@ def parse_agent_payload(
                 terminal_id=str(raw_agent.get("terminal_id") or ""),
                 workspace_is_worktree=workspace_is_worktree,
                 route_target=route_target,
+                focused=pane_focus.get(pane_id, pane_id == focused_pane_id),
             )
         )
     return records
@@ -727,6 +737,7 @@ class AgentCache:
                 or type(record.revision) is not int
                 or record.revision < 0
                 or type(record.workspace_is_worktree) is not bool
+                or type(record.focused) is not bool
             ):
                 continue
             records.append(replace(record, stale=stale))

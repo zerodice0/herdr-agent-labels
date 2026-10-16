@@ -23,7 +23,7 @@ from agent_directory import (
     ssh_hosts,
 )
 from agent_labels import ALIASES, LEGACY_SOURCE, SOURCE, Alias, candidates
-from agent_output import compact_agent_payload
+from agent_output import compact_agent_payload, compact_spawn_payload
 from agent_route import encode_agent_route
 
 
@@ -75,6 +75,10 @@ def add_spawn_parser(subparsers: Any) -> None:
     parser.add_argument(
         "--timeout", type=int, default=90_000, metavar="MS",
         help="Interactive readiness timeout in ms (1–300000; default: 90000).",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Print the full legacy payload including the route.",
     )
     parser.add_argument(
         "agent_args", nargs=argparse.REMAINDER,
@@ -362,6 +366,6 @@ def spawn_command(
                 "route": encode_agent_route(agent),
             }
         )
-        return payload
+        return payload if arguments.verbose else compact_spawn_payload(payload)
     except SpawnError as error:
         raise SpawnError(error.code, f"{error.message}; {cleanup()}") from None

@@ -16,6 +16,61 @@ import agent_directory
 
 
 class AgentDirectoryTest(unittest.TestCase):
+    def test_snapshot_pane_focus_is_preserved_for_local_and_remote_agents(self):
+        payload = {"result": {"snapshot": {
+            "agents": [
+                {"pane_id": "w:p1", "agent": "codex"},
+                {"pane_id": "w:p2", "agent": "omp"},
+            ],
+            "panes": [
+                {"pane_id": "w:p1", "focused": True},
+                {"pane_id": "w:p2", "focused": False},
+            ],
+            "focused_pane_id": "w:p1",
+        }}}
+        completed = subprocess.CompletedProcess(["herdr"], 0, json.dumps(payload), "")
+        with mock.patch.object(agent_directory, "_run_command", return_value=completed):
+            probes = (
+                agent_directory.probe_local_agents({}),
+                agent_directory.query_remote_agents("remote", config_path=Path("/tmp/config")),
+            )
+        for probe in probes:
+            with self.subTest(host=probe.host):
+                self.assertTrue(probe.success)
+                self.assertEqual([agent.focused for agent in probe.agents], [True, False])
+
+    def test_focus_falls_back_to_snapshot_focused_pane_id(self):
+        payload = {"result": {"snapshot": {
+            "agents": [{"pane_id": "w:p1", "agent": "codex"}],
+            "focused_pane_id": "w:p1",
+        }}}
+        agents = agent_directory.parse_agent_payload(payload, host="local", local=True)
+        self.assertTrue(agents[0].focused)
+        payload["result"]["snapshot"]["panes"] = [{"pane_id": "w:p1"}]
+        agents = agent_directory.parse_agent_payload(payload, host="local", local=True)
+        self.assertTrue(agents[0].focused)
+        payload["result"]["snapshot"]["panes"] = [{"pane_id": "w:p1", "focused": False}]
+        agents = agent_directory.parse_agent_payload(payload, host="local", local=True)
+        self.assertFalse(agents[0].focused)
+
+    def test_focus_only_change_preserves_identity_route_and_occupant(self):
+        from agent_route import encode_agent_route, resolve_agent_route
+
+        for session_id in ("session", ""):
+            with self.subTest(session_id=session_id):
+                original = agent_directory.AgentRecord(
+                    "remote", "worker", "w:p1", "w", "work", "idle",
+                    session_id, "/work", False, revision=1,
+                    agent_kind="codex", terminal_id="terminal",
+                )
+                focused = agent_directory.replace(original, focused=True)
+                route = encode_agent_route(original)
+                self.assertEqual(original, focused)
+                self.assertEqual(original.identity, focused.identity)
+                self.assertEqual(route, encode_agent_route(focused))
+                self.assertFalse(resolve_agent_route(route, [focused]).route_refreshed)
+                self.assertIs(agent_directory._matching_agent(original, [focused]), focused)
+
     def test_malformed_revisions_fail_local_and_remote_probes_cleanly(self):
         for revision in ("bad", [], {}, True, 1.5, -1):
             payload = {"result": {"agents": [

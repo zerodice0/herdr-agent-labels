@@ -1,9 +1,14 @@
+from contextlib import nullcontext
+from copy import deepcopy
+import fcntl
+import os
 import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest import mock
+from datetime import datetime
 
 import agent_skill_cli
 from request_lifecycle import (
@@ -13,6 +18,11 @@ from request_lifecycle import (
     SubmissionResult,
     capture_new_output,
     limit_output,
+    mark_deferred_notified,
+    open_request_store,
+    pending_deferred,
+    request_state_directory,
+    set_deferred_decision,
 )
 
 
@@ -21,6 +31,7 @@ class FakeTarget:
     identity: str
     status: str
     output: str = ""
+    focused: bool = False
 
 
 class MemoryStore:
@@ -29,13 +40,18 @@ class MemoryStore:
         self.history = []
 
     def save(self, request_id, payload):
-        copied = dict(payload)
-        copied["response"] = dict(payload["response"])
+        copied = deepcopy(payload)
         self.payloads[request_id] = copied
         self.history.append(copied)
 
     def load(self, request_id):
-        return self.payloads.get(request_id)
+        return deepcopy(self.payloads.get(request_id))
+
+    def lock(self, request_id):
+        return nullcontext()
+
+    def list_request_ids(self):
+        return list(self.payloads)
 
 
 class FakeClock:
@@ -59,10 +75,18 @@ class FakeTransport:
     def resolve(self):
         if self.targets:
             self.last_target = self.targets.pop(0)
+        if isinstance(self.last_target, Exception):
+            raise self.last_target
         return self.last_target
 
     def describe(self, target):
         return {"identity": target.identity, "status": target.status}
+
+    def is_focused(self, target):
+        return target.focused
+
+    def recipient_is_sender(self, target):
+        return False
 
     def submit(self, target, prompt):
         self.prompts.append((target, prompt))
@@ -487,6 +511,337 @@ class RequestLifecycleMachineTest(unittest.TestCase):
         self.assertEqual(result["error_code"], "cancelled")
 
 
+class DeferredRequestTest(unittest.TestCase):
+    request_id = "d" * 32
+    prompt = "Message from sender/agent:\n\nDo the work."
+
+    def setUp(self):
+        self.store = MemoryStore()
+        self.clock = FakeClock()
+        self.focused = FakeTarget("worker", "idle", "before\n", focused=True)
+
+    def machine(self, targets, submission=None):
+        transport = FakeTransport(
+            targets, submission if submission is not None else SubmissionResult.submitted()
+        )
+        machine = RequestLifecycleMachine(
+            transport,
+            self.store,
+            monotonic=self.clock.monotonic,
+            sleep=self.clock.sleep,
+            now=lambda: 1700000000 + self.clock.value,
+        )
+        return machine, transport
+
+    def enqueue(self, machine, **kwargs):
+        return machine.enqueue(
+            request_id=self.request_id,
+            prompt=self.prompt,
+            max_output_lines=20,
+            max_output_chars=500,
+            defer_timeout_seconds=kwargs.pop("defer_timeout_seconds", 3),
+            **kwargs,
+        )
+
+    def run_request(self, machine, **kwargs):
+        return machine.run(
+            request_id=self.request_id,
+            prompt=self.prompt,
+            timeout_seconds=kwargs.pop("timeout_seconds", 5),
+            poll_interval_seconds=1,
+            max_output_lines=20,
+            max_output_chars=500,
+            defer_timeout_seconds=kwargs.pop("defer_timeout_seconds", 3),
+            **kwargs,
+        )
+
+    def test_focused_run_defers_then_delivers_and_observes_settlement(self):
+        unfocused = replace(self.focused, focused=False)
+        machine, transport = self.machine([
+            self.focused,
+            self.focused,
+            unfocused,
+            replace(unfocused, status="working", output="before\npartial\n"),
+            replace(unfocused, status="done", output="before\nanswer\n"),
+        ])
+        deferred = []
+
+        result = self.run_request(
+            machine, on_deferred=lambda record: deferred.append(deepcopy(record))
+        )
+
+        self.assertEqual(deferred[0]["state"], "deferred")
+        self.assertFalse(deferred[0]["submitted"])
+        self.assertEqual(result["state"], "submitted_settled")
+        self.assertEqual(result["response"]["output"], "answer\n")
+        self.assertTrue(result["response"]["correlated"])
+        self.assertEqual(result["_prompt"], self.prompt)
+        self.assertEqual(len(transport.prompts), 1)
+
+    def test_deadline_enters_decision_and_focus_leaving_does_not_push(self):
+        machine, transport = self.machine([self.focused])
+        record = self.enqueue(machine)
+        self.assertEqual(record["_defer"]["since"], 1700000000)
+        self.assertEqual(record["_defer"]["deadline"], 1700000003)
+        self.assertEqual(record["_defer"]["timeout_ms"], 3000)
+        for key in ("since", "deadline"):
+            self.assertTrue(record["defer"][key].endswith("Z"))
+            self.assertEqual(
+                datetime.fromisoformat(record["defer"][key].replace("Z", "+00:00"))
+                .timestamp(),
+                record["_defer"][key],
+            )
+        self.clock.sleep(2.999)
+        self.assertEqual(machine.deliver_deferred(self.request_id)["state"], "deferred")
+        self.clock.value = 3
+        record = machine.deliver_deferred(self.request_id)
+        self.assertEqual(record["state"], "awaiting_decision")
+        transport.last_target = replace(self.focused, focused=False)
+        self.clock.sleep(100)
+        record = machine.deliver_deferred(self.request_id)
+        self.assertEqual(record["state"], "awaiting_decision")
+        self.assertFalse(record["submitted"])
+        self.assertEqual(transport.prompts, [])
+
+    def test_push_decision_delivers_despite_focus_and_is_idempotent(self):
+        machine, transport = self.machine([self.focused])
+        self.enqueue(machine, defer_timeout_seconds=0)
+        self.assertEqual(
+            machine.deliver_deferred(self.request_id)["state"], "awaiting_decision"
+        )
+        set_deferred_decision(self.store, self.request_id, "push")
+
+        result = machine.deliver_deferred(self.request_id)
+        again = machine.deliver_deferred(self.request_id)
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(again, result)
+        self.assertEqual(transport.prompts, [(self.focused, self.prompt)])
+        self.assertEqual(result["_prompt"], self.prompt)
+
+    def test_forced_delivery_does_not_require_a_stored_push_decision(self):
+        machine, transport = self.machine([self.focused])
+        self.enqueue(machine)
+        result = machine.deliver_deferred(self.request_id, force=True)
+        self.assertTrue(result["submitted"])
+        self.assertEqual(len(transport.prompts), 1)
+
+    def test_cancel_is_terminal_without_transport_calls(self):
+        machine, transport = self.machine([self.focused])
+        self.enqueue(machine)
+        with mock.patch.object(transport, "resolve") as resolve, \
+                mock.patch.object(transport, "is_focused") as is_focused:
+            result = machine.cancel_deferred(self.request_id)
+            again = machine.cancel_deferred(self.request_id)
+            resolve.assert_not_called()
+            is_focused.assert_not_called()
+        self.assertEqual(result["state"], "submission_failed")
+        self.assertEqual(result["phase"], "delivery_cancelled")
+        self.assertEqual(result["error_code"], "delivery_cancelled")
+        self.assertTrue(result["terminal"])
+        self.assertFalse(result["submitted"])
+        self.assertEqual(again, result)
+        self.assertEqual(transport.prompts, [])
+
+    def test_deferred_recipient_disappearing_or_changing_fails_before_submission(self):
+        for target, code in (
+            (replace(self.focused, identity="replacement"), "recipient_changed"),
+            (
+                agent_skill_cli.SkillCommandError("agent_not_found", "not found"),
+                "agent_not_found",
+            ),
+        ):
+            with self.subTest(code=code):
+                machine, transport = self.machine([self.focused, target])
+                self.enqueue(machine)
+                result = machine.deliver_deferred(self.request_id, force=True)
+                self.assertEqual(result["state"], "submission_failed")
+                self.assertEqual(result["error_code"], code)
+                self.assertTrue(result["terminal"])
+                self.assertFalse(result["submitted"])
+                self.assertEqual(transport.prompts, [])
+
+    def test_run_timeout_returns_deferred_without_wait_timeout_mutation(self):
+        machine, transport = self.machine([self.focused])
+        result = self.run_request(
+            machine, timeout_seconds=2, defer_timeout_seconds=30
+        )
+        self.assertEqual(result["state"], "deferred")
+        self.assertFalse(result["submitted"])
+        self.assertFalse(result["terminal"])
+        self.assertFalse(result["timed_out"])
+        self.assertEqual(self.clock.value, 2)
+        self.assertEqual(transport.prompts, [])
+
+    def test_run_timeout_while_awaiting_decision_does_not_deliver(self):
+        machine, transport = self.machine([self.focused])
+        result = self.run_request(
+            machine, timeout_seconds=4, defer_timeout_seconds=1
+        )
+        self.assertEqual(result["state"], "awaiting_decision")
+        self.assertFalse(result["submitted"])
+        self.assertFalse(result["timed_out"])
+        self.assertEqual(transport.prompts, [])
+
+    def test_run_after_deferred_delivery_uses_remaining_wait_budget(self):
+        idle = replace(self.focused, focused=False)
+        machine, transport = self.machine([
+            self.focused, self.focused, idle,
+            replace(idle, status="working", output="before\npartial\n"),
+        ])
+        result = self.run_request(machine, timeout_seconds=2)
+        self.assertEqual(result["state"], "submitted_working")
+        self.assertEqual(result["phase"], "wait_timed_out")
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(result["error_code"], "wait_timed_out")
+        self.assertEqual(self.clock.value, 2)
+        self.assertEqual(len(transport.prompts), 1)
+
+    def test_refresh_delivers_when_focus_leaves_and_observes_requested_turn(self):
+        idle = replace(self.focused, focused=False)
+        machine, transport = self.machine([
+            self.focused, idle, replace(idle, status="working"),
+            replace(idle, status="done", output="before\nanswer\n"),
+        ])
+        self.enqueue(machine)
+        result = machine.refresh(request_id=self.request_id)
+        self.assertEqual(result["state"], "submitted_working")
+        result = machine.refresh(request_id=self.request_id)
+        self.assertEqual(result["state"], "submitted_settled")
+        self.assertEqual(len(transport.prompts), 1)
+
+    def test_enqueue_unfocused_does_not_take_ownership_or_submit(self):
+        machine, transport = self.machine([replace(self.focused, focused=False)])
+        callback = mock.Mock()
+        self.assertIsNone(self.enqueue(machine, on_deferred=callback))
+        self.assertIsNone(self.store.load(self.request_id))
+        callback.assert_not_called()
+        self.assertEqual(transport.prompts, [])
+
+    def test_enqueue_resolve_failure_is_persisted(self):
+        error = agent_skill_cli.SkillCommandError("agent_not_found", "not found")
+        machine, transport = self.machine([error])
+        result = self.enqueue(machine)
+        self.assertEqual(result["state"], "submission_failed")
+        self.assertEqual(result["error_code"], "agent_not_found")
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["_prompt"], self.prompt)
+        self.assertEqual(self.store.load(self.request_id), result)
+        self.assertEqual(transport.prompts, [])
+
+    def test_notification_and_decision_updates_preserve_the_deferred_record(self):
+        machine, _transport = self.machine([self.focused])
+        self.enqueue(machine)
+        notified = {"local": "shown", "remote": "disabled"}
+        record = mark_deferred_notified(self.store, self.request_id, notified)
+        self.assertEqual(record["defer"]["notified"], notified)
+        self.assertEqual(record["_prompt"], self.prompt)
+        record = set_deferred_decision(self.store, self.request_id, "push")
+        self.assertEqual(record["_defer"]["decision"], "push")
+        self.assertEqual(record["defer"]["notified"], notified)
+        self.assertEqual(pending_deferred(self.store), [record])
+        machine.cancel_deferred(self.request_id)
+        self.assertEqual(pending_deferred(self.store), [])
+
+    def test_decision_and_notification_do_not_change_submitted_records(self):
+        machine, _transport = self.machine([self.focused])
+        self.enqueue(machine)
+        submitted = machine.deliver_deferred(self.request_id, force=True)
+        self.assertEqual(
+            set_deferred_decision(self.store, self.request_id, "push"), submitted
+        )
+        self.assertEqual(
+            mark_deferred_notified(self.store, self.request_id, {"local": "shown"}),
+            submitted,
+        )
+        self.assertEqual(machine.cancel_deferred(self.request_id), submitted)
+
+    def test_prompt_is_retained_when_deferral_is_disabled(self):
+        machine, transport = self.machine([self.focused])
+        transport.is_focused = mock.Mock(side_effect=AssertionError("focus queried"))
+        result = self.run_request(machine, defer_timeout_seconds=None)
+        self.assertEqual(result["_prompt"], self.prompt)
+        self.assertEqual(len(transport.prompts), 1)
+        transport.is_focused.assert_not_called()
+
+    def test_focused_self_target_fails_before_focus_or_enqueue(self):
+        for operation in (self.run_request, self.enqueue):
+            with self.subTest(operation=operation.__name__):
+                machine, transport = self.machine([self.focused])
+                transport.recipient_is_sender = lambda target: True
+                transport.is_focused = mock.Mock(side_effect=AssertionError("focus queried"))
+                callback = mock.Mock()
+                result = operation(machine, on_deferred=callback)
+                self.assertEqual(result["error_code"], "recipient_is_sender")
+                self.assertEqual(result["state"], "submission_failed")
+                self.assertTrue(result["terminal"])
+                self.assertEqual(pending_deferred(self.store), [])
+                callback.assert_not_called()
+                transport.is_focused.assert_not_called()
+                self.assertEqual(transport.prompts, [])
+
+    def test_interrupted_submit_is_not_held_or_resubmitted(self):
+        machine, transport = self.machine([self.focused])
+        self.enqueue(machine)
+        transport.submit = mock.Mock(side_effect=KeyboardInterrupt)
+        with self.assertRaises(KeyboardInterrupt):
+            machine.deliver_deferred(self.request_id, force=True)
+        record = self.store.load(self.request_id)
+        self.assertEqual(record["state"], "submitted_unknown")
+        self.assertIsNone(record["submitted"])
+        self.assertEqual(record["phase"], "submitting")
+        self.assertNotIn("_defer", record)
+        self.assertNotIn("defer", record)
+        machine.deliver_deferred(self.request_id, force=True)
+        transport.submit.assert_called_once()
+        for saved in self.store.history:
+            if saved.get("state") in {"deferred", "awaiting_decision"}:
+                self.assertIn("_defer", saved)
+                self.assertIn("defer", saved)
+
+    def test_malformed_held_records_fail_without_transport_calls(self):
+        for state in ("deferred", "awaiting_decision"):
+            for operation in ("refresh", "cancel", "push"):
+                with self.subTest(state=state, operation=operation):
+                    machine, transport = self.machine([self.focused])
+                    self.enqueue(machine)
+                    record = self.store.load(self.request_id)
+                    record["state"] = state
+                    record.pop("_defer")
+                    self.store.save(self.request_id, record)
+                    transport.resolve = mock.Mock(side_effect=AssertionError("contacted recipient"))
+                    if operation == "refresh":
+                        result = machine.refresh(request_id=self.request_id)
+                    elif operation == "cancel":
+                        result = machine.cancel_deferred(self.request_id)
+                    else:
+                        result = set_deferred_decision(self.store, self.request_id, "push")
+                    self.assertEqual(result["error_code"], "request_state_invalid")
+                    self.assertEqual(result["state"], "submission_failed")
+                    self.assertTrue(result["terminal"])
+                    transport.resolve.assert_not_called()
+
+
+    def test_wait_deadline_does_not_overwrite_worker_settlement(self):
+        idle = replace(self.focused, focused=False)
+        machine, _transport = self.machine([
+            self.focused, self.focused, idle, replace(idle, status="working"),
+        ])
+
+        def worker_settles_during_sleep(seconds):
+            self.clock.sleep(seconds)
+            record = self.store.load(self.request_id)
+            if record.get("state") == "submitted_working":
+                record.update(state="submitted_settled", phase="settled", terminal=True)
+                self.store.save(self.request_id, record)
+
+        machine.sleep = worker_settles_during_sleep
+        result = self.run_request(machine, timeout_seconds=2)
+        self.assertEqual(result["state"], "submitted_settled")
+        self.assertTrue(result["terminal"])
+        self.assertFalse(result["timed_out"])
+
+
 class RequestOutputTest(unittest.TestCase):
     def test_limit_output_returns_tail_and_truncation_flag(self):
         captured = limit_output("one\ntwo\nthree\n", max_lines=2, max_chars=100)
@@ -496,7 +851,7 @@ class RequestOutputTest(unittest.TestCase):
     def test_new_output_uses_rolling_tail_overlap(self):
         captured = capture_new_output(
             OutputSnapshot("one\ntwo\nthree\n", truncated=True),
-            OutputSnapshot("three\nfour\n"),
+            OutputSnapshot("three\nfour\n", truncated=True),
             max_lines=10,
             max_chars=100,
         )
@@ -528,7 +883,7 @@ class RequestOutputTest(unittest.TestCase):
 
         self.assertEqual(captured.text, reply)
         self.assertTrue(captured.anchored)
-        self.assertTrue(captured.truncated)
+        self.assertFalse(captured.truncated)
 
     def test_missing_anchor_keeps_rewritten_screen_behavior(self):
         screen = "banner\nquoted Message from x/y:\nunrelated output\n"
@@ -571,6 +926,16 @@ class RequestOutputTest(unittest.TestCase):
         self.assertTrue(captured.anchored)
         self.assertTrue(captured.truncated)
 
+    def test_complete_anchor_is_not_truncated_by_omitted_older_scrollback(self):
+        captured = capture_new_output(
+            OutputSnapshot("old screen", truncated=True),
+            OutputSnapshot("history\nMessage from x/y:\n\nquestion\nOK\n", truncated=True),
+            anchor="Message from x/y:", max_lines=10, max_chars=500,
+        )
+        self.assertTrue(captured.anchored)
+        self.assertFalse(captured.truncated)
+        self.assertTrue(captured.text.endswith("OK\n"))
+
 
 class RequestStateStoreTest(unittest.TestCase):
     def test_json_store_round_trips_queryable_state(self):
@@ -592,6 +957,112 @@ class RequestStateStoreTest(unittest.TestCase):
             store = JsonRequestStateStore(Path(directory))
             with self.assertRaises(ValueError):
                 store.load("../request")
+
+    def test_lock_is_private_and_remains_exclusive_across_atomic_saves(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonRequestStateStore(Path(directory) / "requests")
+            request_id = "a" * 32
+            with store.lock(request_id):
+                lock_path = store.directory / f"{request_id}.lock"
+                self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
+                descriptor = os.open(lock_path, os.O_RDWR)
+                try:
+                    for state in ("deferred", "submitted_unknown"):
+                        store.save(request_id, {"state": state})
+                        self.assertEqual(store.load(request_id)["state"], state)
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(descriptor)
+            with store.lock(request_id):
+                self.assertEqual(store.load(request_id)["state"], "submitted_unknown")
+
+    def test_list_ids_and_pending_skip_unrelated_and_corrupt_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonRequestStateStore(Path(directory))
+            deferred_id, awaiting_id, settled_id, corrupt_id, invalid_id = (
+                character * 32 for character in "abcde"
+            )
+            store.save(deferred_id, {"state": "deferred"})
+            store.save(awaiting_id, {"state": "awaiting_decision"})
+            store.save(settled_id, {"state": "submitted_settled"})
+            (store.directory / f"{corrupt_id}.json").write_text("{", encoding="utf-8")
+            (store.directory / f"{invalid_id}.json").write_text("[]", encoding="utf-8")
+            (store.directory / "not-a-request.json").write_text("{}", encoding="utf-8")
+            (store.directory / f"{'f' * 32}.lock").touch()
+            (store.directory / f"{'0' * 32}.json").mkdir()
+
+            self.assertEqual(
+                store.list_request_ids(),
+                [deferred_id, awaiting_id, settled_id, corrupt_id, invalid_id],
+            )
+            self.assertEqual(
+                pending_deferred(store),
+                [{"state": "deferred"}, {"state": "awaiting_decision"}],
+            )
+
+    def test_missing_directory_has_no_pending_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonRequestStateStore(Path(directory) / "missing")
+            self.assertEqual(store.list_request_ids(), [])
+            self.assertEqual(pending_deferred(store), [])
+
+    def test_request_state_directory_explicit_override_wins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = {
+                "HERDR_AGENT_REQUEST_STATE_DIR": str(root / "queue"),
+                "HERDR_PLUGIN_STATE_DIR": str(root / "plugin"),
+                "XDG_STATE_HOME": str(root / "state"),
+                "HOME": str(root / "home"),
+            }
+            self.assertEqual(request_state_directory(environment), root / "queue")
+            self.assertEqual(open_request_store(environment).directory, root / "queue")
+
+    def test_request_state_directory_ignores_plugin_directory_and_uses_xdg(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plugin = root / "plugin"
+            (plugin / "requests").mkdir(parents=True)
+            environment = {
+                "HERDR_PLUGIN_STATE_DIR": str(plugin),
+                "XDG_STATE_HOME": str(root / "state"),
+                "HOME": str(root / "home"),
+            }
+            self.assertEqual(
+                request_state_directory(environment),
+                root / "state/herdr-agent-messenger/requests",
+            )
+
+    def test_request_state_directory_uses_home_without_xdg(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(
+                request_state_directory(
+                    {"HOME": str(root), "HERDR_PLUGIN_STATE_DIR": str(root / "plugin")}
+                ),
+                root / ".local/state/herdr-agent-messenger/requests",
+            )
+        with mock.patch("request_lifecycle.Path.home", return_value=Path("/fallback")):
+            self.assertEqual(
+                request_state_directory({}),
+                Path("/fallback/.local/state/herdr-agent-messenger/requests"),
+            )
+
+    def test_request_state_directory_legacy_fallback_only_without_new_directory(self):
+        for use_xdg in (False, True):
+            with self.subTest(use_xdg=use_xdg), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                root = home / "state" if use_xdg else home / ".local/state"
+                environment = {"HOME": str(home)}
+                if use_xdg:
+                    environment["XDG_STATE_HOME"] = str(root)
+                legacy = root / "herdr-agent-labels/requests"
+                legacy.mkdir(parents=True)
+                self.assertEqual(request_state_directory(environment), legacy)
+                current = root / "herdr-agent-messenger/requests"
+                current.mkdir(parents=True)
+                self.assertEqual(request_state_directory(environment), current)
 
 
 class AgentRequestCliIntegrationTest(unittest.TestCase):
@@ -677,14 +1148,20 @@ class AgentRequestCliIntegrationTest(unittest.TestCase):
         self.assertNotIn("--wait", prompt)
         self.assertEqual(result["state"], "submitted_settled")
         self.assertEqual(result["request_id"], "b" * 32)
-        self.assertEqual(result["response"]["output"], "answer\n")
+        self.assertEqual(result["response"]["text"], "answer")
         self.assertFalse(any(key.startswith("_") for key in result))
         self.assertEqual(
             agent_skill_cli.request_status_command(
                 request_id="b" * 32,
                 state_store=store,
             ),
-            result,
+            {
+                "request_id": "b" * 32,
+                "state": "submitted_settled",
+                "terminal": True,
+                "submitted": True,
+                "changed": False,
+            },
         )
 
     def test_request_persists_a_safely_refreshed_v2_route(self):
@@ -756,6 +1233,7 @@ class AgentRequestCliIntegrationTest(unittest.TestCase):
                 request_id="e" * 32,
                 monotonic=clock.monotonic,
                 sleep=clock.sleep,
+                verbose=True,
             )
 
         refreshed_route = agent_skill_cli.encode_agent_route(replacement)
@@ -766,6 +1244,7 @@ class AgentRequestCliIntegrationTest(unittest.TestCase):
             agent_skill_cli.request_status_command(
                 request_id="e" * 32,
                 state_store=store,
+                verbose=True,
             )["route"],
             refreshed_route,
         )
@@ -880,7 +1359,8 @@ class AgentRequestCliIntegrationTest(unittest.TestCase):
             )
 
         self.assertEqual(settled["state"], "submitted_settled")
-        self.assertEqual(settled["response"]["output"], "answer\n")
+        self.assertEqual(settled["response"]["text"], "answer")
+        self.assertTrue(settled["changed"])
         self.assertFalse(any(key.startswith("_") for key in settled))
         resolve.assert_called_once_with(
             host="local",
@@ -916,12 +1396,14 @@ class RequestBoundaryIntegrationTest(unittest.TestCase):
                         resolver=mock.Mock(side_effect=observations), state_store=store,
                         command_runner=runner, request_id="a" * 32,
                         monotonic=clock.monotonic, sleep=clock.sleep,
+                        verbose=True,
                     )
                 if not replace_during_wait:
                     runner.reset_mock()
                     result = agent_skill_cli.request_status_command(
                         request_id="a" * 32, environment={}, state_store=store,
                         resolver=lambda: replacement, command_runner=runner,
+                        verbose=True,
                     )
                     runner.assert_not_called()
                 else:

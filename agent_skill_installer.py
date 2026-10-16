@@ -267,6 +267,7 @@ def _check_destination_paths(destination: Path, source: Path) -> None:
 
 
 def install_skill(destination: Path, source: Path | None = None) -> None:
+    """Install the complete skill bundle, including its on-demand reference."""
     source_directory = (
         bundled_skill_path().parent if source is None else source
     ).resolve()

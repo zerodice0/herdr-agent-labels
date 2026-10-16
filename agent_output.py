@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import json
-from typing import Protocol
+import re
+from typing import Any, Protocol
 import zlib
 
 
@@ -67,6 +69,271 @@ def compact_agent_payload(agent: AgentSummary) -> dict[str, str]:
         "status": agent.status,
         "workspace": agent.workspace_label or agent.workspace_id,
     }
+
+
+def _box_rule(line: str) -> bool:
+    characters = [character for character in line if not character.isspace()]
+    return len(characters) >= 3 and all(
+        "\u2500" <= character <= "\u257f" for character in characters
+    )
+
+
+def _footer_rule(line: str) -> bool:
+    """Recognize horizontal rules and input corners, never table junctions."""
+
+    return _box_rule(line) and all(
+        character.isspace() or character in "─━═╌╍┄┅┈┉╭╮╰╯┌┐└┘┏┓┗┛╔╗╚╝"
+        for character in line
+    )
+
+
+def _content_box_borders(lines: list[str]) -> set[int]:
+    """Keep framed tool/table borders from being mistaken for input chrome."""
+
+    borders: set[int] = set()
+    start: int | None = None
+    divided = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if _box_rule(line) and stripped.startswith(("╭", "┌", "┏", "╔")):
+            start = index
+            divided = False
+        elif start is not None:
+            if stripped.startswith(("├", "┣", "╠")):
+                divided = True
+            elif _box_rule(line) and stripped.startswith(("╰", "└", "┗", "╚")):
+                if divided:
+                    borders.update((start, index))
+                start = None
+    return borders
+
+
+_PRIVATE_USE_STATUS = re.compile(
+    r"[\ue000-\uf8ff\U000f0000-\U000ffffd]\s+"
+    r"(?:Working|Thinking|Running|Processing|Waiting|Loading|Generating|Reasoning)"
+    r"(?:(?:…|\.{3})(?:\s.*)?)?",
+    re.IGNORECASE,
+)
+
+
+def clean_agent_text(text: str, *, prompt: str | None = None) -> str:
+    """Remove terminal chrome and the last matching prompt echo.
+
+    ASCII rules such as Markdown's ``---`` are reply content, not chrome.
+    Horizontal rules and input-box corners identify a trailing footer block;
+    table junctions and framed tool-card borders do not.
+    Private-use spinner status lines are discarded without treating ordinary
+    answer text containing those glyphs or status words as chrome.
+    Framed lines have terminal-width padding and long strokes compacted outside
+    fenced or indented code; ordinary reply text is otherwise unchanged.
+    Reply indentation is preserved; outer whitespace and blank runs are trimmed.
+    """
+
+    lines = text.splitlines()
+    content_borders = _content_box_borders(lines)
+    trailing_box = next(
+        (
+            index
+            for index in range(max(0, len(lines) - 8), len(lines))
+            if _footer_rule(lines[index]) and index not in content_borders
+        ),
+        None,
+    )
+    if trailing_box is not None:
+        start = trailing_box
+        previous = start - 1
+        while previous >= 0 and not lines[previous].strip():
+            previous -= 1
+        if previous >= 0 and re.fullmatch(
+            r"Working(?:…|\.{3})?", lines[previous].strip(), re.IGNORECASE
+        ):
+            start = previous
+        lines = lines[:start]
+
+    if prompt:
+        prompt_lines = prompt.splitlines()
+        anchor = prompt_lines[0].strip()
+        echoed = [
+            index
+            for index, line in enumerate(lines)
+            if anchor and line.strip() == anchor
+        ]
+        if echoed:
+            start = echoed[-1]
+            end = start + 1
+            for expected in prompt_lines[1:]:
+                if not expected.strip():
+                    continue
+                following = end
+                while following < len(lines) and not lines[following].strip():
+                    following += 1
+                if following == len(lines) or lines[following].strip() != expected.strip():
+                    break
+                end = following + 1
+            del lines[start:end]
+
+    cleaned: list[str] = []
+    code_fence: str | None = None
+    for line in lines:
+        stripped = line.strip()
+        fence = re.match(r"(`{3,}|~{3,})", stripped)
+        if fence:
+            if code_fence is None:
+                code_fence = fence[1]
+            elif stripped.startswith(code_fence):
+                code_fence = None
+        if _box_rule(line) or _PRIVATE_USE_STATUS.fullmatch(stripped) or (
+            stripped
+            and "\u2800" <= stripped[0] <= "\u28ff"
+            and (len(stripped) == 1 or stripped[1].isspace())
+        ):
+            continue
+        if (
+            stripped
+            and code_fence is None
+            and not line.startswith(("    ", "\t"))
+            and "\u2500" <= stripped[0] <= "\u257f"
+            and "\u2500" <= stripped[-1] <= "\u257f"
+        ):
+            if stripped.startswith("│") and stripped.endswith("│"):
+                line = re.sub(r" +│(?=\s*$)", " │", line)
+            line = re.sub(r"([─━═])\1{3,}", r"\1\1\1", line)
+        if stripped:
+            cleaned.append(line)
+        elif cleaned and cleaned[-1]:
+            cleaned.append("")
+    return "\n".join(cleaned).strip()
+
+
+def _payload_address(payload: Mapping[str, Any]) -> str:
+    address = payload.get("address")
+    if address:
+        return str(address)
+    name = payload.get("name") or payload.get("label")
+    if not name:
+        return ""
+    host = "local" if payload.get("local") else payload.get("host") or "local"
+    return f"{host}/{name}"
+
+
+def _request_address(record: Mapping[str, Any]) -> str:
+    recipient = record.get("recipient")
+    if isinstance(recipient, Mapping):
+        address = _payload_address(recipient)
+        if address:
+            return address
+    context = record.get("_context")
+    return _payload_address(context) if isinstance(context, Mapping) else ""
+
+
+def compact_request_payload(
+    record: Mapping[str, Any], *, response_text: str | None
+) -> dict[str, Any]:
+    """Return the request decision fields without transport or sender metadata."""
+
+    payload = {
+        key: record.get(key)
+        for key in ("request_id", "state", "terminal", "submitted")
+    }
+    for key in ("error_code", "error"):
+        if record.get(key) is not None:
+            payload[key] = record[key]
+    payload["phase"] = record.get("phase")
+    payload["address"] = _request_address(record)
+    defer = record.get("defer")
+    if record.get("state") in {"deferred", "awaiting_decision"} and isinstance(
+        defer, Mapping
+    ):
+        payload["defer"] = {
+            key: defer[key]
+            for key in ("reason", "deadline")
+            if defer.get(key) is not None
+        }
+    if record.get("changed") is not None:
+        payload["changed"] = record["changed"]
+    response = record.get("response")
+    response = response if isinstance(response, Mapping) else {}
+    if response_text is None:
+        response_text = clean_agent_text(
+            str(response.get("output") or ""), prompt=record.get("_prompt")
+        )
+    if response_text or record.get("state") == "submitted_settled":
+        payload["response"] = {
+            "text": response_text,
+            "truncated": bool(response.get("truncated")),
+            "correlated": bool(response.get("correlated")),
+        }
+        if response.get("anchored") is True:
+            payload["response"]["anchored"] = True
+    return payload
+
+
+def compact_spawn_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep the created agent's address and placement, plus reporting failures."""
+
+    compact = {
+        key: payload[key]
+        for key in ("address", "marker", "created", "pane_id", "tab_id", "workspace_id")
+        if key != "tab_id" or payload.get(key) is not None
+    }
+    for key in ("label_metadata_reported", "placement_label_reported"):
+        if payload.get(key) is False:
+            compact[key] = False
+    return compact
+
+
+def compact_status_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the current agent's address and status, retaining stale warnings."""
+
+    agent = payload["agent"]
+    compact = {"address": _payload_address(agent), "status": agent["status"]}
+    if agent.get("stale"):
+        compact["stale"] = True
+    return compact
+
+
+def compact_read_payload(
+    payload: Mapping[str, Any], *, cleaned_output: str
+) -> dict[str, Any]:
+    """Keep cleaned output and the fields required for subsequent delta reads."""
+
+    return {
+        "address": payload["address"],
+        "output": cleaned_output,
+        "delta": payload["delta"],
+        "truncated": payload["truncated"],
+        "cursor": payload["cursor"],
+    }
+
+
+def compact_batch_item(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize one dispatcher result without routes or correlation metadata."""
+
+    compact = {
+        "address": _payload_address(item) or _request_address(item),
+        "status": item["status"],
+    }
+    for key in ("request_id", "state"):
+        if item.get(key) is not None:
+            compact[key] = item[key]
+    if "error_code" in item:
+        error_code, error = item.get("error_code"), item.get("error")
+    else:
+        error_code, error = item.get("error"), item.get("detail")
+    if error_code:
+        compact["error_code"] = error_code
+    if error:
+        compact["error"] = error
+    response = item.get("response")
+    if isinstance(response, Mapping):
+        compact["response"] = {
+            "text": clean_agent_text(
+                str(response.get("text", response.get("output")) or ""),
+                prompt=item.get("_prompt"),
+            ),
+            "truncated": bool(response.get("truncated")),
+        }
+    return compact
 
 
 def output_stream_id(identity: str) -> str:

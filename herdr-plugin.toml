@@ -20,6 +20,13 @@ contexts = ["pane"]
 command = ["python3", "agent_messenger.py", "launch"]
 
 [[actions]]
+id = "held-messages"
+title = "HAM: Held Messages"
+description = "Push or cancel messages held while their recipient was focused."
+contexts = ["workspace", "pane"]
+command = ["python3", "agent_messenger.py", "held-launch"]
+
+[[actions]]
 id = "agent-skill-guide"
 title = "HAM Skill"
 description = "Install, update, or learn how to use HAM."
@@ -28,6 +35,9 @@ command = ["python3", "agent_skill_installer.py", "launch"]
 
 [[startup]]
 command = ["python3", "agent_labels.py", "reconcile"]
+
+[[startup]]
+command = ["python3", "agent_delivery.py", "reconcile"]
 
 [[events]]
 on = "pane.agent_detected"
@@ -48,3 +58,9 @@ id = "skill-installer"
 title = "HAM Skill"
 placement = "popup"
 command = ["python3", "agent_skill_installer.py", "popup"]
+
+[[panes]]
+id = "held"
+title = "HAM: Held Messages"
+placement = "popup"
+command = ["python3", "agent_messenger.py", "popup-held"]

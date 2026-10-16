@@ -91,19 +91,17 @@ class AgentSkillCliTest(unittest.TestCase):
 
         self.assertEqual(store.directory, legacy)
 
-    def test_request_state_runtime_falls_back_to_legacy_plugin_sibling(self):
+    def test_request_state_ignores_plugin_runtime_directory(self):
         with tempfile.TemporaryDirectory() as directory:
-            state_root = Path(directory)
-            current = state_root / agent_directory.PLUGIN_ID
-            legacy = state_root / agent_directory.LEGACY_PLUGIN_ID / "requests"
-            current.mkdir()
-            legacy.mkdir(parents=True)
-
-            store = agent_skill_cli._request_state_store(
-                {"HERDR_PLUGIN_STATE_DIR": str(current)}
-            )
-
-        self.assertEqual(store.directory, legacy)
+            root = Path(directory)
+            store = agent_skill_cli._request_state_store({
+                "HERDR_PLUGIN_STATE_DIR": str(root / "plugin"),
+                "XDG_STATE_HOME": str(root / "state"),
+                "HOME": str(root / "home"),
+            })
+        self.assertEqual(
+            store.directory, root / "state/herdr-agent-messenger/requests"
+        )
 
     def test_route_token_resolves_exact_current_occupant(self):
         recipient = agent(name="", pane_id="w7:p9")
@@ -215,16 +213,7 @@ class AgentSkillCliTest(unittest.TestCase):
             payload = agent_skill_cli.status_command(host="local", route=route)
 
         discover.assert_called_once_with("local", None)
-        self.assertEqual(
-            payload["agent"],
-            {
-                "address": "local/w7:p9",
-                "status": "idle",
-                "workspace": "project",
-            },
-        )
-        self.assertFalse(payload["route_refreshed"])
-        self.assertEqual(payload["route"], route)
+        self.assertEqual(payload, {"address": "local/w7:p9", "status": "idle"})
 
     def test_status_returns_a_safely_refreshed_route(self):
         original = agent(name="white-bison", pane_id="w7:p9")
@@ -235,7 +224,9 @@ class AgentSkillCliTest(unittest.TestCase):
             "discover_agents",
             return_value=[replacement],
         ):
-            payload = agent_skill_cli.status_command(host="local", route=route)
+            payload = agent_skill_cli.status_command(
+                host="local", route=route, verbose=True
+            )
 
         self.assertTrue(payload["route_refreshed"])
         self.assertEqual(
@@ -314,6 +305,7 @@ class AgentSkillCliTest(unittest.TestCase):
                 wait=True,
                 timeout_ms=90_000,
                 environment={},
+                verbose=True,
             )
 
         command = run.call_args.args[0]
@@ -354,6 +346,7 @@ class AgentSkillCliTest(unittest.TestCase):
                 wait=True,
                 timeout_ms=90_000,
                 environment={},
+                verbose=True,
         )
 
         self.assertEqual(run.call_args.args[0][3], "w7:p9")
@@ -387,6 +380,7 @@ class AgentSkillCliTest(unittest.TestCase):
                 wait=False,
                 timeout_ms=90_000,
                 environment={},
+                verbose=True,
             )
 
         self.assertTrue(payload["route_refreshed"])
@@ -511,7 +505,7 @@ class AgentSkillCliTest(unittest.TestCase):
                 timeout_ms=90_000,
                 environment={},
             )
-        self.assertFalse(payload["wait_can_track_submitted_turn"])
+        self.assertEqual(payload["address"], "local/white-bison")
         self.assertEqual(payload["warnings"], ["recipient_already_working"])
 
     def test_send_rejects_the_current_sender_as_recipient(self):
@@ -562,7 +556,7 @@ class AgentSkillCliTest(unittest.TestCase):
             )
         self.assertNotIn("--wait", run.call_args.args[0])
         self.assertNotIn("wait_can_track_submitted_turn", payload)
-        self.assertEqual(payload["warnings"], [])
+        self.assertNotIn("warnings", payload)
         self.assertEqual(
             run.call_args.kwargs["timeout"],
             agent_directory.REMOTE_DISCOVERY_TIMEOUT_SECONDS,
@@ -663,9 +657,9 @@ class AgentSkillCliTest(unittest.TestCase):
             [result["status"] for result in payload["results"]],
             ["succeeded", "failed", "submitted"],
         )
-        self.assertEqual(payload["results"][1]["error"], "recipient_is_sender")
+        self.assertEqual(payload["results"][1]["error_code"], "recipient_is_sender")
         self.assertEqual(payload["results"][0]["request_id"], "a" * 32)
-        self.assertEqual(payload["results"][0]["response"]["output"], "answer\n")
+        self.assertEqual(payload["results"][0]["response"]["text"], "answer")
         self.assertEqual(payload["status"], "partial")
 
     @mock.patch.object(
@@ -700,7 +694,7 @@ class AgentSkillCliTest(unittest.TestCase):
                 wait=False, timeout_ms=1000, max_workers=1, environment={},
             )
         self.assertEqual(result["results"][0]["status"], "timeout")
-        self.assertEqual(result["results"][0]["error"], "prompt_acceptance_unknown")
+        self.assertEqual(result["results"][0]["error_code"], "prompt_acceptance_unknown")
 
     def test_batch_normalizes_future_request_lifecycle_payloads(self):
         cases = (
@@ -773,6 +767,7 @@ class AgentSkillCliTest(unittest.TestCase):
                 timeout_ms=90_000,
                 max_workers=1,
                 environment={},
+                verbose=True,
             )
 
         self.assertEqual(payload["results"][0]["route"], "v2-refreshed")
@@ -814,13 +809,12 @@ class AgentSkillCliTest(unittest.TestCase):
                 "text",
             ],
         )
-        self.assertEqual(payload["output"], "final report\n")
-        self.assertFalse(payload["route_refreshed"])
-        self.assertEqual(payload["route"], agent_skill_cli.encode_agent_route(recipient))
+        self.assertEqual(payload["output"], "final report")
+        self.assertNotIn("route", payload)
         self.assertEqual(payload["address"], "local/white-bison")
         self.assertFalse(payload["delta"])
         self.assertFalse(payload["truncated"])
-        self.assertEqual(payload["cursor_status"], "initial")
+        self.assertNotIn("cursor_status", payload)
         self.assertTrue(payload["cursor"])
 
     def test_read_refreshes_the_same_stale_route_path_as_send(self):
@@ -845,6 +839,7 @@ class AgentSkillCliTest(unittest.TestCase):
                 route=token,
                 lines=80,
                 environment={},
+                verbose=True,
             )
 
         self.assertTrue(payload["route_refreshed"])
@@ -882,9 +877,9 @@ class AgentSkillCliTest(unittest.TestCase):
                 environment={},
             )
 
-        self.assertEqual(delta["output"], "second\n")
+        self.assertEqual(delta["output"], "second")
         self.assertTrue(delta["delta"])
-        self.assertEqual(delta["cursor_status"], "current")
+        self.assertNotIn("cursor_status", delta)
 
     def test_read_rejects_an_invalid_cursor(self):
         recipient = agent(name="white-bison")
@@ -1121,6 +1116,8 @@ class AgentSkillContractTest(unittest.TestCase):
             "submission_failed": 1,
             "submitted_working": 3,
             "submitted_unknown": 3,
+            "deferred": 3,
+            "awaiting_decision": 3,
         }
         commands = (
             ("request", ["--route", "token", "--message", "work"], "request_command"),
@@ -1144,6 +1141,8 @@ class AgentSkillContractTest(unittest.TestCase):
             (["succeeded"], 0),
             (["succeeded", "submitted"], 3),
             (["submitted"], 3),
+            (["succeeded", "deferred"], 3),
+            (["deferred", "failed"], 1),
             (["succeeded", "failed"], 1),
             (["submitted", "cancelled"], 1),
             (["submitted", "timeout"], 1),
@@ -1196,7 +1195,7 @@ class AgentSkillContractTest(unittest.TestCase):
                 )
             self.assertEqual(result, 0)
             self.assertEqual(
-                json.loads(output.getvalue())["agent"]["address"], "remote/purple-koala"
+                json.loads(output.getvalue())["address"], "remote/purple-koala"
             )
             self.assertEqual(discover.call_args.args[0], "remote")
 
@@ -1270,9 +1269,7 @@ class AgentSkillContractTest(unittest.TestCase):
         self.assertEqual(result["results"][0]["status"], "submitted")
         self.assertEqual(len(commands), 1)
         self.assertIn(recipient.target, commands[0])
-        self.assertEqual(
-            agent_skill_cli.route_host(result["results"][0]["route"]), "local"
-        )
+        self.assertEqual(result["results"][0]["address"], "local/white-bison")
 
     def test_batch_duplicate_route_and_address_never_submit(self):
         recipient = agent(pane_id="w1:p2")
@@ -1292,7 +1289,7 @@ class AgentSkillContractTest(unittest.TestCase):
                 wait=False, timeout_ms=1000, max_workers=1, environment={},
             )
         self.assertEqual(
-            [item["error"] for item in result["results"]], ["duplicate_route"] * 3
+            [item["error_code"] for item in result["results"]], ["duplicate_route"] * 3
         )
         send.assert_not_called()
 
@@ -1368,7 +1365,7 @@ class AgentSkillContractTest(unittest.TestCase):
                 requests_json='[{"address":"missing-host","message":"work"}]',
                 wait=False, timeout_ms=1000, max_workers=1, environment={},
             )
-        self.assertEqual(result["results"][0]["error"], "invalid_address")
+        self.assertEqual(result["results"][0]["error_code"], "invalid_address")
         send.assert_not_called()
 
     def test_spawn_success_returns_payload_and_zero_exit(self):
@@ -1381,6 +1378,557 @@ class AgentSkillContractTest(unittest.TestCase):
             result = agent_skill_cli.main(["spawn", "--kind", "codex"], {})
         self.assertEqual(result, 0)
         self.assertEqual(json.loads(output.getvalue()), payload)
+
+
+class FocusDeferredCliTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.environment = {"HERDR_AGENT_REQUEST_STATE_DIR": directory.name}
+        self.store = agent_skill_cli.JsonRequestStateStore(Path(directory.name))
+        self.sender = agent(name="blue-raven", pane_id="w1:p1")
+        self.recipient = agent(name="white-bison", pane_id="w1:p2")
+        self.clock = 0.0
+        self.sleeps = []
+        sender_patch = mock.patch.object(
+            agent_skill_cli, "current_sender", return_value=self.sender
+        )
+        sender_patch.start()
+        self.addCleanup(sender_patch.stop)
+        worker_patch = mock.patch.object(
+            agent_skill_cli.agent_delivery, "ensure_worker", return_value=True
+        )
+        self.worker = worker_patch.start()
+        self.addCleanup(worker_patch.stop)
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.clock += seconds
+
+    def request(self, **overrides):
+        arguments = {
+            "host": "local", "label": self.recipient.name,
+            "message": "Please review.", "timeout_ms": 1000,
+            "output_lines": 10, "output_chars": 1000,
+            "environment": self.environment, "state_store": self.store,
+            "monotonic": lambda: self.clock, "sleep": self.sleep,
+        }
+        arguments.update(overrides)
+        return agent_skill_cli.request_command(**arguments)
+
+    def settled_request(self, *, verbose=False):
+        resolver = mock.Mock(side_effect=[
+            self.recipient, replace(self.recipient, status="working"),
+            replace(self.recipient, status="done"),
+        ])
+        response = (
+            "Message from local/blue-raven:\n\nPlease review.\n\n"
+            "Review complete.\n"
+        )
+        runner = mock.Mock(side_effect=[
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, response, ""),
+        ])
+        return self.request(resolver=resolver, command_runner=runner, verbose=verbose)
+
+    def deferred_send(self, **overrides):
+        arguments = {
+            "host": "local", "label": self.recipient.name,
+            "message": "Please review.", "wait": True, "timeout_ms": 1000,
+            "environment": self.environment,
+        }
+        arguments.update(overrides)
+        with (
+            mock.patch.object(
+                agent_skill_cli, "resolve_labeled_agent",
+                return_value=replace(self.recipient, focused=True),
+            ),
+            mock.patch.object(agent_skill_cli, "run_bounded_command") as runner,
+        ):
+            payload = agent_skill_cli.send_command(**arguments)
+        runner.assert_not_called()
+        return payload
+
+    def test_request_compact_and_verbose_payloads(self):
+        compact = self.settled_request()
+        self.assertEqual(compact["state"], "submitted_settled")
+        self.assertEqual(compact["address"], "local/white-bison")
+        self.assertEqual(compact["response"]["text"], "Review complete.")
+        self.assertFalse({"route", "sender", "recipient"} & compact.keys())
+        record = self.store.load(compact["request_id"])
+        self.assertEqual(len(record["_last_reported"]), 4)
+        self.assertEqual(record["_last_reported"][:3], [
+            "submitted_settled", "settled", None,
+        ])
+        verbose = self.settled_request(verbose=True)
+        self.assertIn("route", verbose)
+        self.assertIn("sender", verbose)
+        self.assertIn("recipient", verbose)
+        self.assertIn("output", verbose["response"])
+        self.assertFalse(any(key.startswith("_") for key in verbose))
+
+    def test_focused_request_defers_without_prompt_and_ensures_worker(self):
+        focused = replace(self.recipient, focused=True)
+        runner = mock.Mock()
+        payload = self.request(resolver=lambda: focused, command_runner=runner)
+        self.assertEqual(payload["state"], "deferred")
+        self.assertFalse(payload["submitted"])
+        self.assertEqual(payload["defer"]["reason"], "recipient_focused")
+        self.assertNotIn("since", payload["defer"])
+        runner.assert_not_called()
+        self.worker.assert_called_with(self.environment)
+        self.assertEqual(self.sleeps, [0.5, 0.5])
+        self.assertIn("_last_reported", self.store.load(payload["request_id"]))
+
+    def test_deferred_request_main_returns_three(self):
+        output = StringIO()
+        with (
+            mock.patch.object(
+                agent_skill_cli, "resolve_labeled_agent",
+                return_value=replace(self.recipient, focused=True),
+            ),
+            mock.patch.object(agent_skill_cli, "run_bounded_command") as runner,
+            mock.patch("sys.stdout", output),
+        ):
+            code = agent_skill_cli.main([
+                "request", "--address", "local/white-bison", "--message", "work",
+                "--timeout", "1", "--defer-timeout", "5000",
+            ], self.environment)
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(output.getvalue())["state"], "deferred")
+        runner.assert_not_called()
+        self.worker.assert_called_with(self.environment)
+
+    def test_focused_self_request_and_send_fail_without_queue_or_worker(self):
+        focused_sender = replace(self.sender, focused=True)
+        runner = mock.Mock()
+        request = self.request(
+            label=self.sender.name, resolver=lambda: focused_sender, command_runner=runner,
+        )
+        self.assertEqual(request["error_code"], "recipient_is_sender")
+        self.assertEqual(request["state"], "submission_failed")
+        self.assertTrue(request["terminal"])
+        with (
+            mock.patch.object(
+                agent_skill_cli, "resolve_labeled_agent", return_value=focused_sender
+            ),
+            mock.patch.object(agent_skill_cli, "run_bounded_command", runner),
+            self.assertRaises(agent_skill_cli.SkillCommandError) as raised,
+        ):
+            agent_skill_cli.send_command(
+                host="local", label=self.sender.name, message="work", wait=False,
+                timeout_ms=1000, environment=self.environment,
+            )
+        self.assertEqual(raised.exception.code, "recipient_is_sender")
+        self.assertEqual(agent_skill_cli.request_lifecycle.pending_deferred(self.store), [])
+        runner.assert_not_called()
+        self.worker.assert_not_called()
+
+
+    def test_send_deferred_is_owned_and_stores_prompt_context(self):
+        payload = self.deferred_send(defer_timeout_ms=54321)
+        self.assertEqual(payload["state"], "deferred")
+        self.assertFalse(payload["submitted"])
+        record = self.store.load(payload["request_id"])
+        self.assertEqual(record["_prompt"], (
+            "Message from local/blue-raven:\n\nPlease review."
+        ))
+        self.assertEqual(record["_defer"]["timeout_ms"], 54321)
+        self.assertEqual(record["sender"]["address"], "local/blue-raven")
+        self.assertTrue(record["_context"]["route"])
+        self.worker.assert_called_with(self.environment)
+
+    def test_send_main_returns_three_without_waiting_when_deferred(self):
+        output = StringIO()
+        with (
+            mock.patch.object(
+                agent_skill_cli, "resolve_labeled_agent",
+                return_value=replace(self.recipient, focused=True),
+            ),
+            mock.patch.object(agent_skill_cli, "run_bounded_command") as runner,
+            mock.patch("sys.stdout", output),
+        ):
+            code = agent_skill_cli.main([
+                "send", "--address", "local/white-bison", "--message", "work",
+            ], self.environment)
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(output.getvalue())["state"], "deferred")
+        runner.assert_not_called()
+
+    def test_immediate_send_compact_payload_and_no_worker(self):
+        with (
+            mock.patch.object(
+                agent_skill_cli, "resolve_labeled_agent", return_value=self.recipient
+            ),
+            mock.patch.object(
+                agent_skill_cli, "run_bounded_command",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ) as runner,
+        ):
+            payload = agent_skill_cli.send_command(
+                host="local", label=self.recipient.name, message="work",
+                wait=False, timeout_ms=1000, environment=self.environment,
+            )
+        self.assertEqual(payload, {
+            "sent": True, "address": "local/white-bison", "waited": False,
+        })
+        self.assertEqual(runner.call_count, 1)
+        self.worker.assert_not_called()
+        self.assertEqual(self.store.list_request_ids(), [])
+
+    def test_send_resolution_failure_returns_terminal_request(self):
+        with mock.patch.object(
+            agent_skill_cli, "resolve_labeled_agent",
+            side_effect=agent_skill_cli.SkillCommandError("agent_not_found", "missing"),
+        ):
+            payload = agent_skill_cli.send_command(
+                host="local", label="missing", message="work", wait=False,
+                timeout_ms=1000, environment=self.environment,
+            )
+        self.assertEqual(payload["state"], "submission_failed")
+        self.assertEqual(payload["error_code"], "agent_not_found")
+        self.assertEqual(payload["address"], "local/missing")
+        self.worker.assert_not_called()
+
+    def test_status_changed_only_and_verbose_always_full(self):
+        initial = self.settled_request()
+        request_id = initial["request_id"]
+        unchanged = agent_skill_cli.request_status_command(
+            request_id=request_id, state_store=self.store
+        )
+        self.assertEqual(unchanged, {
+            "request_id": request_id, "state": "submitted_settled",
+            "terminal": True, "submitted": True, "changed": False,
+        })
+        record = self.store.load(request_id)
+        record["response"]["output"] = "A different answer."
+        self.store.save(request_id, record)
+        changed = agent_skill_cli.request_status_command(
+            request_id=request_id, state_store=self.store
+        )
+        self.assertTrue(changed["changed"])
+        self.assertEqual(changed["response"]["text"], "A different answer.")
+        self.assertFalse(agent_skill_cli.request_status_command(
+            request_id=request_id, state_store=self.store
+        )["changed"])
+        verbose = agent_skill_cli.request_status_command(
+            request_id=request_id, state_store=self.store, verbose=True
+        )
+        self.assertIn("recipient", verbose)
+        self.assertIn("output", verbose["response"])
+        self.assertNotIn("_last_reported", verbose)
+
+    def test_status_single_refresh_and_wait_stops_on_phase_change(self):
+        initial = self.deferred_send()
+        request_id = initial["request_id"]
+        record = self.store.load(request_id)
+        next_record = dict(record, phase="awaiting_decision", state="awaiting_decision")
+        with mock.patch.object(
+            agent_skill_cli.RequestLifecycleMachine, "refresh",
+            side_effect=[record, record, next_record],
+        ) as refresh:
+            unchanged = agent_skill_cli.request_status_command(
+                request_id=request_id, state_store=self.store
+            )
+            self.assertFalse(unchanged["changed"])
+            self.assertEqual(refresh.call_count, 1)
+            changed = agent_skill_cli.request_status_command(
+                request_id=request_id, state_store=self.store, wait_ms=2000,
+                monotonic=lambda: self.clock, sleep=self.sleep,
+            )
+        self.assertTrue(changed["changed"])
+        self.assertEqual(changed["state"], "awaiting_decision")
+        self.assertEqual(self.sleeps, [0.5])
+        self.assertEqual(refresh.call_count, 3)
+
+    def test_status_wait_deadline_is_bounded_and_response_hash_is_cleaned(self):
+        initial = self.deferred_send()
+        request_id = initial["request_id"]
+        with mock.patch.object(
+            agent_skill_cli.RequestLifecycleMachine, "refresh",
+            return_value=self.store.load(request_id),
+        ) as refresh:
+            payload = agent_skill_cli.request_status_command(
+                request_id=request_id, state_store=self.store, wait_ms=750,
+                monotonic=lambda: self.clock, sleep=self.sleep,
+            )
+        self.assertFalse(payload["changed"])
+        self.assertEqual(self.sleeps, [0.5, 0.25])
+        self.assertEqual(refresh.call_count, 3)
+        settled = self.settled_request()
+        record = self.store.load(settled["request_id"])
+        record["response"]["output"] = "\nReview complete.\n\n"
+        self.store.save(settled["request_id"], record)
+        payload = agent_skill_cli.request_status_command(
+            request_id=settled["request_id"], state_store=self.store
+        )
+        self.assertFalse(payload["changed"])
+
+    def test_status_wait_stops_on_error_code_change(self):
+        initial = self.deferred_send()
+        record = self.store.load(initial["request_id"])
+        changed = dict(record, error_code="recipient_changed")
+        with mock.patch.object(
+            agent_skill_cli.RequestLifecycleMachine, "refresh", return_value=changed
+        ) as refresh:
+            payload = agent_skill_cli.request_status_command(
+                request_id=initial["request_id"], state_store=self.store, wait_ms=5000,
+                monotonic=lambda: self.clock, sleep=self.sleep,
+            )
+        self.assertEqual(refresh.call_count, 1)
+        self.assertEqual(self.sleeps, [])
+        self.assertTrue(payload["changed"])
+        self.assertEqual(payload["error_code"], "recipient_changed")
+
+    def test_defer_timeout_and_wait_validation_and_help(self):
+        for command, flags in (
+            ("send", ["--address", "local/white-bison", "--message", "work"]),
+            ("request", ["--address", "local/white-bison", "--message", "work"]),
+            ("batch", ["--requests-json", "[]"]),
+        ):
+            for timeout in ("0", "-1"):
+                output = StringIO()
+                with mock.patch("sys.stdout", output):
+                    code = agent_skill_cli.main([
+                        command, *flags, "--defer-timeout", timeout,
+                    ], self.environment)
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    json.loads(output.getvalue())["error"]["code"],
+                    "invalid_defer_timeout",
+                )
+        output = StringIO()
+        with mock.patch("sys.stdout", output):
+            code = agent_skill_cli.main([
+                "request-status", "--request-id", "a" * 32, "--wait", "-1",
+            ], self.environment)
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(output.getvalue())["error"]["code"], "invalid_timeout")
+        for command in ("send", "read", "request", "request-status", "batch"):
+            output = StringIO()
+            with mock.patch("sys.stdout", output), self.assertRaises(SystemExit):
+                agent_skill_cli.parse_cli_arguments([command, "--help"])
+            self.assertIn("--verbose", output.getvalue())
+            if command in {"send", "request", "batch"}:
+                self.assertIn("--defer-timeout", output.getvalue())
+            if command == "request-status":
+                self.assertIn("--wait", output.getvalue())
+
+    def test_transport_reconstruction_rejects_bad_context(self):
+        for context in (
+            None, [], {}, {"host": 1, "label": "bird"},
+            {"host": "", "label": "bird"}, {"host": "local"},
+            {"host": "local", "label": 1},
+            {"host": "local", "route": False},
+            {"host": "local", "label": "bird", "route": "route"},
+        ):
+            with self.subTest(context=context), self.assertRaises(
+                agent_skill_cli.SkillCommandError
+            ) as raised:
+                agent_skill_cli.transport_for_record({"_context": context}, {})
+            self.assertEqual(raised.exception.code, "request_state_invalid")
+
+    def test_transport_reconstruction_uses_context_and_no_sender(self):
+        for context in (
+            {"host": "remote", "label": "bird", "route": None},
+            {"host": "local", "label": None, "route": "route"},
+        ):
+            with mock.patch.object(
+                agent_skill_cli, "resolve_or_refresh_recipient",
+                return_value=agent_skill_cli.RouteResolution(
+                    self.sender, route_refreshed=False, route="route"
+                ),
+            ) as resolve, mock.patch.object(
+                agent_skill_cli, "run_bounded_command",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ) as runner:
+                transport = agent_skill_cli.transport_for_record(
+                    {"_context": context}, self.environment
+                )
+                target = transport.resolve()
+                transport.submit(target, "work")
+            resolve.assert_called_once_with(**context, environment=self.environment)
+            runner.assert_called_once()
+            self.assertFalse(transport.is_focused(target))
+            self.assertTrue(transport.is_focused(replace(target, focused=True)))
+
+    def test_batch_deferred_items_are_compact_and_exit_three(self):
+        for wait in (True, False):
+            output = StringIO()
+            handler = "request_command" if wait else "send_command"
+            deferred = {
+                "request_id": "a" * 32, "state": "deferred", "terminal": False,
+                "submitted": False, "phase": "deferred_recipient_focused",
+                "recipient": {"host": "local", "name": "one"},
+            }
+            with (
+                mock.patch.object(
+                    agent_skill_cli, "resolve_or_refresh_routed_agent",
+                    new=batch_route_resolution,
+                ),
+                mock.patch.object(
+                    agent_skill_cli, handler, return_value=deferred
+                ) as send,
+                mock.patch("sys.stdout", output),
+            ):
+                code = agent_skill_cli.main([
+                    "batch", "--requests-json", '[{"route":"one","message":"work"}]',
+                    "--wait" if wait else "--no-wait", "--defer-timeout", "4321",
+                ], self.environment)
+            self.assertEqual(code, 3)
+            self.assertEqual(json.loads(output.getvalue())["results"], [{
+                "address": "local/one", "status": "deferred", "request_id": "a" * 32,
+                "state": "deferred",
+                "response": {"text": "", "truncated": False},
+            }])
+            self.assertEqual(send.call_args.kwargs["defer_timeout_ms"], 4321)
+
+    def test_status_main_acknowledges_only_after_json_output(self):
+        initial = self.settled_request()
+        request_id = initial["request_id"]
+        record = self.store.load(request_id)
+        previous = record["_last_reported"]
+        record["response"]["output"] = "New response."
+        self.store.save(request_id, record)
+        writer = agent_skill_cli._write_json
+        output = StringIO()
+
+        def write_json(payload, **options):
+            self.assertEqual(
+                self.store.load(request_id)["_last_reported"], previous
+            )
+            writer(payload, **options)
+
+        with (
+            mock.patch.object(agent_skill_cli, "_write_json", side_effect=write_json),
+            mock.patch("sys.stdout", output),
+        ):
+            code = agent_skill_cli.main([
+                "request-status", "--request-id", request_id,
+            ], self.environment)
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(output.getvalue())["changed"])
+        self.assertNotEqual(self.store.load(request_id)["_last_reported"], previous)
+
+    def test_batch_compact_removes_prompt_echo_but_verbose_retains_output(self):
+        echoed = "Message from winmini/blue-raven:\n\nwork\n\nAnswer.\n"
+        lifecycle = {
+            "state": "submitted_settled", "request_id": "a" * 32,
+            "sender": {"address": "local/blue-raven"},
+            "response": {"output": echoed, "truncated": False, "correlated": True},
+        }
+        self.store.save(lifecycle["request_id"], dict(
+            lifecycle, _prompt="Message from winmini/blue-raven:\n\nwork",
+        ))
+        for verbose in (False, True):
+            with (
+                mock.patch.object(
+                    agent_skill_cli, "resolve_or_refresh_routed_agent",
+                    new=batch_route_resolution,
+                ),
+                mock.patch.object(
+                    agent_skill_cli, "request_command", return_value=lifecycle
+                ),
+            ):
+                result = agent_skill_cli.batch_command(
+                    requests_json='[{"route":"one","message":"work"}]',
+                    wait=True, timeout_ms=1000, max_workers=1, verbose=verbose,
+                    environment=self.environment,
+                )
+            response = result["results"][0]["response"]
+            if verbose:
+                self.assertEqual(response["output"], echoed)
+            else:
+                self.assertEqual(response["text"], "Answer.")
+                self.assertNotIn("route", result["results"][0])
+
+    def test_first_request_status_after_batch_includes_full_compact_details(self):
+        request_command = agent_skill_cli.request_command
+        prompt = "Message from winmini/blue-raven:\n\nwork"
+
+        def send_request(**arguments):
+            resolver = mock.Mock(side_effect=[
+                self.recipient, replace(self.recipient, status="working"),
+                replace(self.recipient, status="done"),
+            ])
+            runner = mock.Mock(side_effect=[
+                subprocess.CompletedProcess([], 0, "old screen", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, prompt + "\n\nOK\n", ""),
+            ])
+            return request_command(
+                **arguments, resolver=resolver, command_runner=runner,
+                state_store=self.store, monotonic=lambda: self.clock, sleep=self.sleep,
+            )
+
+        with (
+            mock.patch.object(
+                agent_skill_cli, "current_sender", return_value=replace(self.sender, host="winmini")
+            ),
+            mock.patch.object(
+                agent_skill_cli, "resolve_or_refresh_routed_agent", new=batch_route_resolution
+            ),
+            mock.patch.object(agent_skill_cli, "request_command", side_effect=send_request),
+        ):
+            batch = agent_skill_cli.batch_command(
+                requests_json='[{"route":"one","message":"work"}]',
+                wait=True, timeout_ms=1000, max_workers=1, environment=self.environment,
+            )
+        item = batch["results"][0]
+        self.assertEqual(item["response"]["text"], "OK")
+        self.assertFalse(item["response"]["truncated"])
+        self.assertNotIn("_last_reported", self.store.load(item["request_id"]))
+        status = agent_skill_cli.request_status_command(
+            request_id=item["request_id"], state_store=self.store,
+        )
+        self.assertTrue(status["changed"])
+        self.assertEqual(status["response"]["text"], "OK")
+        self.assertTrue(status["response"]["correlated"])
+        self.assertTrue(status["response"]["anchored"])
+        self.assertFalse(status["response"]["truncated"])
+        self.assertFalse(agent_skill_cli.request_status_command(
+            request_id=item["request_id"], state_store=self.store,
+        )["changed"])
+
+    def test_worker_cancellation_is_not_overwritten_by_route_reporting(self):
+        def cancel_pending(environment):
+            for request_id in self.store.list_request_ids():
+                agent_skill_cli.RequestLifecycleMachine(
+                    mock.Mock(), self.store
+                ).cancel_deferred(request_id)
+            return True
+
+        self.worker.side_effect = cancel_pending
+        initial = self.deferred_send()
+        status = agent_skill_cli.request_status_command(
+            request_id=initial["request_id"], state_store=self.store
+        )
+        self.assertEqual(status["state"], "submission_failed")
+        self.assertEqual(status["error_code"], "delivery_cancelled")
+        self.assertTrue(status["changed"])
+
+    def test_state_store_uses_shared_precedence(self):
+        root = self.store.directory
+        environment = {
+            "HERDR_AGENT_REQUEST_STATE_DIR": str(root / "explicit"),
+            "HERDR_PLUGIN_STATE_DIR": str(root / "plugin"),
+            "XDG_STATE_HOME": str(root / "xdg"), "HOME": str(root / "home"),
+        }
+        self.assertEqual(
+            agent_skill_cli._request_state_store(environment).directory, root / "explicit"
+        )
+        environment.pop("HERDR_AGENT_REQUEST_STATE_DIR")
+        self.assertEqual(
+            agent_skill_cli._request_state_store(environment).directory,
+            root / "xdg/herdr-agent-messenger/requests",
+        )
+        with mock.patch.object(
+            agent_skill_cli.request_lifecycle, "open_request_store",
+            return_value=self.store,
+        ) as open_store:
+            self.assertIs(agent_skill_cli._request_state_store(environment), self.store)
+        open_store.assert_called_once_with(environment)
 
 
 class AgentSkillWrapperTest(unittest.TestCase):

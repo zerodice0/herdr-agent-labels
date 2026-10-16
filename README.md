@@ -15,8 +15,10 @@ routes prompts from a keyboard-first popup, Codex, Claude Code, or omp.
 - Automatic labels such as `blue-otter` with matching color markers
 - Local and SSH agent discovery using concrete aliases from `~/.ssh/config`
 - Coordinator delegation and direct multi-recipient delivery
-- A bundled `herdr-agent-messenger` skill for Codex, Claude Code, and omp
+- A bundled `herdr-agent-messenger` skill for Codex, Claude Code, and omp, split into short `SKILL.md` and on-demand `reference.md`
 - Labeled interactive-session creation with `spawn`, plus safe request, wait, read, batch, and rollout helpers
+- Focus-based holds for agent messages, with a 3-minute default timeout and explicit Push/Cancel in **HAM: Held Messages**
+- Compact CLI output by default, with `--verbose` diagnostics and `request-status --wait` follow-up
 
 Manually named agents are left unchanged. Agent addresses are always
 host-qualified, for example `local/blue-otter` or
@@ -60,8 +62,9 @@ $ham Ask local/yellow-falcon what language label dxp-ui uses. Wait for the
 reply, then align this work and its defaults with that answer.
 ```
 
-Use the exact `host/label` shown by Herdr. A bare label can collide with an agent
-on another host or be mistaken for a client's own subagent.
+Use `local/LABEL` for this machine, not its hostname, and a configured SSH alias
+for remote recipients. A bare label can collide across hosts or be mistaken for
+a client's own subagent.
 
 To start a new agent and message it, ask HAM explicitly to create the session.
 HAM uses `spawn`, then `request --address` with the returned address; it does not
@@ -74,6 +77,21 @@ python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py sp
 python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py request \
   --address RETURNED_HOST/RETURNED_LABEL --message 'Review this project.'
 ```
+
+CLI messages to a focused recipient are held; do not resend. After the default
+3-minute hold deadline, choose Push or Cancel in **HAM: Held Messages** on the
+sender host. After deferred delivery or Push, the worker observes the request
+until it is terminal or 30 minutes after submission. Read the saved result with
+`request-status`; it can still advance observation after that limit.
+Self-send fails immediately with `recipient_is_sender`, even if the sender pane
+is focused, and is never held.
+
+`request-status --wait MS` stops on a state, phase or `error_code` change, a
+terminal state, or the deadline, not response-text growth. Compact
+`response.truncated` is true only when reply text itself was cut by output
+bounds or a failed read, not merely when older history was omitted or baseline
+overlap was lost. See the [skill guide](docs/skill-guide.md) for flags and errors,
+including `invalid_defer_timeout` for a nonpositive or invalid hold timeout.
 
 Install or update the bundled skill from **HAM Skill** in Herdr's command
 palette, or run:

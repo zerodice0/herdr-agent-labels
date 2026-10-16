@@ -16,8 +16,10 @@ HAM은 Herdr용 에이전트 라벨링 및 다중 에이전트 메시징 플러�
 - `blue-otter` 같은 자동 라벨과 색상 표시를 제공합니다.
 - `~/.ssh/config`의 명시적 별칭으로 로컬·SSH 에이전트를 탐색합니다.
 - 코디네이터 위임과 다중 수신자 직접 전송을 지원합니다.
-- Codex, Claude Code, omp용 `herdr-agent-messenger` 스킬을 제공합니다.
+- Codex, Claude Code, omp용 스킬을 짧은 `SKILL.md`와 필요할 때 읽는 `reference.md`로 제공합니다.
 - 안전한 요청·대기·읽기·배치·세션 생성·원격 배포 도구를 제공합니다.
+- 포커스가 있는 pane으로 오는 에이전트 메시지를 보류하고, 기본 3분 후 **HAM: Held Messages**에서 Push 또는 Cancel을 선택하도록 합니다.
+- 간결한 CLI 출력, `--verbose` 진단 정보, `request-status --wait`를 통한 후속 관찰을 지원합니다.
 
 사용자가 직접 붙인 이름은 변경하지 않습니다. 에이전트 주소는
 `local/blue-otter`, `macbook-pro/purple-koala`처럼 항상 호스트를
@@ -62,14 +64,31 @@ $ham local/yellow-falcon에게 dxp-ui에서 사용하는 언어 라벨을 물어
 응답을 기다린 다음 현재 작업과 기본값을 그 답변에 맞춰줘.
 ```
 
-Herdr에 표시된 정확한 `host/label`을 사용하세요. 라벨만 쓰면 다른 호스트의
-에이전트와 충돌하거나 AI 클라이언트 자체 서브에이전트로 오인될 수 있습니다.
+현재 기기는 호스트 이름 대신 `local/LABEL`로 지정하고, 원격 기기는 설정된
+SSH 별칭을 사용하세요. 라벨만 쓰면 다른 호스트의 에이전트와 충돌하거나
+AI 클라이언트 자체 서브에이전트로 오인될 수 있습니다.
 
 새 에이전트 세션을 열고 메시지를 보내라는 요청에는 `spawn`을 사용한 뒤 반환된
 `address`로 `request --address HOST/LABEL`을 실행하세요. 직접
 `herdr agent start <name>`을 실행하면 HAM의 라벨 선택과 메타데이터 처리를
 우회합니다. 기존 라벨이 없다는 이유만으로 새 세션을 만들거나 라벨을 추측하지 마세요.
 전체 옵션과 예시는 [스킬 가이드](docs/ko/skill-guide.md)를 참고하세요.
+
+CLI 메시지의 수신자 pane에 포커스가 있으면 전송을 보류하므로 다시 보내지
+마세요. 기본 보류 제한인 3분이 지나면 송신 호스트의 **HAM: Held Messages**에서
+Push 또는 Cancel을 선택하세요. 보류 후 전송하거나 Push로 전송하면 worker가
+요청을 관찰하다가 종료 상태가 되거나 제출 후 30분이 지나면 관찰을 끝냅니다.
+저장된 결과는 `request-status`로 읽으며, 30분 뒤에도 이 명령으로 관찰을
+이어갈 수 있습니다. 자기 자신에게 보내면 송신자 pane에 포커스가 있어도
+`recipient_is_sender`로 즉시 실패하며 보류하지 않습니다.
+
+`request-status --wait MS`는 `state`, `phase`, `error_code` 중 하나가 바뀌거나,
+요청이 종료 상태가 되거나, 제한 시간이 지나면 반환합니다. 응답 텍스트가
+늘어나는 것만으로는 대기를 끝내지 않습니다. 간결한 결과의 `response.truncated`는
+출력 한도나 읽기 실패로 응답 텍스트 자체가 잘렸을 때만 `true`입니다. 오래된
+이력을 생략했거나 기준 화면과의 연속성을 잃었다는 이유만으로는 설정하지 않습니다.
+잘못된 보류 제한을 나타내는 `invalid_defer_timeout`을 비롯한 오류와 전체 옵션은
+[스킬 가이드](docs/ko/skill-guide.md)를 참고하세요.
 
 Herdr 명령 팔레트의 **HAM Skill**에서 번들 스킬을 설치·갱신하거나 다음 명령을
 실행합니다.

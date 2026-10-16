@@ -140,11 +140,11 @@ class AgentSpawnTest(unittest.TestCase):
             "agent": "omp", "agent_session": {"value": "session-existing"},
         })
         result = self.spawn(backend)
-        self.assertEqual(result["label"], third.name)
+        self.assertEqual(result["address"], f"local/{third.name}")
         self.assertEqual(backend.starts, [third.name])
         self.assertEqual(len(backend.agents), 2)
         self.assertEqual(backend.agents[0]["name"], first.name)
-        self.assertTrue(result["label_metadata_reported"])
+        self.assertNotIn("label_metadata_reported", result)
         self.assertEqual(backend.metadata[backend.pane_id], {
             "source": SOURCE,
             "display_agent": f"{third.marker} {third.name}",
@@ -161,7 +161,7 @@ class AgentSpawnTest(unittest.TestCase):
         backend.start_errors[first.name] = "agent_name_taken"
         result = self.spawn(backend)
         self.assertEqual(backend.starts, [first.name, second.name])
-        self.assertEqual(result["label"], second.name)
+        self.assertEqual(result["address"], f"local/{second.name}")
         self.assertEqual(len(backend.created), 1)
         self.assertEqual(len(backend.agents), 1)
         self.assertEqual(result["pane_id"], backend.pane_id)
@@ -170,9 +170,7 @@ class AgentSpawnTest(unittest.TestCase):
         backend = FakeHerdr()
         result = self.spawn(backend, "--label", "Review Worker")
         self.assertEqual(result["address"], "local/Review Worker")
-        self.assertEqual(result["label"], "Review Worker")
         self.assertEqual(result["marker"], "")
-        self.assertEqual(result["color"], "")
         self.assertFalse(result["label_metadata_reported"])
         self.assertEqual(backend.metadata, {})
         self.assertFalse(any(command[:2] == ["pane", "report-metadata"] for command in backend.commands))
@@ -181,14 +179,13 @@ class AgentSpawnTest(unittest.TestCase):
         backend = FakeHerdr()
         alias = ALIASES[0]
         result = self.spawn(backend, "--label", alias.name)
-        self.assertTrue(result["label_metadata_reported"])
+        self.assertNotIn("label_metadata_reported", result)
         self.assertEqual(result["marker"], alias.marker)
-        self.assertEqual(result["color"], alias.color)
 
-    def test_success_returns_an_address_and_route_for_the_observed_occupant(self):
+    def test_verbose_returns_the_legacy_payload_and_observed_route(self):
         backend = FakeHerdr()
         backend.banner = "Welcome to the remote shell\n"
-        result = self.spawn(backend, "--cwd", "/work/actual")
+        result = self.spawn(backend, "--verbose", "--cwd", "/work/actual")
         self.assertEqual(result["address"], f"local/{result['label']}")
         self.assertEqual(result["pane_id"], backend.pane_id)
         self.assertEqual(result["workspace_id"], backend.workspace_id)
@@ -200,6 +197,32 @@ class AgentSpawnTest(unittest.TestCase):
         self.assertEqual(resolved.session_id, "session-new")
         self.assertEqual(resolved.name, result["label"])
         self.assertEqual(result["agent"]["address"], result["address"])
+        self.assertEqual(set(result), {
+            "address", "label", "marker", "color", "host", "created", "pane_id",
+            "tab_id", "workspace_id", "kind", "cwd", "label_metadata_reported",
+            "placement_label_reported", "agent", "route",
+        })
+
+    def test_default_returns_only_compact_placement_fields(self):
+        backend = FakeHerdr()
+        result = self.spawn(backend)
+        alias = next(alias for alias in ALIASES if alias.name == backend.starts[0])
+        self.assertEqual(result, {
+            "address": f"local/{alias.name}",
+            "marker": alias.marker,
+            "created": "pane",
+            "pane_id": backend.pane_id,
+            "tab_id": backend.tab_id,
+            "workspace_id": backend.workspace_id,
+        })
+
+    def test_default_omits_unavailable_tab_id(self):
+        backend = FakeHerdr()
+        backend.tab_id = ""
+        result = self.spawn(backend)
+        self.assertEqual(set(result), {
+            "address", "marker", "created", "pane_id", "workspace_id",
+        })
 
     def test_start_failure_cleans_up_each_placement(self):
         for placement in ("split", "tab", "workspace"):
@@ -268,8 +291,8 @@ class AgentSpawnTest(unittest.TestCase):
                 backend = FakeHerdr()
                 result = self.spawn(backend, "--placement", placement, environment={})
                 self.assertEqual(result["created"], placement)
-                self.assertEqual(backend.workspace_label, result["label"])
-                self.assertTrue(result["placement_label_reported"])
+                self.assertEqual(backend.workspace_label, result["address"].split("/", 1)[1])
+                self.assertNotIn("placement_label_reported", result)
 
     def test_tab_inherits_explicit_source_workspace(self):
         backend = FakeHerdr()
@@ -286,8 +309,8 @@ class AgentSpawnTest(unittest.TestCase):
         backend = FakeHerdr()
         result = self.spawn(backend, "--placement", "workspace", "--workspace-label", "Review room")
         self.assertEqual(backend.workspace_label, "Review room")
-        self.assertNotEqual(result["label"], "Review room")
-        self.assertTrue(result["placement_label_reported"])
+        self.assertNotEqual(result["address"], "local/Review room")
+        self.assertNotIn("placement_label_reported", result)
 
     def test_noncritical_reporting_failures_keep_the_agent_running(self):
         backend = FakeHerdr()
@@ -306,7 +329,7 @@ class AgentSpawnTest(unittest.TestCase):
             config.write_text("Host test-remote\n  HostName example.invalid\n", encoding="utf-8")
             result = self.spawn(
                 backend, "--host", "test-remote", "--cwd", "/remote/project",
-                "--from-pane", "remote-pane",
+                "--from-pane", "remote-pane", "--verbose",
                 environment={
                     SSH_CONFIG_ENV: str(config),
                     SSH_HOSTS_FILE_ENV: str(Path(directory) / "ssh-hosts"),
@@ -351,7 +374,10 @@ class AgentSpawnTest(unittest.TestCase):
                 self.assertEqual(backend.commands, [])
         for timeout in ("1", "300000"):
             with self.subTest(timeout=timeout):
-                self.assertEqual(self.spawn(FakeHerdr(), "--timeout", timeout)["kind"], "codex")
+                backend = FakeHerdr()
+                self.spawn(backend, "--timeout", timeout)
+                start = next(command for command in backend.commands if command[:2] == ["agent", "start"])
+                self.assertEqual(start[start.index("--timeout") + 1], timeout)
 
     def test_labels_reject_empty_and_address_separator(self):
         for label in ("", "   ", "remote/worker"):
@@ -390,7 +416,9 @@ class AgentSpawnTest(unittest.TestCase):
 
     def test_local_cwd_defaults_to_current_directory(self):
         backend = FakeHerdr()
-        self.assertEqual(self.spawn(backend)["cwd"], os.getcwd())
+        self.spawn(backend)
+        split = next(command for command in backend.commands if command[:2] == ["pane", "split"])
+        self.assertEqual(split[split.index("--cwd") + 1], os.getcwd())
 
     def test_import_does_not_import_cli(self):
         result = subprocess.run(

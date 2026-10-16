@@ -17,13 +17,14 @@ MAX_BATCH_WORKERS = 8
 
 SUCCEEDED = "succeeded"
 SUBMITTED = "submitted"
+DEFERRED = "deferred"
 FAILED = "failed"
 TIMED_OUT = "timeout"
 CANCELLED = "cancelled"
 
-DELIVERED_STATUSES = frozenset((SUCCEEDED, SUBMITTED))
+DELIVERED_STATUSES = frozenset((SUCCEEDED, SUBMITTED, DEFERRED))
 RESULT_STATUSES = frozenset(
-    (SUCCEEDED, SUBMITTED, FAILED, TIMED_OUT, CANCELLED)
+    (SUCCEEDED, SUBMITTED, DEFERRED, FAILED, TIMED_OUT, CANCELLED)
 )
 
 
@@ -57,6 +58,8 @@ class DispatchOutcome:
     output: str = ""
     truncated: bool = False
     correlated: bool = False
+    state: str = ""
+    address: str = ""
 
 
 class BatchSender(Protocol):
@@ -74,9 +77,15 @@ class BatchResult:
     output: str = ""
     truncated: bool = False
     correlated: bool = False
+    state: str = ""
+    address: str = ""
 
     def payload(self) -> dict[str, Any]:
         value: dict[str, Any] = {"route": self.route, "status": self.status}
+        if self.address:
+            value["address"] = self.address
+        if self.state:
+            value["state"] = self.state
         if self.error:
             value["error"] = self.error
         if self.detail:
@@ -116,8 +125,10 @@ def parse_batch_json(value: str) -> list[object]:
     return decoded
 
 
-def _failure(route: str, error: str, detail: str = "") -> BatchResult:
-    return BatchResult(route, FAILED, error, detail)
+def _failure(
+    route: str, error: str, detail: str = "", *, address: str = "",
+) -> BatchResult:
+    return BatchResult(route, FAILED, error, detail, address=address)
 
 
 def _normalize_sender_outcome(
@@ -129,6 +140,7 @@ def _normalize_sender_outcome(
             request.route,
             "invalid_sender_result",
             "The single-request sender returned an invalid outcome.",
+            address=request.address,
         )
     return BatchResult(
         outcome.route or request.route,
@@ -139,20 +151,27 @@ def _normalize_sender_outcome(
         outcome.output,
         outcome.truncated,
         outcome.correlated,
+        outcome.state,
+        outcome.address or request.address,
     )
 
 
 def _exception_result(request: BatchRequest, error: Exception) -> BatchResult:
     if isinstance(error, TimeoutError):
-        return BatchResult(request.route, TIMED_OUT, "timeout", str(error))
+        return BatchResult(
+            request.route, TIMED_OUT, "timeout", str(error), address=request.address,
+        )
     if isinstance(error, CancelledError):
-        return BatchResult(request.route, CANCELLED, "cancelled", str(error))
+        return BatchResult(
+            request.route, CANCELLED, "cancelled", str(error), address=request.address,
+        )
     code = getattr(error, "code", "dispatch_failed")
     message = getattr(error, "message", str(error))
     return _failure(
         request.route,
         code if isinstance(code, str) else "dispatch_failed",
         message if isinstance(message, str) else str(message),
+        address=request.address,
     )
 
 
@@ -193,10 +212,10 @@ def _prepare_requests(
             results[index] = _failure(route, "duplicate_route")
             continue
         if not isinstance(message, str):
-            results[index] = _failure(route, "invalid_message")
+            results[index] = _failure(route, "invalid_message", address=address)
             continue
         if not message.strip():
-            results[index] = _failure(route, "empty_message")
+            results[index] = _failure(route, "empty_message", address=address)
             continue
         request = BatchRequest(route, message, address)
         identity = route or address
@@ -204,6 +223,8 @@ def _prepare_requests(
             try:
                 if resolve_request is not None:
                     request, identity = resolve_request(request)
+                    if not request.address and address:
+                        request = BatchRequest(request.route, request.message, address)
                 elif address:
                     raise BatchDispatchError(
                         "invalid_address", "Address dispatch requires a resolver."
@@ -216,7 +237,9 @@ def _prepare_requests(
     ready: list[tuple[int, BatchRequest]] = []
     for index, request, identity in prepared:
         if identities[identity] > 1:
-            results[index] = _failure(request.route, "duplicate_route")
+            results[index] = _failure(
+                request.route, "duplicate_route", address=request.address,
+            )
         else:
             ready.append((index, request))
     return results, ready
@@ -300,6 +323,11 @@ def dispatch_batch(
             route if isinstance(route, str) else "",
             CANCELLED,
             "cancelled",
+            address=(
+                item["address"]
+                if isinstance(item, Mapping) and isinstance(item.get("address"), str)
+                else ""
+            ),
         )
 
     final_results = [result for result in result_slots if result is not None]

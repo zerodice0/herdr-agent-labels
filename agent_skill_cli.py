@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import threading
@@ -15,9 +15,12 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from typing import Any
 
+import agent_delivery
+import request_lifecycle
 from agent_batch_dispatch import (
     CANCELLED,
     DEFAULT_BATCH_WORKERS,
+    DEFERRED,
     FAILED,
     SUBMITTED,
     SUCCEEDED,
@@ -29,8 +32,6 @@ from agent_batch_dispatch import (
     parse_batch_json,
 )
 from agent_directory import (
-    LEGACY_PLUGIN_ID,
-    PLUGIN_ID,
     REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     AgentRecord,
     herdr_executable,
@@ -53,6 +54,11 @@ from agent_route import (
 from agent_output import (
     InvalidOutputCursor,
     agent_address,
+    clean_agent_text,
+    compact_batch_item,
+    compact_read_payload,
+    compact_request_payload,
+    compact_status_payload,
     compact_agent_payload,
     compact_output,
     output_stream_id,
@@ -69,6 +75,7 @@ from request_lifecycle import (
 )
 
 DEFAULT_WAIT_TIMEOUT_MS = 120_000
+DEFAULT_DEFER_TIMEOUT_MS = 180_000
 DEFAULT_READ_LINES = 120
 DEFAULT_REQUEST_OUTPUT_CHARS = 12_000
 DEFAULT_REQUEST_POLL_INTERVAL_SECONDS = 0.5
@@ -286,30 +293,7 @@ def _agent_command(
 def _request_state_store(
     environment: Mapping[str, str] | None = None,
 ) -> JsonRequestStateStore:
-    values = os.environ if environment is None else environment
-    configured = values.get("HERDR_AGENT_REQUEST_STATE_DIR")
-    if configured:
-        directory = Path(configured).expanduser()
-    elif values.get("HERDR_PLUGIN_STATE_DIR"):
-        plugin_state = Path(values["HERDR_PLUGIN_STATE_DIR"]).expanduser()
-        directory = plugin_state / "requests"
-        legacy = plugin_state.with_name(LEGACY_PLUGIN_ID) / "requests"
-        if (
-            plugin_state.name == PLUGIN_ID
-            and not directory.exists()
-            and legacy.exists()
-        ):
-            directory = legacy
-    else:
-        state_home = values.get("XDG_STATE_HOME")
-        configured_home = values.get("HOME")
-        home = Path(configured_home).expanduser() if configured_home else Path.home()
-        root = Path(state_home).expanduser() if state_home else home / ".local/state"
-        directory = root / "herdr-agent-messenger" / "requests"
-        legacy = root / "herdr-agent-labels" / "requests"
-        if not directory.exists() and legacy.exists():
-            directory = legacy
-    return JsonRequestStateStore(directory)
+    return request_lifecycle.open_request_store(environment)
 
 
 class AgentRequestTransport(RequestTransport[AgentRecord]):
@@ -358,8 +342,14 @@ class AgentRequestTransport(RequestTransport[AgentRecord]):
     def resolution(self) -> RouteResolution | None:
         return self._resolution
 
+    def is_focused(self, target: AgentRecord) -> bool:
+        return target.focused
+
+    def recipient_is_sender(self, target: AgentRecord) -> bool:
+        return target.identity == self._sender_identity
+
     def submit(self, target: AgentRecord, prompt: str) -> SubmissionResult:
-        if target.identity == self._sender_identity:
+        if self.recipient_is_sender(target):
             return SubmissionResult.failed(
                 "The current sender cannot also be the recipient.",
                 code="recipient_is_sender",
@@ -462,15 +452,12 @@ def status_command(
         environment=environment,
     )
     recipient = resolution.agent
-    return {
-        "agent": (
-            _record_payload(recipient)
-            if verbose
-            else compact_agent_payload(recipient)
-        ),
+    payload = {
+        "agent": _record_payload(recipient),
         "route_refreshed": resolution.route_refreshed,
         "route": resolution.route,
     }
+    return payload if verbose else compact_status_payload(payload)
 
 
 def send_command(
@@ -481,8 +468,11 @@ def send_command(
     message: str,
     wait: bool,
     timeout_ms: int,
+    defer_timeout_ms: int = DEFAULT_DEFER_TIMEOUT_MS,
+    verbose: bool = False,
     environment: Mapping[str, str] | None = None,
     cancel_event: threading.Event | None = None,
+    on_report: Callable[[Callable[[], None]], None] | None = None,
 ) -> dict[str, Any]:
     if not message.strip():
         raise SkillCommandError("empty_message", "The message must not be empty.")
@@ -491,21 +481,46 @@ def send_command(
             "invalid_timeout",
             "--timeout must be greater than zero.",
         )
+    _validate_defer_timeout(defer_timeout_ms)
 
-    resolution = resolve_or_refresh_recipient(
-        host=host,
-        label=label,
-        route=route,
-        environment=environment,
-    )
-    recipient = resolution.agent
     sender = current_sender(environment)
-    if recipient.identity == sender.identity:
-        raise SkillCommandError(
-            "recipient_is_sender",
-            "The current sender cannot also be the recipient.",
-        )
     prompt = f"Message from {sender.qualified_name}:\n\n{message.strip()}"
+    transport = AgentRequestTransport(
+        resolver=lambda: resolve_or_refresh_recipient(
+            host=host, label=label, route=route, environment=environment,
+        ),
+        sender_identity=sender.identity,
+        environment=environment,
+        command_runner=run_bounded_command,
+        cancel_event=cancel_event,
+    )
+    store = _request_state_store(environment)
+    try:
+        queued = RequestLifecycleMachine(transport, store).enqueue(
+            request_id=uuid.uuid4().hex,
+            prompt=prompt,
+            max_output_lines=DEFAULT_READ_LINES,
+            max_output_chars=DEFAULT_REQUEST_OUTPUT_CHARS,
+            defer_timeout_seconds=defer_timeout_ms / 1000,
+            metadata=_request_metadata(sender, host=host, label=label, route=route),
+            on_deferred=lambda record: agent_delivery.ensure_worker(environment),
+        )
+        if queued is not None:
+            if queued.get("error_code") == "recipient_is_sender":
+                raise SkillCommandError(
+                    "recipient_is_sender", "The current sender cannot also be the recipient."
+                )
+            _record_request_route(queued, transport, store)
+            if queued.get("state") in {"deferred", "awaiting_decision"}:
+                agent_delivery.ensure_worker(environment)
+            return _report_request(
+                queued, store, verbose=verbose, on_report=on_report
+            )
+    except (OSError, ValueError) as error:
+        raise SkillCommandError("request_state_unavailable", str(error)) from error
+    resolution = transport.resolution
+    assert resolution is not None  # enqueue resolved the immediate recipient.
+    recipient = resolution.agent
     arguments = ["agent", "prompt", recipient.target, prompt]
     if wait:
         arguments.extend(["--wait", "--timeout", str(timeout_ms)])
@@ -548,7 +563,16 @@ def send_command(
         if wait and recipient.status == "working"
         else []
     )
-    return payload
+    if verbose:
+        return payload
+    compact = {
+        "sent": True,
+        "address": payload["recipient"],
+        "waited": wait,
+    }
+    if payload["warnings"]:
+        compact["warnings"] = payload["warnings"]
+    return compact
 
 
 def _batch_outcome_from_payload(
@@ -577,7 +601,14 @@ def _batch_outcome_from_payload(
             str(response_payload.get("output") or ""),
             bool(response_payload.get("truncated")),
             bool(response_payload.get("correlated")),
+            state=str(payload.get("state") or ""),
+            address=str(payload.get("address") or (
+                compact_request_payload(payload, response_text="")["address"]
+            )),
         )
+
+    if payload.get("state") in {"deferred", "awaiting_decision"}:
+        return outcome(DEFERRED)
 
     if (
         "submitted" in payload
@@ -624,10 +655,10 @@ def _batch_outcome_from_payload(
         if normalized in {"cancelled", "canceled"}:
             return outcome(CANCELLED, "prompt_cancelled")
         if normalized in {"failed", "failure", "blocked", "submission_failed"}:
-            error = payload.get("error")
             return outcome(
                 FAILED,
-                error if isinstance(error, str) else "prompt_failed",
+                str(payload.get("error_code") or payload.get("error") or "prompt_failed"),
+                str(payload.get("error") or ""),
             )
     if (
         not waited
@@ -644,8 +675,11 @@ def batch_command(
     wait: bool,
     timeout_ms: int,
     max_workers: int,
+    defer_timeout_ms: int = DEFAULT_DEFER_TIMEOUT_MS,
+    verbose: bool = False,
     environment: Mapping[str, str] | None = None,
     cancel_event: threading.Event | None = None,
+    on_report: Callable[[Callable[[], None]], None] | None = None,
 ) -> dict[str, Any]:
     """Mechanically dispatch pre-tailored route/message pairs."""
 
@@ -654,6 +688,7 @@ def batch_command(
             "invalid_timeout",
             "--timeout must be greater than zero.",
         )
+    _validate_defer_timeout(defer_timeout_ms)
     items = parse_batch_json(requests_json)
 
     def resolve_request(request: BatchRequest) -> tuple[BatchRequest, str]:
@@ -668,7 +703,9 @@ def batch_command(
         else:
             resolution = resolve_or_refresh_routed_agent(request.route, environment)
         return (
-            BatchRequest(resolution.route, request.message),
+            BatchRequest(
+                resolution.route, request.message, address=agent_address(resolution.agent)
+            ),
             resolution.agent.identity,
         )
 
@@ -682,8 +719,11 @@ def batch_command(
                     timeout_ms=timeout_ms,
                     output_lines=DEFAULT_READ_LINES,
                     output_chars=DEFAULT_REQUEST_OUTPUT_CHARS,
+                    defer_timeout_ms=defer_timeout_ms,
+                    verbose=True,
                     environment=environment,
                     cancel_event=cancel_event,
+                    on_report=lambda acknowledge: None,
                 )
             else:
                 payload = send_command(
@@ -692,8 +732,11 @@ def batch_command(
                     message=request.message,
                     wait=False,
                     timeout_ms=timeout_ms,
+                    defer_timeout_ms=defer_timeout_ms,
+                    verbose=True,
                     environment=environment,
                     cancel_event=cancel_event,
+                    on_report=lambda acknowledge: None,
                 )
         except SkillCommandError as error:
             if error.code == "prompt_timeout":
@@ -703,16 +746,26 @@ def batch_command(
             if error.code == "prompt_cancelled":
                 return DispatchOutcome(CANCELLED, error.code, error.message)
             return DispatchOutcome(FAILED, error.code, error.message)
-        outcome = _batch_outcome_from_payload(payload, waited=wait)
-        return outcome
+        if not verbose and isinstance(payload.get("response"), Mapping):
+            record = _request_state_store(environment).load(payload["request_id"])
+            prompt = record.get("_prompt") if record is not None else None
+            response = dict(payload["response"])
+            response["output"] = clean_agent_text(
+                str(response.get("output") or ""), prompt=prompt
+            )
+            payload = dict(payload, response=response)
+        return _batch_outcome_from_payload(payload, waited=wait)
 
-    return dispatch_batch(
+    payload = dispatch_batch(
         items,
         send_one,
         max_workers=max_workers,
         cancel_event=cancel_event,
         resolve_request=resolve_request,
     )
+    if not verbose:
+        payload["results"] = [compact_batch_item(item) for item in payload["results"]]
+    return payload
 
 
 def read_command(
@@ -723,6 +776,7 @@ def read_command(
     lines: int,
     max_bytes: int = DEFAULT_READ_MAX_BYTES,
     cursor: str | None = None,
+    verbose: bool = False,
     environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     if lines <= 0:
@@ -769,7 +823,7 @@ def read_command(
         )
     except InvalidOutputCursor as error:
         raise SkillCommandError("invalid_cursor", str(error)) from None
-    return {
+    payload = {
         "address": agent_address(recipient),
         "output": delta.output,
         "truncated": delta.truncated,
@@ -779,6 +833,9 @@ def read_command(
         "route_refreshed": resolution.route_refreshed,
         "route": resolution.route,
     }
+    return payload if verbose else compact_read_payload(
+        payload, cleaned_output=clean_agent_text(delta.output)
+    )
 
 
 def request_command(
@@ -790,6 +847,8 @@ def request_command(
     timeout_ms: int,
     output_lines: int,
     output_chars: int,
+    defer_timeout_ms: int = DEFAULT_DEFER_TIMEOUT_MS,
+    verbose: bool = False,
     environment: Mapping[str, str] | None = None,
     resolver: Callable[[], AgentRecord | RouteResolution] | None = None,
     state_store: RequestStateStore | None = None,
@@ -798,6 +857,7 @@ def request_command(
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     cancel_event: threading.Event | None = None,
+    on_report: Callable[[Callable[[], None]], None] | None = None,
 ) -> dict[str, Any]:
     """Run one prompt through submission, observation, and bounded output read."""
 
@@ -808,6 +868,7 @@ def request_command(
             "invalid_timeout",
             "--timeout must be greater than zero.",
         )
+    _validate_defer_timeout(defer_timeout_ms)
     if output_lines <= 0:
         raise SkillCommandError(
             "invalid_output_lines",
@@ -854,18 +915,17 @@ def request_command(
             poll_interval_seconds=DEFAULT_REQUEST_POLL_INTERVAL_SECONDS,
             max_output_lines=output_lines,
             max_output_chars=output_chars,
-            metadata={
-                "sender": _record_payload(sender),
-                "_context": {
-                    "host": host,
-                    "label": label,
-                    "route": route,
-                },
-            },
+            metadata=_request_metadata(sender, host=host, label=label, route=route),
+            defer_timeout_seconds=defer_timeout_ms / 1000,
+            on_deferred=lambda record: agent_delivery.ensure_worker(environment),
             cancelled=cancel_event.is_set if cancel_event is not None else None,
         )
         _record_request_route(payload, transport, store)
-        return _public_request_payload(payload)
+        if payload.get("state") in {"deferred", "awaiting_decision"}:
+            agent_delivery.ensure_worker(environment)
+        return _report_request(
+            payload, store, verbose=verbose, on_report=on_report
+        )
     except (OSError, ValueError) as error:
         raise SkillCommandError(
             "request_state_unavailable",
@@ -873,14 +933,53 @@ def request_command(
         ) from error
 
 
+def transport_for_record(
+    record: Mapping[str, Any],
+    environment: Mapping[str, str] | None = None,
+) -> AgentRequestTransport:
+    """Rebuild the recipient route without depending on a current sender pane."""
+    context = record.get("_context")
+    if not isinstance(context, Mapping):
+        raise SkillCommandError(
+            "request_state_invalid", "The stored request context is invalid."
+        )
+    host, label, route = (
+        context.get("host"), context.get("label"), context.get("route")
+    )
+    if (
+        not isinstance(host, str) or not host.strip()
+        or (label is not None and (not isinstance(label, str) or not label.strip()))
+        or (route is not None and (not isinstance(route, str) or not route.strip()))
+        or bool(label) == bool(route)
+    ):
+        raise SkillCommandError(
+            "request_state_invalid", "The stored request address is invalid."
+        )
+    return AgentRequestTransport(
+        resolver=lambda: resolve_or_refresh_recipient(
+            host=host, label=label, route=route, environment=environment,
+        ),
+        sender_identity="",
+        environment=environment,
+        command_runner=run_bounded_command,
+    )
+
+
 def request_status_command(
     *,
     request_id: str,
+    wait_ms: int = 0,
+    verbose: bool = False,
     environment: Mapping[str, str] | None = None,
     state_store: RequestStateStore | None = None,
     resolver: Callable[[], AgentRecord | RouteResolution] | None = None,
     command_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    on_report: Callable[[Callable[[], None]], None] | None = None,
 ) -> dict[str, Any]:
+    if wait_ms < 0:
+        raise SkillCommandError("invalid_timeout", "--wait must not be negative.")
     store = state_store or _request_state_store(environment)
     try:
         payload = store.load(request_id)
@@ -893,44 +992,104 @@ def request_status_command(
             "request_not_found",
             f"No stored request state was found for {request_id!r}.",
         )
-    if payload.get("terminal"):
-        return _public_request_payload(payload)
-    context = payload.get("_context")
-    if not isinstance(context, dict):
-        raise SkillCommandError(
-            "request_state_invalid",
-            "The stored request context is invalid.",
-        )
-    host = context.get("host")
-    label = context.get("label")
-    route = context.get("route")
-    if not isinstance(host, str):
-        raise SkillCommandError(
-            "request_state_invalid",
-            "The stored request address is invalid.",
-        )
-    recipient_resolver = resolver or (
-        lambda: resolve_or_refresh_recipient(
-            host=host,
-            label=label if isinstance(label, str) else None,
-            route=route if isinstance(route, str) else None,
-            environment=environment,
-        )
-    )
-    transport = AgentRequestTransport(
-        resolver=recipient_resolver,
-        sender_identity="",
-        environment=environment,
-        command_runner=command_runner or run_bounded_command,
-    )
+    previous = payload.get("_last_reported")
+    start = _request_signature(payload)[:3]
+    deadline = monotonic() + wait_ms / 1000
     try:
-        refreshed = RequestLifecycleMachine(transport, store).refresh(
-            request_id=request_id
+        if not payload.get("terminal"):
+            transport = transport_for_record(payload, environment)
+            if resolver is not None or command_runner is not None:
+                transport = AgentRequestTransport(
+                    resolver=resolver or transport._resolver,
+                    sender_identity="",
+                    environment=environment,
+                    command_runner=command_runner or run_bounded_command,
+                )
+            machine = RequestLifecycleMachine(
+                transport, store, monotonic=monotonic, sleep=sleep
+            )
+            while True:
+                payload = machine.refresh(request_id=request_id)
+                _record_request_route(payload, transport, store)
+                if (
+                    payload.get("terminal")
+                    or _request_signature(payload)[:3] != start
+                    or monotonic() >= deadline
+                ):
+                    break
+                sleep(max(0, min(
+                    DEFAULT_REQUEST_POLL_INTERVAL_SECONDS, deadline - monotonic()
+                )))
+        return _report_request(
+            payload, store, verbose=verbose,
+            changed=_request_signature(payload) != previous,
+            on_report=on_report,
         )
-        _record_request_route(refreshed, transport, store)
     except (OSError, ValueError) as error:
         raise SkillCommandError("request_state_unavailable", str(error)) from error
-    return _public_request_payload(refreshed)
+
+
+def _validate_defer_timeout(timeout_ms: int) -> None:
+    if timeout_ms <= 0:
+        raise SkillCommandError(
+            "invalid_defer_timeout", "--defer-timeout must be greater than zero."
+        )
+
+
+def _request_metadata(
+    sender: AgentRecord, *, host: str, label: str | None, route: str | None,
+) -> dict[str, Any]:
+    return {
+        "sender": _record_payload(sender),
+        "_context": {"host": host, "label": label, "route": route},
+    }
+
+
+def _request_text(record: Mapping[str, Any]) -> str:
+    response = record.get("response")
+    output = response.get("output") if isinstance(response, Mapping) else ""
+    return clean_agent_text(str(output or ""), prompt=record.get("_prompt"))
+
+
+def _request_signature(record: Mapping[str, Any]) -> list[Any]:
+    return [
+        record.get("state"), record.get("phase"), record.get("error_code"),
+        hashlib.sha256(_request_text(record).encode("utf-8")).hexdigest(),
+    ]
+
+
+def _report_request(
+    record: dict[str, Any], store: RequestStateStore, *,
+    verbose: bool, changed: bool | None = None,
+    on_report: Callable[[Callable[[], None]], None] | None = None,
+) -> dict[str, Any]:
+    """Acknowledge helper returns immediately, or CLI output after its JSON flush."""
+    signature = _request_signature(record)
+    if verbose:
+        payload = _public_request_payload(record)
+    elif changed is False:
+        payload = {
+            key: record.get(key)
+            for key in ("request_id", "state", "terminal", "submitted")
+        }
+        payload["changed"] = False
+    else:
+        payload = compact_request_payload(record, response_text=_request_text(record))
+        if changed is not None:
+            payload["changed"] = changed
+    request_id = record["request_id"]
+
+    def persist_report() -> None:
+        with store.lock(request_id):
+            latest = store.load(request_id) or record
+            latest["_last_reported"] = signature
+            store.save(request_id, latest)
+
+    if on_report is None:
+        persist_report()
+    else:
+        on_report(persist_report)
+    return payload
 
 
 def _record_request_route(
@@ -968,7 +1127,21 @@ def _record_request_route(
         context["label"] = None
     request_id = payload.get("request_id")
     if isinstance(request_id, str):
-        store.save(request_id, payload)
+        with store.lock(request_id):
+            # The worker may have delivered or cancelled since this observation.
+            # Persist only routing metadata, never an older lifecycle state.
+            latest = store.load(request_id) or payload
+            latest["route_refreshed"] = route_refreshed
+            latest["route"] = route
+            latest_recipient = latest.get("recipient")
+            if isinstance(latest_recipient, dict):
+                latest_recipient["route_refreshed"] = route_refreshed
+                latest_recipient["route"] = route
+            latest_context = latest.get("_context")
+            if isinstance(latest_context, dict):
+                latest_context["route"] = route
+                latest_context["label"] = None
+            store.save(request_id, latest)
 
 
 # Agent tools often truncate long single-line JSON, so decision fields come
@@ -1146,6 +1319,22 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     request_status_parser.add_argument(
         "--request-id", required=True, help="Request ID returned by request or batch."
     )
+    request_status_parser.add_argument(
+        "--wait", type=int, default=0,
+        help="Observe until state or phase changes, terminal, or deadline in ms (default: 0).",
+    )
+    for command_parser in (
+        send_parser, read_parser, request_parser, request_status_parser, batch_parser,
+    ):
+        command_parser.add_argument(
+            "--verbose", action="store_true",
+            help="Include the full legacy payload instead of compact output.",
+        )
+    for command_parser in (send_parser, request_parser, batch_parser):
+        command_parser.add_argument(
+            "--defer-timeout", type=int, default=DEFAULT_DEFER_TIMEOUT_MS,
+            help="Hold focused-recipient delivery before asking for a decision in ms (default: 180000).",
+        )
     add_spawn_parser(subparsers)
     return parser.parse_args(argv)
 
@@ -1156,6 +1345,7 @@ def main(
 ) -> int:
     command = ""
     exit_code = 0
+    reports: list[Callable[[], None]] = []
     try:
         arguments = parse_cli_arguments(argv)
         command = arguments.command
@@ -1185,7 +1375,10 @@ def main(
                 message=arguments.message,
                 wait=arguments.wait,
                 timeout_ms=arguments.timeout,
+                defer_timeout_ms=arguments.defer_timeout,
+                verbose=arguments.verbose,
                 environment=environment,
+                on_report=reports.append,
             )
         elif arguments.command == "batch":
             requests_json = (
@@ -1198,12 +1391,15 @@ def main(
                 wait=arguments.wait,
                 timeout_ms=arguments.timeout,
                 max_workers=arguments.max_workers,
+                defer_timeout_ms=arguments.defer_timeout,
+                verbose=arguments.verbose,
                 environment=environment,
+                on_report=reports.append,
             )
             statuses = [item["status"] for item in payload["results"]]
             if any(status in {FAILED, CANCELLED, TIMED_OUT} for status in statuses):
                 exit_code = 1
-            elif SUBMITTED in statuses:
+            elif any(status in {SUBMITTED, DEFERRED} for status in statuses):
                 exit_code = 3
         elif arguments.command == "read":
             payload = read_command(
@@ -1213,6 +1409,7 @@ def main(
                 lines=arguments.lines,
                 max_bytes=arguments.max_bytes,
                 cursor=arguments.cursor,
+                verbose=arguments.verbose,
                 environment=environment,
             )
         elif arguments.command == "request":
@@ -1224,25 +1421,39 @@ def main(
                 timeout_ms=arguments.timeout,
                 output_lines=arguments.output_lines,
                 output_chars=arguments.output_chars,
+                defer_timeout_ms=arguments.defer_timeout,
+                verbose=arguments.verbose,
                 environment=environment,
+                on_report=reports.append,
             )
         elif arguments.command == "request-status":
             payload = request_status_command(
                 request_id=arguments.request_id,
+                wait_ms=arguments.wait,
+                verbose=arguments.verbose,
                 environment=environment,
+                on_report=reports.append,
             )
         elif arguments.command == "spawn":
             payload = spawn_command(arguments, environment)
         else:  # pragma: no cover - argparse rejects unknown commands
             raise SkillCommandError("invalid_command", "Unsupported command.")
-        if command in {"request", "request-status"}:
+        if command in {"request", "request-status"} or (
+            command == "send" and "state" in payload
+        ):
             exit_code = {
                 "submitted_settled": 0,
                 "submission_failed": 1,
                 "submitted_working": 3,
                 "submitted_unknown": 3,
+                "deferred": 3,
+                "awaiting_decision": 3,
             }[payload["state"]]
         _write_json(payload, compact=command == "batch")
+        if reports:
+            sys.stdout.flush()
+            for report in reports:
+                report()
         return exit_code
     except (BatchDispatchError, SkillCommandError, SpawnError) as error:
         _write_json(

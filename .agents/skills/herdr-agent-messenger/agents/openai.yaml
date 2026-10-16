@@ -1,4 +1,4 @@
 interface:
   display_name: "HAM — Herdr Agent Messenger"
-  short_description: "Route prompts to labeled Herdr agents"
-  default_prompt: "Use $herdr-agent-messenger to ask a labeled Herdr agent for help, wait for its response, and report the result."
+  short_description: "Start labeled Herdr sessions and coordinate agents"
+  default_prompt: "Use $herdr-agent-messenger to start or message the requested Herdr agents, follow saved requests without resending held or uncertain deliveries, and verify the results."

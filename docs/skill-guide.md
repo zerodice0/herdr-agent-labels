@@ -58,7 +58,7 @@ These are different operations: a missing requested label is reported, never gue
 
 ## CLI commands and addressing
 
-The [canonical AI skill](../.agents/skills/herdr-agent-messenger/SKILL.md#command-and-flag-reference) contains the complete flag/default/unit/range tables for all eight commands: `list`, `status`, `send`, `batch`, `read`, `request`, `request-status`, and `spawn`. Every command supports `-h` / `--help`.
+The bundled skill is split into a short [SKILL.md](../.agents/skills/herdr-agent-messenger/SKILL.md) for common workflows and an on-demand [reference.md](../.agents/skills/herdr-agent-messenger/reference.md#command-and-flag-reference) with complete flag/default/unit/range tables for all eight commands: `list`, `status`, `send`, `batch`, `read`, `request`, `request-status`, and `spawn`. Every command supports `-h` / `--help`.
 
 The following examples run **from the plugin/checkout root**; for another working directory use the absolute path to the bundled script. An installed skill also has `scripts/herdr_agent_messenger.py` relative to its own directory.
 
@@ -76,7 +76,13 @@ Copy `list` → `address` → `--address` directly; it works for `status`, `send
 
 Only literal `local` selects the current Herdr server. Every other host must be a concrete configured SSH alias—even a hostname matching this machine still means SSH. Never use a bare label as a global address: labels can repeat across hosts and be mistaken for a client's own subagent names. Every operation resolves the current occupant again; a label does not promise continuity after restart.
 
-`list` returns compact `address`, `status`, and `workspace` fields by default. Use `list --verbose` (or its `--legacy` alias) for full records; `status --verbose` expands a single record.
+All eight commands return compact output by default; `--verbose` restores full diagnostic payloads. `list` returns each agent's `address`, `status`, and `workspace`; `status` returns `address` and `status` (plus `stale: true` when needed). Compact request results omit routes and agent/baseline metadata, and expose cleaned reply text as `response.text`. TUI borders, status footers, and echoed prompts are removed. Use `--verbose` for raw/full response fields such as `response.output`. The `list --legacy` alias still selects verbose output.
+
+| Flag | Commands | Default and meaning |
+| --- | --- | --- |
+| `--verbose` | All eight commands | Off; show full payloads instead of compact views. |
+| `--defer-timeout MS` | `request`, `send`, `batch` | `180000` milliseconds (3 minutes); time to hold a focused recipient before requiring a decision. This is separate from the command's `--timeout` wait budget. |
+| `--wait MS` | `request-status` | `0` (one observation); otherwise stops on a state, phase or `error_code` change, a terminal state, or the deadline, not response-text growth. This numeric option differs from the boolean `--wait` on `send` and `batch`. |
 
 ### Start a new labeled session
 
@@ -98,19 +104,35 @@ python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py sp
   --placement workspace --workspace-label Review -- --model MODEL
 ```
 
-Spawn returns `address`, `label`, palette `marker`/`color`, `host`, placement IDs, `kind`, `cwd`, `route`, compact `agent`, `created` (`pane`/`tab`/`workspace`), and reporting flags `label_metadata_reported` / `placement_label_reported`. A custom nonpalette name has empty marker/color and no palette metadata. A successful session need not have successful optional metadata reporting; inspect the flags. Startup failure includes cleanup information; inspect for surviving resources before trying again.
+Compact spawn results contain `address`, palette `marker`, `created` (`pane`/`tab`/`workspace`), `pane_id`, `workspace_id`, and `tab_id` when available. Reporting flags `label_metadata_reported` / `placement_label_reported` appear only when false. Use `--verbose` for label/color, host, kind, cwd, route, agent metadata, and both reporting flags. A custom nonpalette name has an empty marker and no palette metadata. A successful session need not have successful optional metadata reporting; inspect false flags. Startup failure includes cleanup information; inspect for surviving resources before trying again.
 
 ### GUI routes
 
-The popup's coordinator prompt supplies an absolute CLI path and opaque route tokens, so it works even without a globally installed skill and can address unlabeled selections. Follow those commands directly; do not decode or modify tokens or replace them with guessed Herdr commands. `status`, `spawn`, and request results expose `route` for follow-up GUI-style routing. If `route_refreshed: true`, retain the returned token. Refresh is allowed only when conservative continuity checks identify one safe current occupant; otherwise report `route_expired`. See [route safety](ssh-and-routing.md#route-safety).
+The popup's coordinator prompt supplies an absolute CLI path and host-qualified addresses, so it works even without a globally installed skill. For GUI selections supplied as opaque route tokens, follow the supplied `--route` commands directly; do not decode or modify tokens or replace them with guessed Herdr commands. Compact results use addresses rather than exposing routes; `--verbose` includes routes for diagnostic/GUI-style routing. If `route_refreshed: true`, retain the returned token. Refresh is allowed only when conservative continuity checks identify one safe current occupant; otherwise report `route_expired`. See [route safety](ssh-and-routing.md#route-safety).
 
 ## Request lifecycle and exit codes
 
-Prefer `request` for ordinary messaging. Run it from the coordinator's active Herdr agent pane so the sender can be verified. HAM submits once without Herdr's ambiguous lower-level `--wait`, captures a baseline, observes a fresh requested working→settled cycle, and returns bounded new output. If the recipient was already working, its first settlement is only an old-turn boundary; HAM requires a second working→settled cycle.
+Prefer `request` for ordinary messaging. Run it from the coordinator's active Herdr agent pane so the sender can be verified. Once delivery is allowed, HAM captures a baseline, submits once without Herdr's ambiguous lower-level `--wait`, observes a fresh requested working→settled cycle, and returns bounded new output. If the recipient was already working, its first settlement is only an old-turn boundary; HAM requires a second working→settled cycle.
+
+### Focus-based delivery holds
+
+Agent-initiated CLI `request`, `send`, and `batch` deliveries are held when the recipient pane is focused in Herdr. Self-send fails immediately with `recipient_is_sender` before any focus check, even when the sender pane is focused; it is never held. HAM cannot inspect the input box: focus is a safeguard, not typing detection. The request is `deferred`, with `submitted: false`, until focus leaves before the defer deadline. A background worker then delivers it, even if the original CLI wait has ended. A held `send` returns immediately with a `request_id` and exit 3, regardless of `--wait`.
+
+If the pane stays focused for `--defer-timeout` (default `180000` milliseconds, or 3 minutes), the request becomes `awaiting_decision` and HAM sends a Herdr notification. Open **HAM: Held Messages** from the command palette, select a request with Up/Down, and choose **Push** (`p`) or **Cancel** (`c`); `q` or Esc closes the popup. Push can combine the message with unsent text in that pane. Cancel ends the request as `submission_failed`, with phase and `error_code` `delivery_cancelled` and `submitted: false`. **After the timeout, held messages never auto-push, even when focus later leaves.** You must choose Push or Cancel.
+
+After deferred delivery or Push, the worker observes the submitted request about every 0.5 seconds until it becomes terminal or 30 minutes have passed since submission. Use `request-status` to read the saved result; after that limit, the command can still advance observation. The worker exits only when no deferred, awaiting-decision, or watched requests remain.
+
+HAM popup direct sends and coordinator delegation are user-initiated and are never held. Known limitation: typing a draft and then switching panes without submitting can still merge that draft with an incoming message.
+
+For SSH recipients, HAM checks focus on the recipient's host. The hold queue, worker, and **HAM: Held Messages** live on the **sender host**. Timeout notifications are sent to both hosts; the recipient-side notification names the sender host so you know where to decide. If the recipient disappears or is replaced before delivery, HAM fails the undelivered request rather than sending to the replacement.
+
+### States and follow-up
 
 | State | Meaning |
 | --- | --- |
 | `submission_failed` | Resolution failed, or prompt rejected/cancelled before submission; terminal. |
+| `deferred` | Recipient pane is focused; phase `deferred_recipient_focused`, nonterminal, `submitted: false`. HAM owns delivery; do not resend. |
+| `awaiting_decision` | Hold deadline passed; phase `awaiting_decision`, nonterminal, `submitted: false`. Choose Push or Cancel on the sender host. |
 | `submitted_working` | Submitted/possibly submitted, recipient working; completion not proven. |
 | `submitted_settled` | Fresh requested cycle observed; terminal. |
 | `submitted_unknown` | Matching requested turn cannot be confirmed; usually nonterminal, but occupant change makes it terminal. |
@@ -120,20 +142,22 @@ Prefer `request` for ordinary messaging. Run it from the coordinator's active He
 | `0` | Settled request; all batch items `succeeded`; or successful other-command payload. Review output before trusting claims. Lower-level send success is not lifecycle settlement. |
 | `1` | JSON error envelope, `submission_failed`, or batch containing `failed`/`cancelled`/`timeout`. Inspect delivery evidence before retrying; this does not always mean nothing was sent. |
 | `2` | Argument usage error on stderr. Correct syntax. |
-| `3` | Request `submitted_working`/`submitted_unknown`, or batch with `submitted` items and no failures. **Never resend**; advance IDs with `request-status`. For no-wait items without IDs, inspect `status`/`read`. |
+| `3` | **HAM still owns the request; do not resend.** Request/send is `submitted_working`, `submitted_unknown`, `deferred`, or `awaiting_decision`, or a batch has `submitted`/`deferred` items and no failures. Advance IDs with `request-status`; held requests may require a decision. For no-wait items without IDs, inspect `status`/`read`. |
 
-Lifecycle payloads have `request_id` and machine-readable `error_code` alongside human `error` (null when no lifecycle error). Preflight failures instead return `{"error":{"code":"...","message":"..."}}` without `request_id`. Neither all successful CLI payloads nor every batch item has a request ID.
+Compact lifecycle payloads have `request_id`, `state`, `terminal`, `submitted`, `phase`, and `address`, with optional `error_code`, `error`, `defer`, and `response`. Null/absent optional fields are omitted. Held records expose `defer.reason: recipient_focused` and `defer.deadline`. `--verbose` includes full metadata and response fields. Preflight failures instead return `{"error":{"code":"...","message":"..."}}` without `request_id`. Neither all successful CLI payloads nor every batch item has a request ID.
 
 ```bash
 python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py request-status \
-  --request-id REQUEST_ID
+  --request-id REQUEST_ID --wait 30000
 ```
 
-This command advances one saved nonterminal request with a fresh observation; it does not submit or perform a new full wait. Preserve the ID on the same coordinator host/state location. It cannot reconstruct a complete working→settled cycle missed between observations. If `phase: recipient_changed`, HAM stops capture and keeps the original route rather than attaching replacement-agent output. This is terminal `submitted_unknown` with `error_code: recipient_changed`; report the uncertainty instead of repeatedly polling or resending.
+Without `--wait`, this command advances one saved nonterminal request with a fresh observation. With `--wait MS`, it stops on a state, phase or `error_code` change, a terminal state, or the deadline, not response-text growth; it never creates a duplicate submission. Refreshing a held request may deliver the saved message once focus leaves before its hold deadline. Changed-only reporting is separate: compact output includes `changed: true` when a state, phase, error code, or response-text change is reported; unchanged output is only `request_id`, `state`, `terminal`, `submitted`, and `changed: false`. `--verbose` always prints the full payload.
+
+Preserve the ID on the same sender host/state location. The shared queue uses `HERDR_AGENT_REQUEST_STATE_DIR` when set, otherwise `${XDG_STATE_HOME:-$HOME/.local/state}/herdr-agent-messenger/requests`; the legacy `herdr-agent-labels/requests` directory is used only if the new directory does not exist. `HERDR_PLUGIN_STATE_DIR` is not used. `request-status` cannot reconstruct a complete working→settled cycle missed between observations. If `phase: recipient_changed` after submission, HAM stops capture and keeps the original route rather than attaching replacement-agent output. This is terminal `submitted_unknown` with `error_code: recipient_changed`; report the uncertainty instead of repeatedly polling or resending. Before submission, a lost/replaced held recipient instead becomes `submission_failed`.
 
 Inspect response fields independently:
 
-- `response.truncated`: bounded/omitted output, an unreliable baseline/read, or lost safe delta recovery. It is not proof of a complete transcript.
+- `response.truncated`: true only when reply text itself was cut by output bounds or a failed read, in compact and verbose results. Omitting older history or losing baseline overlap alone does not set it. False does not prove correlation or a reliable complete transcript.
 - `response.correlated`: fresh requested cycle observed with reliable baseline and read; false means this is not a proven completed answer for the request.
 - Optional `response.anchored: true`: when baseline overlap could not be recovered, capture began at the last matching sender prompt header (`Message from HOST/LABEL:`). This removes preceding startup/history text but is not proof of completion, completeness, or unique correlation among multiple prompts from that sender.
 
@@ -155,28 +179,30 @@ python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py ba
 | --- | --- |
 | `succeeded` | Matching request settled in wait mode. |
 | `submitted` | Acceptance confirmed but settlement not verified; never resend. |
+| `deferred` | Focus hold or user decision pending; HAM owns delivery. Use the request ID and never resend. |
 | `failed` | Invalid item, target resolution failure, or submission rejection. |
 | `timeout` | Acceptance unconfirmed or dispatch timed out; possibly delivered. |
 | `cancelled` | Dispatch/submission cancelled; inspect acceptance evidence. |
 
-Aggregate `succeeded` means all items were **delivered** (`succeeded` or `submitted`), not necessarily settled. `partial` means only some were delivered; `failed` means none. The process exit code also checks per-item completion/failure; a no-wait batch can have aggregate `succeeded` and exit 3. Wait-mode items include lifecycle IDs and bounded responses when available; preflight failures and no-wait items may not. Batch item `error`/`detail` is not the lifecycle `error_code` field and may contain human failure text; use `request-status` for the full record, including anchoring metadata.
+Aggregate `succeeded` means all items were accepted or retained by HAM (`succeeded`, `submitted`, or `deferred`), not necessarily delivered or settled. `partial` means only some reached those statuses; `failed` means none did. The process exit code also checks per-item completion/failure; a batch with `submitted` or `deferred` items and no failures exits 3. Held items have lifecycle IDs even in no-wait mode; preflight failures and immediate no-wait sends may not. Compact items use `address`, `status`, and optional `request_id`, `state`, `error_code`, `error`, and `response` (`text`, `truncated`). Use `--verbose` for full item details and `request-status` for the full lifecycle response, including anchoring metadata.
 
 Wait for every requested worker or clear terminal failure. Review responses against the workspace, follow up on inconsistencies, and synthesize unavailable hosts, unverified claims, uncertainty, and remaining risks. Retry only known-undelivered failed items, never the whole mixed-result batch.
 
 ## Error recovery reference
 
-The [complete error code catalog](../.agents/skills/herdr-agent-messenger/SKILL.md#error-code-catalog-and-retry-policy) lists every category and code. Recovery depends on delivery evidence, not merely exit 1:
+The [complete error code catalog](../.agents/skills/herdr-agent-messenger/reference.md#error-code-catalog-and-retry-policy) lists every category and code. Recovery depends on delivery evidence, not merely exit 1:
 
 | Error codes / category | Recovery / retryability |
 | --- | --- |
-| `invalid_address`, `conflicting_address`, other `invalid_*` input codes, `empty_message`, `empty_batch`, `missing_address`, `duplicate_route` | Fix rejected input; retry only the undelivered operation/items. Never invent IDs or routes. |
+| `invalid_address`, `conflicting_address`, `invalid_defer_timeout`, other `invalid_*` input codes, `empty_message`, `empty_batch`, `missing_address`, `duplicate_route` | Fix rejected input; `--defer-timeout` requires positive integer milliseconds. Retry only the undelivered operation/items. Never invent IDs or routes. |
 | `agent_not_found`, `agent_ambiguous`, `invalid_route`, `route_expired`, `route_ambiguous`, `resolve_failed`, `recipient_is_sender` | Relist/reselect rather than guess. A post-submission resolution error means resume observation, not resubmit. Create only when asked. |
 | `host_not_configured`, `host_unavailable` | Restore authorized SSH/Herdr connectivity. Local sandbox/socket denial requires socket access; failed discovery does not mean missing agent. |
 | `sender_unavailable`, `sender_probe_failed` | Use the current Herdr agent pane. Probe failure is before submission; obtain local-socket access for sandbox/socket errors, then retry that exact undelivered request only. |
 | `prompt_failed` | Submission rejected; fix cause before retrying known-undelivered work. |
 | `prompt_acceptance_unknown`, `prompt_timeout`, `wait_timed_out`, `timeout` | Possibly delivered / completion unknown. Preserve ID and use `request-status`, or inspect recipient if no ID. Never blindly resend. |
 | `prompt_cancelled`, `cancelled` | Before submission: may retry; after submission: cancellation only stops waiting, not recipient work. Inspect `submitted`. |
-| `recipient_changed` | Terminal uncertainty; do not scrape replacement output or resend the old request. |
+| `delivery_cancelled` | User cancelled a held message before submission. Terminal `submission_failed`, `submitted: false`; respect the cancellation rather than automatically resending. |
+| `recipient_changed` | Occupant changed. Before submission, a held request fails undelivered; after submission, the result is terminal uncertainty. Do not scrape replacement output or resend the old request. |
 | `request_not_found`, `request_state_invalid`, `request_state_unavailable` | Check ID/state location/permissions; storage failure can follow submission, so inspect recipient before retrying delivery. |
 | `cwd_required`, `sender_pane_unavailable`, `label_unavailable` | Fix spawn cwd/source pane/label availability before retrying. |
 | `placement_failed`, `agent_start_failed` | Inspect cleanup details and possible surviving session/resource before retrying startup. |
@@ -186,9 +212,9 @@ Local socket access is needed even for a remote request because HAM verifies the
 
 ## Lower-level send and read
 
-`send` defaults to `--wait` and Herdr's completion signal. A recipient already working produces `recipient_already_working` and `wait_can_track_submitted_turn: false`; its signal may belong to old work. Prefer lifecycle `request`. `send --no-wait` only confirms acceptance and provides no lifecycle request ID. SSH loss/process interruption after acceptance can produce `prompt_acceptance_unknown`; inspect the recipient before retrying.
+`send` defaults to `--wait` and Herdr's completion signal, unless the recipient is focused: then it returns a deferred lifecycle record immediately, even with `--no-wait`, and HAM owns later delivery. An immediate send returns compact `sent`, `address`, and `waited`, plus nonempty `warnings`; `--verbose` restores full details. A recipient already working produces `recipient_already_working` and, in verbose output, `wait_can_track_submitted_turn: false`; its completion signal may belong to old work. Prefer lifecycle `request`. An immediate `send --no-wait` only confirms acceptance and provides no lifecycle request ID. SSH loss/process interruption after acceptance can produce `prompt_acceptance_unknown`; inspect the recipient before retrying.
 
-`read` defaults to 120 recent lines / 65536 UTF-8 bytes and accepts positive `--lines` / `--max-bytes` limits plus a prior `--cursor` (`--watermark` alias). It returns `truncated`, `delta`, `cursor_status`, and an opaque new cursor. Reuse that cursor to suppress unchanged output. Terminal screens may be rewritten, not append-only logs: an unsafe/expired cursor returns a bounded fresh snapshot (`delta: false`), and a malformed cursor produces `invalid_cursor`. Do not infer progress from line numbers or claim full output when `truncated` is true.
+`read` defaults to 120 recent lines / 65536 UTF-8 bytes and accepts positive `--lines` / `--max-bytes` limits plus a prior `--cursor` (`--watermark` alias). Compact output contains `address`, cleaned `output`, `delta`, `truncated`, and an opaque new `cursor`; `--verbose` also exposes raw output, `cursor_status`, and routing metadata. Reuse the cursor to suppress unchanged output. Terminal screens may be rewritten, not append-only logs: an unsafe/expired cursor returns a bounded fresh snapshot (`delta: false`), and a malformed cursor produces `invalid_cursor`. Do not infer progress from line numbers or claim full output when `truncated` is true.
 
 ## Use HAM without the plugin
 

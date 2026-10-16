@@ -17,6 +17,7 @@ class AgentSkillInstallerTest(unittest.TestCase):
             f"---\nname: herdr-agent-messenger\n---\n{marker}\n", encoding="utf-8",
         )
         (directory / "scripts" / "herdr_agent_messenger.py").write_text(marker, encoding="utf-8")
+        (directory / "reference.md").write_text(marker, encoding="utf-8")
         return directory
 
     def test_failed_update_keeps_the_previous_installation(self):
@@ -39,6 +40,7 @@ class AgentSkillInstallerTest(unittest.TestCase):
                 agent_skill_installer.install_skill(destination, source)
             self.assertTrue((destination / "SKILL.md").read_text().endswith("old\n"))
             self.assertEqual((destination / "scripts/herdr_agent_messenger.py").read_text(), "old")
+            self.assertEqual((destination / "reference.md").read_text(), "old")
 
     def test_activation_failure_restores_previous_installation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -125,6 +127,21 @@ class AgentSkillInstallerTest(unittest.TestCase):
             self.assertEqual(outside.read_text(), "keep")
             self.assertTrue(script.is_symlink())
 
+    def test_update_refuses_reference_symlinks_without_touching_their_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.create_skill(root / "source", "new")
+            destination = self.create_skill(root / "installed", "old")
+            outside = root / "unrelated.txt"
+            outside.write_text("keep", encoding="utf-8")
+            reference = destination / "reference.md"
+            reference.unlink()
+            reference.symlink_to(outside)
+            with self.assertRaisesRegex(OSError, "symlink"):
+                agent_skill_installer.install_skill(destination, source)
+            self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
+            self.assertTrue(reference.is_symlink())
+
     def test_dangling_destination_symlink_is_a_conflict(self):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "installed"
@@ -147,6 +164,7 @@ class AgentSkillInstallerTest(unittest.TestCase):
             self.assertEqual((destination / "notes.txt").read_text(), "keep")
             self.assertFalse((destination / "__pycache__").exists())
             self.assertFalse((destination / ".DS_Store").exists())
+            self.assertEqual((destination / "reference.md").read_text(), "new")
 
     def test_destinations_use_selected_home(self):
         destinations = agent_skill_installer.install_destinations(
@@ -292,6 +310,43 @@ class AgentSkillInstallerTest(unittest.TestCase):
                 agent_skill_installer.STATUS_MISSING,
             )
 
+    def test_missing_reference_is_outdated_and_restored_by_update(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "installed"
+            agent_skill_installer.install_skill(destination)
+            reference = destination / "reference.md"
+            reference.unlink()
+            self.assertEqual(
+                agent_skill_installer.installation_status(destination),
+                agent_skill_installer.STATUS_OUTDATED,
+            )
+            agent_skill_installer.install_skill(destination)
+            source = agent_skill_installer.bundled_skill_path().parent
+            self.assertEqual(
+                reference.read_bytes(),
+                (source / "reference.md").read_bytes(),
+            )
+            self.assertEqual(
+                agent_skill_installer.installation_status(destination),
+                agent_skill_installer.STATUS_CURRENT,
+            )
+
+    def test_modified_reference_is_outdated_and_restored_by_update(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "installed"
+            agent_skill_installer.install_skill(destination)
+            reference = destination / "reference.md"
+            reference.write_text("old reference", encoding="utf-8")
+            self.assertEqual(
+                agent_skill_installer.installation_status(destination),
+                agent_skill_installer.STATUS_OUTDATED,
+            )
+            agent_skill_installer.install_skill(destination)
+            self.assertEqual(
+                agent_skill_installer.installation_status(destination),
+                agent_skill_installer.STATUS_CURRENT,
+            )
+
     def test_install_all_copies_the_bundled_skill_to_three_targets(self):
         with tempfile.TemporaryDirectory() as directory:
             environment = {"HOME": directory}
@@ -307,6 +362,10 @@ class AgentSkillInstallerTest(unittest.TestCase):
                 self.assertTrue((destination / "SKILL.md").is_file())
                 self.assertTrue(
                     (destination / "scripts" / "herdr_agent_messenger.py").is_file()
+                )
+                self.assertEqual(
+                    (destination / "reference.md").read_bytes(),
+                    (agent_skill_installer.bundled_skill_path().parent / "reference.md").read_bytes(),
                 )
                 self.assertEqual(
                     agent_skill_installer.installation_status(destination),

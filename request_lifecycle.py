@@ -7,6 +7,9 @@ resolver can be replaced without changing request-state semantics.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
 import json
 import os
 from dataclasses import dataclass
@@ -16,7 +19,7 @@ import re
 import subprocess
 import tempfile
 import time
-from typing import Any, Callable, Generic, Mapping, Protocol, TypeVar
+from typing import Any, Callable, ContextManager, Generic, Iterator, Mapping, Protocol, TypeVar
 
 
 class RequestState(str, Enum):
@@ -24,6 +27,8 @@ class RequestState(str, Enum):
     SUBMITTED_WORKING = "submitted_working"
     SUBMITTED_SETTLED = "submitted_settled"
     SUBMITTED_UNKNOWN = "submitted_unknown"
+    DEFERRED = "deferred"
+    AWAITING_DECISION = "awaiting_decision"
 
 
 @dataclass(frozen=True)
@@ -80,6 +85,12 @@ class RequestTransport(Protocol, Generic[TargetT]):
     def describe(self, target: TargetT) -> Mapping[str, Any]:
         """Return JSON-safe recipient metadata."""
 
+    def is_focused(self, target: TargetT) -> bool:
+        """Return whether the recipient pane currently has focus."""
+
+    def recipient_is_sender(self, target: TargetT) -> bool:
+        """Return whether the resolved recipient is the initiating sender."""
+
     def submit(self, target: TargetT, prompt: str) -> SubmissionResult:
         """Submit without using Herdr's settled-state wait."""
 
@@ -99,6 +110,12 @@ class RequestStateStore(Protocol):
 
     def load(self, request_id: str) -> dict[str, Any] | None:
         """Load one request state, returning None when it does not exist."""
+
+    def lock(self, request_id: str) -> ContextManager[None]:
+        """Hold an exclusive lock while updating one request."""
+
+    def list_request_ids(self) -> list[str]:
+        """List the stored request IDs."""
 
 
 _REQUEST_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
@@ -155,6 +172,130 @@ class JsonRequestStateStore:
         if not isinstance(payload, dict):
             raise ValueError("The stored request state is invalid.")
         return payload
+
+    @contextmanager
+    def lock(self, request_id: str) -> Iterator[None]:
+        self._validate_request_id(request_id)
+        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(
+            self.directory / f"{request_id}.lock", os.O_CREAT | os.O_RDWR, 0o600
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)
+
+    def list_request_ids(self) -> list[str]:
+        if not self.directory.exists():
+            return []
+        return sorted(
+            path.stem
+            for path in self.directory.glob("*.json")
+            if _REQUEST_ID_PATTERN.fullmatch(path.stem) and path.is_file()
+        )
+
+
+def request_state_directory(
+    environment: Mapping[str, str] | None = None,
+) -> Path:
+    """Locate the shared queue independently of the plugin launch context."""
+
+    values = os.environ if environment is None else environment
+    configured = values.get("HERDR_AGENT_REQUEST_STATE_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    state_home = values.get("XDG_STATE_HOME")
+    configured_home = values.get("HOME")
+    home = Path(configured_home).expanduser() if configured_home else Path.home()
+    root = Path(state_home).expanduser() if state_home else home / ".local/state"
+    directory = root / "herdr-agent-messenger" / "requests"
+    legacy = root / "herdr-agent-labels" / "requests"
+    return legacy if not directory.exists() and legacy.exists() else directory
+
+
+def open_request_store(
+    environment: Mapping[str, str] | None = None,
+) -> JsonRequestStateStore:
+    return JsonRequestStateStore(request_state_directory(environment))
+
+
+def _is_deferred(record: Mapping[str, Any]) -> bool:
+    return record.get("state") in {
+        RequestState.DEFERRED.value, RequestState.AWAITING_DECISION.value
+    }
+
+
+def _load_request(store: RequestStateStore, request_id: str) -> dict[str, Any]:
+    record = store.load(request_id)
+    if record is None:
+        raise KeyError(request_id)
+    return record
+
+
+def _validate_deferred_record(
+    store: RequestStateStore, record: dict[str, Any],
+) -> dict[str, Any]:
+    if _is_deferred(record) and (
+        not isinstance(record.get("_defer"), dict)
+        or not isinstance(record["_defer"].get("deadline"), (int, float))
+        or not isinstance(record.get("defer"), dict)
+    ):
+        record.update(
+            state=RequestState.SUBMISSION_FAILED.value,
+            phase="request_state_invalid", terminal=True, submitted=False,
+            error="The stored deferred request data is invalid.",
+            error_code="request_state_invalid",
+        )
+        store.save(str(record["request_id"]), record)
+    return record
+
+
+def validate_deferred_record(
+    store: RequestStateStore, request_id: str,
+) -> dict[str, Any]:
+    """Load held state and fail corrupt queue entries under the record lock."""
+    with store.lock(request_id):
+        return _validate_deferred_record(store, _load_request(store, request_id))
+
+
+def set_deferred_decision(
+    store: RequestStateStore, request_id: str, decision: str,
+) -> dict[str, Any]:
+    """Persist a push decision without submitting from the caller."""
+
+    if decision != "push":
+        raise ValueError("The deferred decision must be push.")
+    with store.lock(request_id):
+        record = _validate_deferred_record(store, _load_request(store, request_id))
+        if _is_deferred(record):
+            record["_defer"]["decision"] = decision
+            store.save(request_id, record)
+        return record
+
+
+def mark_deferred_notified(
+    store: RequestStateStore, request_id: str, notified: Mapping[str, Any],
+) -> dict[str, Any]:
+    with store.lock(request_id):
+        record = _validate_deferred_record(store, _load_request(store, request_id))
+        if _is_deferred(record):
+            record["defer"]["notified"] = dict(notified)
+            store.save(request_id, record)
+        return record
+
+
+def pending_deferred(store: RequestStateStore) -> list[dict[str, Any]]:
+    records = []
+    for request_id in store.list_request_ids():
+        try:
+            record = store.load(request_id)
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if record is not None and _is_deferred(record):
+            records.append(record)
+    return records
 
 
 def limit_output(text: str, *, max_lines: int, max_chars: int) -> OutputSnapshot:
@@ -235,7 +376,9 @@ def capture_new_output(
     bounded = limit_output(delta, max_lines=max_lines, max_chars=max_chars)
     return OutputSnapshot(
         bounded.text,
-        correlation_lost or after.truncated or bounded.truncated,
+        bounded.truncated or (
+            not anchored and not overlap and (correlation_lost or after.truncated)
+        ),
         anchored=anchored,
     )
 
@@ -250,11 +393,13 @@ class RequestLifecycleMachine(Generic[TargetT]):
         *,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        now: Callable[[], float] = time.time,
     ) -> None:
         self.transport = transport
         self.store = store
         self.monotonic = monotonic
         self.sleep = sleep
+        self.now = now
 
     def run(
         self,
@@ -267,39 +412,18 @@ class RequestLifecycleMachine(Generic[TargetT]):
         max_output_chars: int,
         metadata: Mapping[str, Any] | None = None,
         cancelled: Callable[[], bool] | None = None,
+        defer_timeout_seconds: float | None = None,
+        on_deferred: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         if timeout_seconds <= 0 or poll_interval_seconds <= 0:
             raise ValueError("Timeouts and poll intervals must be greater than zero.")
-        if max_output_lines <= 0 or max_output_chars <= 0:
-            raise ValueError("Output limits must be greater than zero.")
+        self._validate_limits(max_output_lines, max_output_chars)
+        if defer_timeout_seconds is not None and defer_timeout_seconds < 0:
+            raise ValueError("The defer timeout must not be negative.")
 
-        record: dict[str, Any] = {
-            "request_id": request_id,
-            "state": None,
-            "phase": "resolving",
-            "terminal": False,
-            "submitted": None,
-            "submission_timed_out": False,
-            "timed_out": False,
-            "preexisting_working": None,
-            "requested_turn_observed": False,
-            "wait_safe": None,
-            "recipient_status": None,
-            "response": {
-                "output": "",
-                "truncated": False,
-                "correlated": False,
-            },
-            "error": None,
-            "error_code": None,
-            "_response_anchor": prompt.splitlines()[0] if prompt else "",
-            "_limits": {
-                "lines": max_output_lines,
-                "chars": max_output_chars,
-            },
-        }
-        if metadata:
-            record.update(metadata)
+        record = self._new_record(
+            request_id, prompt, max_output_lines, max_output_chars, metadata
+        )
         self.store.save(request_id, record)
 
         try:
@@ -313,90 +437,29 @@ class RequestLifecycleMachine(Generic[TargetT]):
                 error_code=getattr(error, "code", None) or "resolve_failed",
             )
 
-        initial_working = initial.status == "working"
-        record.update(
-            {
-                "phase": "capturing_baseline",
-                "recipient": dict(self.transport.describe(initial)),
-                "recipient_status": initial.status,
-                "preexisting_working": initial_working,
-                "wait_safe": not initial_working,
-                "_target_identity": initial.identity,
-            }
-        )
-        self.store.save(request_id, record)
-        baseline, baseline_error = self._read_output(
-            initial,
-            max_lines=max_output_lines,
-            max_chars=max_output_chars,
-        )
-        self._store_baseline(record, baseline, baseline_error)
+        if self.transport.recipient_is_sender(initial):
+            return self._reject_self_send(record)
 
-        if cancelled is not None and cancelled():
-            record["cancelled"] = True
-            return self._finish_without_target(
-                record,
-                state=RequestState.SUBMISSION_FAILED,
-                phase="submission_cancelled",
-                error="Request was cancelled before prompt submission.",
-                error_code="cancelled",
+        if defer_timeout_seconds is not None and self.transport.is_focused(initial):
+            deadline = self.monotonic() + timeout_seconds
+            self._defer(record, initial, defer_timeout_seconds, on_deferred)
+            return self._wait_deferred(
+                record, deadline, poll_interval_seconds, cancelled
             )
 
-        record["phase"] = "submitting"
-        if baseline_error:
-            record["baseline_error"] = baseline_error
-        self.store.save(request_id, record)
-        try:
-            submission = self.transport.submit(initial, prompt)
-        except subprocess.TimeoutExpired:
-            submission = SubmissionResult.unknown(
-                "Prompt submission timed out before acceptance could be confirmed.",
-                timed_out=True,
-            )
-        except Exception as error:
-            submission = SubmissionResult.failed(
-                str(error) or error.__class__.__name__
-            )
-
-        record.update(
-            {
-                "submitted": submission.accepted,
-                "submission_timed_out": submission.timed_out,
-                "submission_error": submission.error or None,
-            }
+        self._submit(record, initial, cancelled=cancelled)
+        if record.get("terminal"):
+            return record
+        baseline_data = record["_baseline"]
+        baseline = OutputSnapshot(
+            baseline_data["text"], baseline_data["truncated"]
         )
-        if submission.accepted is False:
-            return self._finish(
-                record,
-                target=initial,
-                baseline=baseline,
-                baseline_reliable=not baseline_error,
-                state=RequestState.SUBMISSION_FAILED,
-                phase="submission_failed",
-                error=submission.error or "Prompt submission failed.",
-                error_code=submission.code or "prompt_failed",
-                max_lines=max_output_lines,
-                max_chars=max_output_chars,
-            )
+        baseline_error = baseline_data["error"]
+        initial_working = record["preexisting_working"]
 
         boundary_seen = not initial_working
         requested_working_seen = False
         last_target = initial
-        record.update(
-            {
-                "state": (
-                    RequestState.SUBMITTED_WORKING.value
-                    if initial_working
-                    else RequestState.SUBMITTED_UNKNOWN.value
-                ),
-                "phase": (
-                    "waiting_for_preexisting_turn"
-                    if initial_working
-                    else "waiting_for_requested_turn"
-                ),
-            }
-        )
-        self.store.save(request_id, record)
         deadline = self.monotonic() + timeout_seconds
         last_resolve_error = ""
 
@@ -510,19 +573,364 @@ class RequestLifecycleMachine(Generic[TargetT]):
             error=error,
             error_code=(
                 "prompt_acceptance_unknown"
-                if submission.accepted is None
+                if record["submitted"] is None
                 else "wait_timed_out"
             ),
             max_lines=max_output_lines,
             max_chars=max_output_chars,
         )
 
+    @staticmethod
+    def _validate_limits(max_lines: int, max_chars: int) -> None:
+        if max_lines <= 0 or max_chars <= 0:
+            raise ValueError("Output limits must be greater than zero.")
+
+    @staticmethod
+    def _new_record(
+        request_id: str,
+        prompt: str,
+        max_lines: int,
+        max_chars: int,
+        metadata: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "request_id": request_id,
+            "state": None,
+            "phase": "resolving",
+            "terminal": False,
+            "submitted": None,
+            "submission_timed_out": False,
+            "timed_out": False,
+            "preexisting_working": None,
+            "requested_turn_observed": False,
+            "wait_safe": None,
+            "recipient_status": None,
+            "response": {"output": "", "truncated": False, "correlated": False},
+            "error": None,
+            "error_code": None,
+            "_response_anchor": prompt.splitlines()[0] if prompt else "",
+            "_limits": {"lines": max_lines, "chars": max_chars},
+        }
+        if metadata:
+            record.update(metadata)
+        record["_prompt"] = prompt
+        return record
+
+    def _defer(
+        self,
+        record: dict[str, Any],
+        target: TargetT,
+        timeout_seconds: float,
+        on_deferred: Callable[[Mapping[str, Any]], None] | None,
+    ) -> dict[str, Any]:
+        since = self.now()
+        deadline = since + timeout_seconds
+        record.update(
+            {
+                "state": RequestState.DEFERRED.value,
+                "phase": "deferred_recipient_focused",
+                "submitted": False,
+                "recipient": dict(self.transport.describe(target)),
+                "recipient_status": target.status,
+                "_target_identity": target.identity,
+                "_defer": {
+                    "since": since,
+                    "deadline": deadline,
+                    "timeout_ms": int(timeout_seconds * 1000),
+                    "decision": None,
+                },
+                "defer": {
+                    "reason": "recipient_focused",
+                    "since": datetime.fromtimestamp(
+                        since, timezone.utc
+                    ).isoformat().replace("+00:00", "Z"),
+                    "deadline": datetime.fromtimestamp(
+                        deadline, timezone.utc
+                    ).isoformat().replace("+00:00", "Z"),
+                    "notified": None,
+                },
+            }
+        )
+        self.store.save(str(record["request_id"]), record)
+        if on_deferred is not None:
+            on_deferred(record)
+        return record
+
+    def enqueue(
+        self,
+        *,
+        request_id: str,
+        prompt: str,
+        max_output_lines: int,
+        max_output_chars: int,
+        defer_timeout_seconds: float,
+        metadata: Mapping[str, Any] | None = None,
+        on_deferred: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> dict[str, Any] | None:
+        """Own a focused recipient's delivery, or leave immediate delivery alone."""
+
+        self._validate_limits(max_output_lines, max_output_chars)
+        if defer_timeout_seconds < 0:
+            raise ValueError("The defer timeout must not be negative.")
+        record = self._new_record(
+            request_id, prompt, max_output_lines, max_output_chars, metadata
+        )
+        try:
+            target = self.transport.resolve()
+        except Exception as error:
+            return self._finish_without_target(
+                record,
+                state=RequestState.SUBMISSION_FAILED,
+                phase="resolve_failed",
+                error=str(error) or error.__class__.__name__,
+                error_code=getattr(error, "code", None) or "resolve_failed",
+            )
+        if self.transport.recipient_is_sender(target):
+            return self._reject_self_send(record)
+        if not self.transport.is_focused(target):
+            return None
+        return self._defer(record, target, defer_timeout_seconds, on_deferred)
+
+    def deliver_deferred(
+        self, request_id: str, *, force: bool = False,
+    ) -> dict[str, Any]:
+        """Recheck the occupant and deliver only after focus or an explicit push."""
+
+        with self.store.lock(request_id):
+            record = _validate_deferred_record(
+                self.store, _load_request(self.store, request_id)
+            )
+            if not _is_deferred(record):
+                return record
+            try:
+                target = self.transport.resolve()
+            except Exception as error:
+                return self._finish_without_target(
+                    record,
+                    state=RequestState.SUBMISSION_FAILED,
+                    phase="resolve_failed",
+                    error=str(error) or error.__class__.__name__,
+                    error_code=getattr(error, "code", None) or "resolve_failed",
+                )
+            if target.identity != record.get("_target_identity"):
+                return self._finish_without_target(
+                    record,
+                    state=RequestState.SUBMISSION_FAILED,
+                    phase="recipient_changed",
+                    error="The resolved recipient occupant changed during the request.",
+                    error_code="recipient_changed",
+                )
+            push = force or record["_defer"].get("decision") == "push"
+            if record["state"] == RequestState.AWAITING_DECISION.value and not push:
+                return record
+            if not push and self.transport.is_focused(target):
+                if self.now() >= record["_defer"]["deadline"]:
+                    record.update(
+                        {
+                            "state": RequestState.AWAITING_DECISION.value,
+                            "phase": "awaiting_decision",
+                        }
+                    )
+                    self.store.save(request_id, record)
+                return record
+            return self._submit(record, target)
+
+    def cancel_deferred(self, request_id: str) -> dict[str, Any]:
+        """Cancel an undelivered request without contacting the recipient."""
+
+        with self.store.lock(request_id):
+            record = _validate_deferred_record(
+                self.store, _load_request(self.store, request_id)
+            )
+            if not _is_deferred(record):
+                return record
+            return self._finish_without_target(
+                record,
+                state=RequestState.SUBMISSION_FAILED,
+                phase="delivery_cancelled",
+                error="Deferred delivery was cancelled.",
+                error_code="delivery_cancelled",
+            )
+
+    def _reject_self_send(self, record: dict[str, Any]) -> dict[str, Any]:
+        return self._finish_without_target(
+            record, state=RequestState.SUBMISSION_FAILED,
+            phase="submission_failed", error_code="recipient_is_sender",
+            error="The current sender cannot also be the recipient.",
+        )
+
+    def _wait_deferred(
+        self,
+        record: dict[str, Any],
+        deadline: float,
+        poll_interval_seconds: float,
+        cancelled: Callable[[], bool] | None,
+    ) -> dict[str, Any]:
+        request_id = str(record["request_id"])
+        while self.monotonic() < deadline:
+            if cancelled is not None and cancelled():
+                record = self.cancel_deferred(request_id)
+                if record.get("terminal"):
+                    return record
+                with self.store.lock(request_id):
+                    record = _load_request(self.store, request_id)
+                    if not record.get("terminal"):
+                        record.update(
+                            cancelled=True, phase="wait_cancelled",
+                            error="Waiting was cancelled after prompt submission.",
+                            error_code="cancelled",
+                        )
+                        self.store.save(request_id, record)
+                    return record
+            record = self.refresh(request_id=request_id)
+            if record.get("terminal"):
+                return record
+            self._sleep_until(deadline, poll_interval_seconds)
+        with self.store.lock(request_id):
+            record = _load_request(self.store, request_id)
+            if _is_deferred(record) or record.get("terminal"):
+                return record
+            return self._finish_deferred_wait_timeout(record)
+
+    def _finish_deferred_wait_timeout(self, record: dict[str, Any]) -> dict[str, Any]:
+        request_id = str(record["request_id"])
+        working = record.get("recipient_status") == "working"
+        record.update(
+            {
+                "state": (
+                    RequestState.SUBMITTED_WORKING.value
+                    if working else RequestState.SUBMITTED_UNKNOWN.value
+                ),
+                "phase": "wait_timed_out",
+                "timed_out": True,
+                "error": record.get("error") or (
+                    "Timed out while the recipient was working."
+                    if working
+                    else "Timed out before a fresh requested turn could be confirmed."
+                ),
+                "error_code": (
+                    "prompt_acceptance_unknown"
+                    if record.get("submitted") is None else "wait_timed_out"
+                ),
+            }
+        )
+        self.store.save(request_id, record)
+        return record
+
+    def _submit(
+        self,
+        record: dict[str, Any],
+        initial: TargetT,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        request_id = str(record["request_id"])
+        prompt = record["_prompt"]
+        max_output_lines = record["_limits"]["lines"]
+        max_output_chars = record["_limits"]["chars"]
+        initial_working = initial.status == "working"
+        record.update(
+            {
+                "phase": "capturing_baseline",
+                "recipient": dict(self.transport.describe(initial)),
+                "recipient_status": initial.status,
+                "preexisting_working": initial_working,
+                "wait_safe": not initial_working,
+                "_target_identity": initial.identity,
+            }
+        )
+        self.store.save(request_id, record)
+        baseline, baseline_error = self._read_output(
+            initial,
+            max_lines=max_output_lines,
+            max_chars=max_output_chars,
+        )
+        self._store_baseline(record, baseline, baseline_error)
+
+        if cancelled is not None and cancelled():
+            record["cancelled"] = True
+            return self._finish_without_target(
+                record,
+                state=RequestState.SUBMISSION_FAILED,
+                phase="submission_cancelled",
+                error="Request was cancelled before prompt submission.",
+                error_code="cancelled",
+            )
+
+        record["phase"] = "submitting"
+        # Commit uncertain submission before the side effect. A killed submitter
+        # must never leave a held record that another process can submit again.
+        if _is_deferred(record):
+            record["_watch_until"] = self.now() + 30 * 60
+        record.update(state=RequestState.SUBMITTED_UNKNOWN.value, submitted=None)
+        record.pop("defer", None)
+        record.pop("_defer", None)
+        if baseline_error:
+            record["baseline_error"] = baseline_error
+        self.store.save(request_id, record)
+        try:
+            submission = self.transport.submit(initial, prompt)
+        except subprocess.TimeoutExpired:
+            submission = SubmissionResult.unknown(
+                "Prompt submission timed out before acceptance could be confirmed.",
+                timed_out=True,
+            )
+        except Exception as error:
+            submission = SubmissionResult.failed(
+                str(error) or error.__class__.__name__
+            )
+
+        record.update(
+            {
+                "submitted": submission.accepted,
+                "submission_timed_out": submission.timed_out,
+                "submission_error": submission.error or None,
+            }
+        )
+        if submission.accepted is False:
+            return self._finish(
+                record,
+                target=initial,
+                baseline=baseline,
+                baseline_reliable=not baseline_error,
+                state=RequestState.SUBMISSION_FAILED,
+                phase="submission_failed",
+                error=submission.error or "Prompt submission failed.",
+                error_code=submission.code or "prompt_failed",
+                max_lines=max_output_lines,
+                max_chars=max_output_chars,
+            )
+        record.update(
+            {
+                "state": (
+                    RequestState.SUBMITTED_WORKING.value
+                    if initial_working
+                    else RequestState.SUBMITTED_UNKNOWN.value
+                ),
+                "phase": (
+                    "waiting_for_preexisting_turn"
+                    if initial_working
+                    else "waiting_for_requested_turn"
+                ),
+            }
+        )
+        self.store.save(request_id, record)
+        return record
+
     def refresh(self, *, request_id: str) -> dict[str, Any]:
         """Advance one stored nonterminal request using a fresh observation."""
 
-        record = self.store.load(request_id)
-        if record is None:
-            raise KeyError(request_id)
+        record = self.deliver_deferred(request_id)
+        if _is_deferred(record):
+            return record
+        # The worker and request-status can observe the same request. Serialize
+        # observations so a stale snapshot cannot erase an observed turn.
+        with self.store.lock(request_id):
+            record = _load_request(self.store, request_id)
+            return self._refresh_record(record)
+
+    def _refresh_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        request_id = str(record["request_id"])
         if record.get("terminal"):
             return record
         limits = record.get("_limits")
@@ -726,7 +1134,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
         )
         response: dict[str, Any] = {
             "output": captured.text,
-            "truncated": captured.truncated or not baseline_reliable,
+            "truncated": captured.truncated or (not baseline_reliable and not captured.anchored),
             "correlated": False,
         }
         if captured.anchored:
@@ -807,7 +1215,7 @@ class RequestLifecycleMachine(Generic[TargetT]):
         )
         response = {
             "output": captured.text,
-            "truncated": captured.truncated or not baseline_reliable,
+            "truncated": captured.truncated or (not baseline_reliable and not captured.anchored),
             "correlated": correlated and baseline_reliable and not read_error,
         }
         if captured.anchored:

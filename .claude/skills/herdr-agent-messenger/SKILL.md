@@ -1,11 +1,12 @@
 ---
 name: herdr-agent-messenger
-description: HAM (Herdr Agent Messenger) routes prompts to current Herdr agents by SSH host and Agent Labels name, waits for responses, reads terminal output, and coordinates tailored multi-agent work. Use when the user mentions HAM or asks Claude to message, delegate to, check, or collect results from labeled Herdr agents such as local/white-bison or macbook-pro/purple-koala.
+description: Use HAM (Herdr Agent Messenger) to start/open new labeled Herdr sessions, message or delegate to existing agents, check progress, and collect replies. Trigger on HAM, new Herdr session requests, or host/label addresses such as local/white-bison and macbook-pro/purple-koala.
 ---
 
 # HAM — Herdr Agent Messenger
 
 Read `../../../.agents/skills/herdr-agent-messenger/SKILL.md` completely and
-follow it. Resolve the referenced path relative to this file. Use the scripts
-from that canonical skill directory so the Codex and Claude workflows share one
-implementation.
+follow it. Read `reference.md` in that canonical directory only on demand for
+flags, error codes, verbose fields, or installation details not covered there.
+Resolve paths relative to this file. Use scripts from the canonical directory
+so Codex and Claude share one implementation.
