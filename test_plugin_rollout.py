@@ -9,6 +9,11 @@ import unittest
 from collections.abc import Sequence
 from unittest import mock
 
+try:
+    import tomllib  # noqa: F401
+except ModuleNotFoundError:  # Python 3.10 Herdr hosts run the plugin, not rollout.
+    raise unittest.SkipTest("rollout_plugin.py requires Python 3.11 (tomllib)")
+
 import plugin_rollout
 
 

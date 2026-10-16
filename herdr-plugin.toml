@@ -1,6 +1,6 @@
 id = "herdr.agent-messenger"
 name = "HAM"
-version = "0.9.0"
+version = "0.9.1"
 min_herdr_version = "0.8.0"
 description = "Label Herdr agents and coordinate prompts with HAM, the Herdr Agent Messenger."
 platforms = ["macos", "linux"]

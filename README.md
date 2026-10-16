@@ -27,7 +27,7 @@ host-qualified, for example `local/blue-otter` or
 ## Requirements
 
 - Herdr 0.8.0 or newer
-- Python 3.11 or newer (including rollout tools and tests)
+- Python 3.10 or newer on Herdr hosts; Python 3.11 or newer to run `rollout_plugin.py`
 
 ## Install
 

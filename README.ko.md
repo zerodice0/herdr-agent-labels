@@ -28,7 +28,7 @@ HAM은 Herdr용 에이전트 라벨링 및 다중 에이전트 메시징 플러�
 ## 요구 사항
 
 - Herdr 0.8.0 이상
-- Python 3.11 이상(배포 도구와 테스트 포함)
+- Herdr 호스트는 Python 3.10 이상, `rollout_plugin.py` 실행은 Python 3.11 이상
 
 ## 설치
 
