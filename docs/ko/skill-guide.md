@@ -78,6 +78,40 @@ $ham local/yellow-falcon에게 현재 변경을 검토해달라고 요청해.
 응답을 기다린 뒤 필요한 후속 작업을 정리해줘.
 ```
 
+### Claude Code 검증 결과와 설치 범위 주의사항
+
+2026-10-16에 winmini에서 Claude Code **2.1.301**과 Herdr **0.9.5**로
+검증했습니다([이슈 #5](https://github.com/zerodice0/herdr-agent-labels/issues/5)).
+
+| 확인 항목 | 관찰한 결과 |
+| --- | --- |
+| 사용자 설치 | `python3 agent_skill_installer.py install claude`로 설치한 뒤 체크아웃 밖에서 `/herdr-agent-messenger`가 `(user)`로 표시되었습니다. |
+| 프로젝트 설치 | **HAM Skill** → **Project / Claude**에서 전체 번들을 복사했습니다. 사용자 설치 전 해당 프로젝트에서는 명령이 `(project)`로 표시되었습니다. |
+| 체크아웃 브리지 | 사용자 사본이 없을 때 `.claude/skills/herdr-agent-messenger/SKILL.md`를 따라 정본인 `.agents/skills/herdr-agent-messenger/SKILL.md`를 읽었습니다. |
+| 명령 실행 | 사용자·프로젝트·체크아웃 범위 모두 번들 CLI의 `list --host local`이 종료 코드 0으로 실행되었습니다. |
+| 새 세션 | `spawn --kind omp --placement tab` 다음에 반환된 주소로 `request --address`를 실행했습니다. 다시 보내지 않고 요청과 연결된 완료 응답을 수집했습니다. |
+| 자연어 선택 | HAM을 언급한 요청과 실제 `local/<label>` 주소만 언급한 요청을 각각 새 세션에서 실행했을 때 `Skill` 도구를 선택했습니다. 사용자 설치 전 체크아웃과 설치 후 체크아웃 밖에서 모두 확인했습니다. |
+
+**같은 이름의 스킬이 있을 때:** 이 Claude Code 버전은 사용자 사본과
+프로젝트·체크아웃 사본이 함께 있으면 **사용자 사본**을 선택했습니다.
+체크아웃에서 시작했다는 이유만으로 브리지를 읽었다고 판단하지 마세요.
+불러온 스킬 경로를 확인하고, 브리지는 같은 이름의 사용자 사본을 설치하기 전에
+검증하세요. 설치 상태를 바꾼 뒤에는 클라이언트를 새로 시작하세요.
+
+**대화형 시작:** Claude의 폴더 신뢰 확인이나 첫 실행 UI 질문이
+HAM `spawn --kind claude`의 준비 상태 확인을 막을 수 있습니다.
+이번 검증에서는 `agent_start_failed` / `agent_not_ready`와 함께 생성한 탭을
+닫았다는 결과가 반환되었습니다. 자동으로 시작하기 전에 해당 디렉터리에서
+대화형으로 신뢰 확인을 처리하고, 다시 시도하기 전에 정리 결과를 확인하세요.
+출력 모드는 신뢰 확인을 건너뛰므로 `claude -p`의 성공만으로 대화형 시작까지
+성공했다고 판단할 수는 없습니다.
+
+**호스트 인증 관찰:** winmini에서는 `claude.ai`의 Max 구독으로 로그인되어
+있었습니다. macbook-pro와 mac-studio에서는 비GUI SSH 세션이 macOS 키체인에
+접근할 수 없어(`User interaction is not allowed`) `loggedIn: false`가
+반환되었습니다. 이 호스트·세션 조건을 스킬 누락이나 Claude 인증 전반의 실패로
+해석하지 마세요.
+
 ## 주소 선택과 새 세션 생성
 
 항상 호스트가 포함된 정확한 Agent Labels 주소를 사용하세요. 리터럴 호스트

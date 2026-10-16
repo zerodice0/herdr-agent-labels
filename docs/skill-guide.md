@@ -56,6 +56,40 @@ focused code-review assignment, and wait for its response.
 
 These are different operations: a missing requested label is reported, never guessed or automatically created. When asked to start/open a session and message it, the agent must use HAM `spawn`, then `request --address` with the returned address. Raw `herdr agent start <name>` bypasses HAM label selection and metadata reporting and is not a substitute.
 
+### Claude Code verification and scope caveats
+
+Verified on winmini with Claude Code **2.1.301** and Herdr **0.9.5** on
+2026-10-16 ([issue #5](https://github.com/zerodice0/herdr-agent-labels/issues/5)):
+
+| Check | Observed result |
+| --- | --- |
+| User install | `python3 agent_skill_installer.py install claude`; `/herdr-agent-messenger` appeared as `(user)` outside the checkout. |
+| Project install | **HAM Skill** → **Project / Claude** copied the complete bundle; the command appeared as `(project)` in that project before user installation. |
+| Checkout bridge | With no user copy installed, Claude followed `.claude/skills/herdr-agent-messenger/SKILL.md` and read the canonical `.agents/skills/herdr-agent-messenger/SKILL.md`. |
+| Invocation | User, project, and checkout runs executed the bundled CLI's `list --host local` with exit 0. |
+| New session | Claude used `spawn --kind omp --placement tab`, then `request --address` with the returned address; the correlated, settled reply was collected without a resend. |
+| Natural-language selection | Separate fresh requests mentioning HAM or only a real `local/<label>` address selected the `Skill` tool, both in the checkout before user installation and outside it after installation. |
+
+**Same-name precedence:** this Claude Code version selected the **user** copy
+when both user and project/checkout copies existed. Do not assume that the
+checkout bridge is being exercised merely because Claude starts in the
+checkout. Verify the loaded skill path; test the bridge before installing a
+same-named user copy. Restart the client after changing installations.
+
+**Interactive startup:** Claude's folder-trust dialog (and first-run UI
+questions) can block a HAM `spawn --kind claude` readiness check. In this
+verification, blocked starts returned `agent_start_failed` / `agent_not_ready`
+and reported that the created tab was closed. Handle trust interactively in
+the intended directory before automated startup; inspect cleanup details
+before retrying. Print mode skips the trust dialog, so `claude -p` alone is not
+proof that interactive startup works.
+
+**Host authentication observation:** winmini was logged in through `claude.ai`
+with a Max subscription. macbook-pro and mac-studio reported `loggedIn: false`
+over SSH while their macOS Keychains were unavailable to non-GUI sessions
+(`User interaction is not allowed`). That observed host/session condition is
+not evidence of a missing skill or a general Claude authentication failure.
+
 ## CLI commands and addressing
 
 The bundled skill is split into a short [SKILL.md](../.agents/skills/herdr-agent-messenger/SKILL.md) for common workflows and an on-demand [reference.md](../.agents/skills/herdr-agent-messenger/reference.md#command-and-flag-reference) with complete flag/default/unit/range tables for all eight commands: `list`, `status`, `send`, `batch`, `read`, `request`, `request-status`, and `spawn`. Every command supports `-h` / `--help`.
