@@ -81,7 +81,7 @@ $ham local/yellow-falcon에게 현재 변경을 검토해달라고 요청해.
 ### Claude Code 검증 결과와 설치 범위 주의사항
 
 2026-10-16에 winmini에서 Claude Code **2.1.301**과 Herdr **0.9.5**로
-검증했습니다([이슈 #5](https://github.com/zerodice0/herdr-agent-labels/issues/5)).
+검증했습니다([이슈 #5](https://github.com/zerodice0/herdr-agent-messenger/issues/5)).
 
 | 확인 항목 | 관찰한 결과 |
 | --- | --- |
@@ -616,7 +616,7 @@ HAM 플러그인을 설치하거나 활성화하지 않고 Herdr와 HAM 스킬�
 설치가 있다면 먼저 확인하고 관련 없는 파일을 덮어쓰지 마세요.
 
 ```bash
-git clone https://github.com/zerodice0/herdr-agent-labels.git \
+git clone https://github.com/zerodice0/herdr-agent-messenger.git \
   "$HOME/.local/share/ham"
 mkdir -p "$HOME/.agents/skills" "$HOME/.claude/skills" "$HOME/.omp/agent/skills"
 ln -s "$HOME/.local/share/ham/.agents/skills/herdr-agent-messenger" \

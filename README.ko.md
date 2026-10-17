@@ -33,11 +33,12 @@ HAM은 Herdr용 에이전트 라벨링 및 다중 에이전트 메시징 플러�
 ## 설치
 
 ```bash
-herdr plugin install zerodice0/herdr-agent-labels --yes
+herdr plugin install zerodice0/herdr-agent-messenger --yes
 ```
 
-저장소 이름은 계속 `herdr-agent-labels`를 사용하지만 플러그인 ID는
-`herdr.agent-messenger`, 표시 이름은 **HAM**입니다.
+저장소 이름은 `herdr-agent-labels`에서 `herdr-agent-messenger`로 변경됐습니다.
+기존 GitHub URL은 새 주소로 리디렉션되므로 기존 GitHub 설치도 계속 업데이트됩니다.
+플러그인 ID는 `herdr.agent-messenger`, 표시 이름은 **HAM**으로 유지됩니다.
 
 로컬 개발 환경에서는 현재 체크아웃을 연결할 수 있습니다.
 

@@ -49,7 +49,7 @@ def plugin_list_payload(
                 "source": {
                     "kind": "github",
                     "owner": "zerodice0",
-                    "repo": "herdr-agent-labels",
+                    "repo": "herdr-agent-messenger",
                     "requested_ref": ref,
                     "resolved_commit": ref,
                     "managed_path": "/managed/plugin",
@@ -83,7 +83,7 @@ def installed_plugin(
         "source": {
             "kind": "github",
             "owner": "zerodice0",
-            "repo": "herdr-agent-labels",
+            "repo": "herdr-agent-messenger",
             "requested_ref": ref,
             "resolved_commit": ref,
             "managed_path": "/managed/plugin",

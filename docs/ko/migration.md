@@ -7,7 +7,7 @@
 공개 GitHub 저장소에서 HAM을 설치하고 활성화합니다.
 
 ```bash
-herdr plugin install zerodice0/herdr-agent-labels --yes
+herdr plugin install zerodice0/herdr-agent-messenger --yes
 ```
 
 로컬 개발 환경에서는 체크아웃을 직접 연결할 수 있습니다.
@@ -22,15 +22,18 @@ herdr plugin link "$PWD" --enabled
 ## 0.7.x에서 마이그레이션
 
 HAM 0.8.0에서는 플러그인 ID가 `herdr.agent-labels`에서
-`herdr.agent-messenger`로 변경됐습니다. 저장소와 설치 소스는 계속
-`zerodice0/herdr-agent-labels`를 사용합니다.
+`herdr.agent-messenger`로 변경됐습니다. 저장소 이름은 `herdr-agent-labels`에서
+`herdr-agent-messenger`로 변경됐으며, 설치 소스는 이제
+`zerodice0/herdr-agent-messenger`입니다. 기존 GitHub URL은 새 주소로
+리디렉션되므로 기존 GitHub 설치도 계속 업데이트됩니다. 저장소 이름 변경과
+별개로 아래의 구 플러그인 ID 마이그레이션은 여전히 필요합니다.
 
 기존 GitHub 설치는 구 ID를 비활성화하고 새 버전을 설치·검증한 다음에만 구
 등록을 제거합니다.
 
 ```bash
 herdr plugin disable herdr.agent-labels
-herdr plugin install zerodice0/herdr-agent-labels --yes
+herdr plugin install zerodice0/herdr-agent-messenger --yes
 herdr plugin list --plugin herdr.agent-messenger --json
 herdr plugin action invoke agent-skill-guide --plugin herdr.agent-messenger
 herdr plugin uninstall herdr.agent-labels

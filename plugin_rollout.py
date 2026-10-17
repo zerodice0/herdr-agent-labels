@@ -28,7 +28,7 @@ from agent_directory import (
 
 PLUGIN_ID = "herdr.agent-messenger"
 LEGACY_PLUGIN_ID = "herdr.agent-labels"
-PLUGIN_SOURCE = "zerodice0/herdr-agent-labels"
+PLUGIN_SOURCE = "zerodice0/herdr-agent-messenger"
 SOURCE_OWNER, SOURCE_REPO = PLUGIN_SOURCE.split("/", 1)
 CORE_ACTION_IDS = frozenset(
     {"agent-skill-guide", "label-current", "message-agents"}

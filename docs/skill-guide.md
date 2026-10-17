@@ -59,7 +59,7 @@ These are different operations: a missing requested label is reported, never gue
 ### Claude Code verification and scope caveats
 
 Verified on winmini with Claude Code **2.1.301** and Herdr **0.9.5** on
-2026-10-16 ([issue #5](https://github.com/zerodice0/herdr-agent-labels/issues/5)):
+2026-10-16 ([issue #5](https://github.com/zerodice0/herdr-agent-messenger/issues/5)):
 
 | Check | Observed result |
 | --- | --- |
@@ -255,7 +255,7 @@ Local socket access is needed even for a remote request because HAM verifies the
 HAM can run with Herdr without installing/enabling the plugin. Keep a persistent checkout: the skill wrapper loads router modules from it. Copying only the skill directory is not a self-contained installation.
 
 ```bash
-git clone https://github.com/zerodice0/herdr-agent-labels.git \
+git clone https://github.com/zerodice0/herdr-agent-messenger.git \
   "$HOME/.local/share/ham"
 mkdir -p "$HOME/.agents/skills" "$HOME/.claude/skills" "$HOME/.omp/agent/skills"
 ln -s "$HOME/.local/share/ham/.agents/skills/herdr-agent-messenger" \

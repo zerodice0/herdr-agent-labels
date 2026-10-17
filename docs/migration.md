@@ -7,7 +7,7 @@
 Install and enable HAM from the public GitHub repository:
 
 ```bash
-herdr plugin install zerodice0/herdr-agent-labels --yes
+herdr plugin install zerodice0/herdr-agent-messenger --yes
 ```
 
 For local development, link a checkout instead:
@@ -22,15 +22,17 @@ detected after installation are labeled automatically.
 ## Migrate from 0.7.x
 
 HAM 0.8.0 changes the plugin ID from `herdr.agent-labels` to
-`herdr.agent-messenger`. The repository and install source remain
-`zerodice0/herdr-agent-labels`.
+`herdr.agent-messenger`. The repository and install source are now
+`zerodice0/herdr-agent-messenger`, renamed from `herdr-agent-labels`. The old
+GitHub URL redirects, so existing GitHub installs keep updating. The repository
+rename does not replace the legacy plugin-ID migration below.
 
 For an existing GitHub installation, disable the legacy ID, install the new
 version, verify it, and only then remove the legacy registration:
 
 ```bash
 herdr plugin disable herdr.agent-labels
-herdr plugin install zerodice0/herdr-agent-labels --yes
+herdr plugin install zerodice0/herdr-agent-messenger --yes
 herdr plugin list --plugin herdr.agent-messenger --json
 herdr plugin action invoke agent-skill-guide --plugin herdr.agent-messenger
 herdr plugin uninstall herdr.agent-labels

@@ -32,11 +32,12 @@ host-qualified, for example `local/blue-otter` or
 ## Install
 
 ```bash
-herdr plugin install zerodice0/herdr-agent-labels --yes
+herdr plugin install zerodice0/herdr-agent-messenger --yes
 ```
 
-The repository name remains `herdr-agent-labels`, while the plugin ID is
-`herdr.agent-messenger` and its display name is **HAM**.
+The repository is now `herdr-agent-messenger`, renamed from `herdr-agent-labels`.
+The old GitHub URL redirects, so existing GitHub installs keep updating.
+The plugin ID remains `herdr.agent-messenger` and its display name is **HAM**.
 
 For local development:
 
